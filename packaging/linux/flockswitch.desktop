@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=flockswitch
+Comment=Move your Logitech mouse and keyboard to another computer with one button
+Comment[ko]=버튼 하나로 Logitech 마우스와 키보드를 다른 컴퓨터로 함께 옮깁니다
+Exec=@BIN@
+Icon=@ICON@
+Terminal=false
+Categories=Utility;Settings;HardwareSettings;
+Keywords=logitech;easy-switch;mouse;keyboard;kvm;
+StartupWMClass=flockswitch

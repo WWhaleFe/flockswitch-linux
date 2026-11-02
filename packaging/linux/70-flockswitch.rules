@@ -1,0 +1,17 @@
+# flockswitch: lets the person at the computer talk to Logitech receivers and devices
+# (HID++), as Solaar's rule does. Installed by install.sh into /etc/udev/rules.d/.
+# The number is below 73 so systemd-logind's seat rules apply the uaccess tag.
+
+ACTION=="remove", GOTO="flockswitch_end"
+SUBSYSTEM!="hidraw", GOTO="flockswitch_end"
+
+# Receivers (Bolt, Unifying) and devices on a USB cable
+ATTRS{idVendor}=="046d", GOTO="flockswitch_apply"
+# Bluetooth, classic and Low Energy
+KERNELS=="0005:046D:*", GOTO="flockswitch_apply"
+GOTO="flockswitch_end"
+
+LABEL="flockswitch_apply"
+TAG+="uaccess"
+
+LABEL="flockswitch_end"

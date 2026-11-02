@@ -1,0 +1,57 @@
+name: Problem report / 문제 신고
+description: Something does not switch, or the button misbehaves / 전환이 안 되거나 버튼이 이상할 때
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks! The two outputs below let us see exactly what flockswitch sees.
+        아래 두 결과가 있으면 원인을 바로 찾을 수 있습니다.
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating system / 운영체제
+      options: [Ubuntu / Debian, Fedora, Arch, Other]
+    validations:
+      required: true
+  - type: input
+    id: desktop
+    attributes:
+      label: Desktop and session / 데스크톱과 세션
+      placeholder: e.g. GNOME 46 on Wayland, KDE Plasma 6 on X11 (echo $XDG_CURRENT_DESKTOP $XDG_SESSION_TYPE)
+    validations:
+      required: true
+  - type: dropdown
+    id: connection
+    attributes:
+      label: Connection / 연결 방식
+      multiple: true
+      options: [Logi Bolt receiver, Unifying receiver, Bluetooth, USB cable]
+    validations:
+      required: true
+  - type: input
+    id: devices
+    attributes:
+      label: Devices / 장치
+      placeholder: e.g. MX Master 4 + MX Mechanical
+    validations:
+      required: true
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened / 무슨 일이 있었나요
+      description: What you did, what you expected, what happened instead.
+    validations:
+      required: true
+  - type: textarea
+    id: list
+    attributes:
+      label: "`flockswitch list` output"
+      description: |
+        `~/.local/bin/flockswitch list` in a terminal.
+      render: text
+  - type: input
+    id: version
+    attributes:
+      label: flockswitch version / 버전
+      placeholder: shown in the tray menu, e.g. 0.1.0

@@ -1,0 +1,100 @@
+# Builds flockswitch for Linux (x86_64 and arm64) from source on GitHub-hosted Ubuntu
+# and publishes it as a GitHub release when a version tag (v*) is pushed.
+
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+# Read-only by default; only the release job gets write access.
+permissions:
+  contents: read
+
+jobs:
+  linux:
+    strategy:
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-22.04
+          - arch: aarch64
+            runner: ubuntu-22.04-arm
+    # Ubuntu 22.04's glibc (2.35): runs there and on anything newer.
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Tag must match the version in Cargo.toml
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          want="${GITHUB_REF_NAME#v}"
+          have=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+          if [ "$want" != "$have" ]; then echo "tag $GITHUB_REF_NAME but Cargo.toml says $have"; exit 1; fi
+          # The release notes come from these sections.
+          for f in CHANGELOG.ko.md CHANGELOG.md; do
+            if ! grep -q "^## $want " "$f"; then echo "$f has no '## $want' section"; exit 1; fi
+          done
+      - name: Build dependencies
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libudev-dev pkg-config
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test --locked
+      - run: cargo build --release --locked
+      - name: Package
+        # tar keeps the executable bits of the program and the scripts.
+        run: |
+          version=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+          dir="flockswitch-linux-${{ matrix.arch }}-$version"
+          mkdir "$dir"
+          cp target/release/flockswitch packaging/linux/install.sh packaging/linux/uninstall.sh \
+             packaging/linux/70-flockswitch.rules packaging/linux/flockswitch.desktop \
+             packaging/icon/flockswitch.png README.md README.ko.md LICENSE "$dir/"
+          tar -czf "$dir.tar.gz" "$dir"
+          readelf -d "$dir/flockswitch" | grep NEEDED
+      - uses: actions/upload-artifact@v4
+        with:
+          name: flockswitch-linux-${{ matrix.arch }}
+          path: flockswitch-linux-*.tar.gz
+
+  release:
+    needs: [linux]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: |
+            CHANGELOG.md
+            CHANGELOG.ko.md
+          sparse-checkout-cone-mode: false
+      - name: Release notes from CHANGELOG.ko.md and CHANGELOG.md
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          # The lines under "## <version> — <date>", up to the next "## ".
+          section() {
+            awk -v v="$version" '
+              /^## / { if (found) exit; if (index($0, "## " v " ") == 1) { found = 1; next } }
+              found
+            ' "$1" | sed '/./,$!d'
+          }
+          for f in CHANGELOG.ko.md CHANGELOG.md; do
+            if ! section "$f" | grep -q '[^[:space:]]'; then echo "$f has no notes for $version"; exit 1; fi
+          done
+          { printf '## 변경 사항\n\n'; section CHANGELOG.ko.md; printf '\n## Changes\n\n'; section CHANGELOG.md; } > notes.md
+          cat notes.md
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cp artifacts/flockswitch-linux-*.tar.gz .
+          sha256sum flockswitch-linux-*.tar.gz > SHA256SUMS.txt
+          # --generate-notes adds GitHub's "Full Changelog" link after notes.md.
+          gh release create "$GITHUB_REF_NAME" flockswitch-linux-*.tar.gz SHA256SUMS.txt \
+            --repo "$GITHUB_REPOSITORY" --title "flockswitch $GITHUB_REF_NAME" \
+            --notes-file notes.md --generate-notes
