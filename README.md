@@ -35,7 +35,15 @@ Install flockswitch on **every** computer you switch between, and pair each devi
 
 ## Install
 
-Get `flockswitch-linux-<x86_64|aarch64>-<version>.tar.gz` from [Releases](../../releases), then:
+With [Homebrew](https://brew.sh):
+
+```sh
+brew install wwhalefe/tap/flockswitch
+```
+
+Then run the commands `brew info flockswitch` shows: they install the udev rule (once, with sudo) and add flockswitch to the app menu. `brew upgrade flockswitch` updates it.
+
+Or get `flockswitch-linux-<x86_64|aarch64>-<version>.tar.gz` from [Releases](../../releases), then:
 
 ```sh
 tar xzf flockswitch-linux-x86_64-<version>.tar.gz
@@ -64,6 +72,8 @@ Settings live in `~/.config/flockswitch/`.
 
 Run `./uninstall.sh` from the downloaded folder. It puts the buttons back to normal, removes start-at-login and the settings, then the program, the app menu entry and the udev rule.
 
+Installed with Homebrew: run `flockswitch uninstall`, then `brew uninstall flockswitch`, and remove the udev rule and menu entry as `brew info flockswitch` shows.
+
 ## Privacy
 
 flockswitch talks to the Logitech devices connected to this PC. Its only internet connection is to GitHub, to see whether a newer version exists (at start and once a day; turn it off in Settings → General) and to download it when you press the button; nothing about you or your devices is sent. "Report to the developer" opens your own mail app, so you see everything before sending. (A port on `127.0.0.1` is held only to stop a second copy from running; nothing is sent or received on it.)
@@ -76,7 +86,7 @@ Open a [problem report](../../issues/new/choose) with:
 - your distribution, desktop (GNOME, KDE, …) and session (X11 or Wayland), and how the devices connect (Bolt / Unifying / Bluetooth)
 - `~/.config/flockswitch/flockswitch.log`
 
-"No permission to use the devices" in the settings window means the udev rule is missing: run `./install.sh` again, then replug the receiver.
+"No permission to use the devices" in the settings window means the udev rule is missing: run `./install.sh` again (installed with Homebrew: the udev commands `brew info flockswitch` shows), then replug the receiver.
 
 ## Status
 

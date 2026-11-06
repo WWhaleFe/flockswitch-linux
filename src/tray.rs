@@ -9,6 +9,7 @@ use crate::shared::{Shared, Status};
 use anyhow::Result;
 use auto_launch::{AutoLaunch, AutoLaunchBuilder, LinuxLaunchMode};
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -153,7 +154,7 @@ fn spawn_engine(shared: Arc<Shared>) -> JoinHandle<()> {
 }
 
 pub fn autostart() -> Option<AutoLaunch> {
-    let exe = std::env::current_exe().ok()?;
+    let exe = launch_path()?;
     AutoLaunchBuilder::new()
         .set_app_name("flockswitch")
         .set_app_path(&exe.to_string_lossy())
@@ -161,6 +162,23 @@ pub fn autostart() -> Option<AutoLaunch> {
         .set_linux_launch_mode(LinuxLaunchMode::XdgAutostart)
         .build()
         .ok()
+}
+
+/// The program path to start flockswitch by later (login, desktop shortcuts). Homebrew
+/// runs it from a folder named after the version, which the next upgrade deletes, so
+/// this is the `<prefix>/bin/flockswitch` link instead when there is one.
+pub fn launch_path() -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    match brew_link(&exe.to_string_lossy()) {
+        Some(link) if link.exists() => Some(link),
+        _ => Some(exe),
+    }
+}
+
+/// `<prefix>/Cellar/flockswitch/<version>/bin/flockswitch` → `<prefix>/bin/flockswitch`.
+fn brew_link(exe: &str) -> Option<PathBuf> {
+    let i = exe.find("/Cellar/flockswitch/")?;
+    Some(PathBuf::from(format!("{}/bin/flockswitch", &exe[..i])))
 }
 
 /// White arrows on a blue tile (grey when paused), visible on light and dark panels.
@@ -358,3 +376,18 @@ pub fn open_settings_window() {
     }
 }
 
+
+#[cfg(test)]
+mod tests {
+    use super::brew_link;
+    use std::path::PathBuf;
+
+    #[test]
+    fn homebrew_path_without_the_version() {
+        assert_eq!(
+            brew_link("/home/linuxbrew/.linuxbrew/Cellar/flockswitch/0.1.1/bin/flockswitch"),
+            Some(PathBuf::from("/home/linuxbrew/.linuxbrew/bin/flockswitch"))
+        );
+        assert_eq!(brew_link("/home/me/.local/bin/flockswitch"), None);
+    }
+}

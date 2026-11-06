@@ -197,7 +197,7 @@ const KO: Texts = Texts {
 
 지원 마우스: MX Master 3·4를 바탕으로 만들고 시험했습니다. 리눅스판은 아직 실제 리눅스 PC에서 시험하지 않았습니다.",
     hid_denied_title: "장치에 접근할 권한이 없습니다",
-    hid_denied: "Logitech 수신기나 블루투스 장치를 열 수 없습니다. 받은 폴더에서 ./install.sh를 실행해 udev 규칙을 설치하고, 수신기를 뺐다 꽂거나 블루투스를 다시 연결하세요.",
+    hid_denied: "Logitech 수신기나 블루투스 장치를 열 수 없습니다. 받은 폴더에서 ./install.sh를 실행해 udev 규칙을 설치하고(Homebrew로 설치했다면 brew info flockswitch에 나오는 명령), 수신기를 뺐다 꽂거나 블루투스를 다시 연결하세요.",
     hotkeys_wayland: "Wayland에서는 앱이 전역 단축키를 등록할 수 없습니다. 시스템 설정 → 키보드 → 사용자 단축키에서 원하는 키에 아래 명령을 하나씩 지정하세요.",
     language: "언어",
 };
@@ -298,7 +298,7 @@ const EN: Texts = Texts {
 
 Supported mice: flockswitch was built and tested with MX Master 3 and 4. The Linux version has not been tried on a Linux PC yet.",
     hid_denied_title: "No permission to use the devices",
-    hid_denied: "The Logitech receiver or Bluetooth device could not be opened. Run ./install.sh in the folder you downloaded to install the udev rule, then replug the receiver or reconnect Bluetooth.",
+    hid_denied: "The Logitech receiver or Bluetooth device could not be opened. Run ./install.sh in the folder you downloaded to install the udev rule (installed with Homebrew: the commands brew info flockswitch shows), then replug the receiver or reconnect Bluetooth.",
     hotkeys_wayland: "On Wayland no app can register shortcuts for the whole desktop. In Settings → Keyboard → Custom Shortcuts, give each of these commands a key of your choice.",
     language: "Language",
 };

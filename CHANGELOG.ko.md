@@ -1,5 +1,11 @@
 # 변경 기록
 
+## 0.1.1 — 2026-11-06
+
+- Homebrew로 설치할 수 있습니다: `brew install wwhalefe/tap/flockswitch`. udev 규칙과 앱 메뉴 항목을 추가하는 방법은 `brew info flockswitch`에 나옵니다
+- 로그인 시 시작과 Wayland 단축키 명령이 업그레이드 때 지워지는 버전 폴더 대신 Homebrew의 `bin/flockswitch` 링크를 가리켜, `brew upgrade` 뒤에도 계속 동작합니다
+- 장치 권한이 없다는 안내에 Homebrew로 설치했을 때의 방법도 적었습니다
+
 ## 0.1.0 — 2026-11-02
 
 - 첫 리눅스 버전입니다. macOS용 flockswitch 0.4.3을 바탕으로 전환, 장치, 설정 창, 이동할 채널(이 PC의 채널은 고를 수 없음)이 같습니다. 아직 실제 리눅스 PC에서 시험하지 않았습니다

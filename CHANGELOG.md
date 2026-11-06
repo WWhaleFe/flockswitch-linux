@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.1 — 2026-11-06
+
+- Install with Homebrew: `brew install wwhalefe/tap/flockswitch`. `brew info flockswitch` shows how to add the udev rule and the app menu entry
+- Start at login and the Wayland shortcut commands use Homebrew's `bin/flockswitch` link instead of the versioned folder an upgrade deletes, so they keep working after `brew upgrade`
+- The missing-permission note also says what to do when installed with Homebrew
+
 ## 0.1.0 — 2026-11-02
 
 - First Linux version, from flockswitch for macOS 0.4.3: the same switching, devices, settings window and “Go to channel” (this PC's own channel cannot be chosen). Not tried on a Linux PC yet

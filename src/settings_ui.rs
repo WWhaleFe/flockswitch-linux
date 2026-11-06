@@ -651,7 +651,7 @@ impl SettingsApp {
         hint(ui, p, t.hotkeys_hint);
         if crate::hotkey::unsupported_session() {
             // Wayland: the desktop's own shortcut settings run the command instead.
-            let exe = std::env::current_exe().map(|p| p.display().to_string()).unwrap_or_else(|_| "flockswitch".into());
+            let exe = crate::tray::launch_path().map(|p| p.display().to_string()).unwrap_or_else(|| "flockswitch".into());
             let commands: Vec<String> = (1..=3).map(|n| format!("{exe} switch {n}")).collect();
             ui.add_space(8.0);
             info_box(ui, p, &format!("{}\n\n{}", t.hotkeys_wayland, commands.join("\n")));

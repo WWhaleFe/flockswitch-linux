@@ -30,7 +30,15 @@ flockswitch는 **MX Master 3**와 **MX Master 4**를 바탕으로 만들고 시�
 
 ## 설치
 
-[Releases](../../releases)에서 `flockswitch-linux-<x86_64|aarch64>-<버전>.tar.gz`를 받은 뒤:
+[Homebrew](https://brew.sh)를 쓰면:
+
+```sh
+brew install wwhalefe/tap/flockswitch
+```
+
+설치한 다음 `brew info flockswitch`에 나오는 명령을 실행하세요. udev 규칙을 설치하고(sudo로 한 번) 앱 메뉴에 flockswitch를 추가합니다. 업데이트는 `brew upgrade flockswitch`입니다.
+
+또는 [Releases](../../releases)에서 `flockswitch-linux-<x86_64|aarch64>-<버전>.tar.gz`를 받은 뒤:
 
 ```sh
 tar xzf flockswitch-linux-x86_64-<버전>.tar.gz
@@ -70,6 +78,8 @@ cd flockswitch-linux-x86_64-<버전>
 
 받은 폴더에서 `./uninstall.sh`를 실행합니다. 버튼을 원래대로 돌려놓고, 자동 실행과 설정을 지운 뒤, 프로그램과 앱 메뉴 항목, udev 규칙을 지웁니다.
 
+Homebrew로 설치했다면 `flockswitch uninstall`을 실행한 다음 `brew uninstall flockswitch`를 실행하고, udev 규칙과 메뉴 항목은 `brew info flockswitch`에 나오는 대로 지웁니다.
+
 ## 개인정보
 
 flockswitch는 이 PC에 연결된 Logitech 장치와 통신합니다. 인터넷 연결은 GitHub에서 새 버전이 있는지 확인할 때(시작할 때와 하루 한 번, 설정 → 일반에서 끌 수 있음)와 버튼을 눌러 내려받을 때뿐이며, 사용자나 장치에 대한 정보는 보내지 않습니다. "개발자에게 리포트"는 사용자의 메일 앱을 열 뿐이라 보내기 전에 내용을 모두 확인할 수 있습니다. (중복 실행을 막으려고 `127.0.0.1`의 포트 하나를 잡아 둘 뿐, 그 포트로 주고받는 데이터는 없습니다.)
@@ -82,7 +92,7 @@ flockswitch는 이 PC에 연결된 Logitech 장치와 통신합니다. 인터넷
 - 배포판, 데스크톱(GNOME, KDE 등)과 세션(X11 / Wayland), 연결 방식(Bolt / Unifying / 블루투스)
 - `~/.config/flockswitch/flockswitch.log`
 
-설정 창에 "장치에 접근할 권한이 없습니다"가 보이면 udev 규칙이 없는 것입니다. `./install.sh`를 다시 실행하고 수신기를 뺐다 꽂아 주세요.
+설정 창에 "장치에 접근할 권한이 없습니다"가 보이면 udev 규칙이 없는 것입니다. `./install.sh`를 다시 실행하고(Homebrew로 설치했다면 `brew info flockswitch`에 나오는 udev 명령) 수신기를 뺐다 꽂아 주세요.
 
 ## 시험 현황
 
