@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.1.2 — 2026-11-06
+
+- Updates: a downloaded update is checked against the SHA-256 checksums published with the release (SHA256SUMS.txt) and deleted if it does not match. For a release without checksums, the release page opens instead
+- Updates: the check and the download go over https only, redirects included
+
 ## 0.1.1 — 2026-11-06
 
 - Install with Homebrew: `brew install wwhalefe/tap/flockswitch`. `brew info flockswitch` shows how to add the udev rule and the app menu entry
