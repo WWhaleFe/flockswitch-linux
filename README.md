@@ -6,7 +6,7 @@ Press one mouse button and move your Logitech mouse **and** keyboard to another 
 
 flockswitch turns buttons of an MX Master mouse — the wheel mode-shift button, the gesture button and/or the wheel click (pressing the wheel) — into an Easy-Switch key. When you press one, every device in your group (keyboard, other mice) switches to the same Easy-Switch channel, then the mouse follows. It needs no network between the computers, so it works where Logitech Flow cannot (guest/public or locked-down networks).
 
-This repository is the Linux version. The others live in [flockswitch-mac](https://github.com/WWhaleFe/flockswitch-mac) and [flockswitch-windows](https://github.com/WWhaleFe/flockswitch-windows); all three switch the same way and can be mixed.
+This repository is the Linux version. The others live in [flockswitch-mac](https://github.com/WWhaleFe/flockswitch-mac), [flockswitch-windows](https://github.com/WWhaleFe/flockswitch-windows) and [flockswitch-android](https://github.com/WWhaleFe/flockswitch-android); all of them switch the same way and can be mixed.
 
 > **Not tried on a Linux PC yet.** The Linux version shares its device code with the macOS and Windows versions, which are tested, but it has not run on real Linux hardware. Reports are very welcome.
 
@@ -39,9 +39,16 @@ With [Homebrew](https://brew.sh):
 
 ```sh
 brew install wwhalefe/tap/flockswitch
+
+# First-time setup: udev rule (once, with sudo) and app menu entry
+sudo install -m 644 "$(brew --prefix)/opt/flockswitch/share/flockswitch/70-flockswitch.rules" /etc/udev/rules.d/
+sudo udevadm control --reload-rules
+sudo udevadm trigger --subsystem-match=hidraw
+mkdir -p ~/.local/share/applications
+ln -sf "$(brew --prefix)/opt/flockswitch/share/applications/flockswitch.desktop" ~/.local/share/applications/
 ```
 
-Then run the commands `brew info flockswitch` shows: they install the udev rule (once, with sudo) and add flockswitch to the app menu. `brew upgrade flockswitch` updates it.
+`brew upgrade flockswitch` updates it.
 
 Or get `flockswitch-linux-<x86_64|aarch64>-<version>.tar.gz` from [Releases](../../releases), then:
 

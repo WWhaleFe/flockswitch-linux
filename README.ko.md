@@ -6,7 +6,7 @@
 
 flockswitch는 MX Master 마우스의 **휠 모드 전환 버튼, 제스처 버튼, 휠 클릭(휠을 눌러 클릭)** 중 고른 버튼을 Easy-Switch 버튼으로 바꿉니다. 누르면 그룹으로 묶은 장치(키보드, 다른 마우스)가 먼저, 마우스가 마지막으로 **같은 Easy-Switch 채널**로 이동합니다. 컴퓨터끼리 네트워크 연결이 필요 없어서 Logitech Flow를 쓸 수 없는 곳(공용 네트워크, 보안이 엄격한 네트워크)에서도 동작합니다.
 
-이 저장소는 리눅스 버전입니다. macOS 버전은 [flockswitch-mac](https://github.com/WWhaleFe/flockswitch-mac), Windows 버전은 [flockswitch-windows](https://github.com/WWhaleFe/flockswitch-windows)에 있으며, 세 버전은 같은 방식으로 전환되어 섞어 쓸 수 있습니다.
+이 저장소는 리눅스 버전입니다. 다른 버전은 [flockswitch-mac](https://github.com/WWhaleFe/flockswitch-mac), [flockswitch-windows](https://github.com/WWhaleFe/flockswitch-windows), [flockswitch-android](https://github.com/WWhaleFe/flockswitch-android)에 있으며, 모두 같은 방식으로 전환되어 섞어 쓸 수 있습니다.
 
 > **아직 실제 리눅스 PC에서 시험하지 않았습니다.** 장치와 통신하는 코드는 시험을 마친 macOS·Windows 버전과 같지만, 리눅스 기기에서는 아직 실행해 보지 않았습니다. 써 보신 결과를 알려 주시면 큰 도움이 됩니다.
 
@@ -34,9 +34,16 @@ flockswitch는 **MX Master 3**와 **MX Master 4**를 바탕으로 만들고 시�
 
 ```sh
 brew install wwhalefe/tap/flockswitch
+
+# 최초 1회: udev 규칙 설치(sudo) 및 앱 메뉴 추가
+sudo install -m 644 "$(brew --prefix)/opt/flockswitch/share/flockswitch/70-flockswitch.rules" /etc/udev/rules.d/
+sudo udevadm control --reload-rules
+sudo udevadm trigger --subsystem-match=hidraw
+mkdir -p ~/.local/share/applications
+ln -sf "$(brew --prefix)/opt/flockswitch/share/applications/flockswitch.desktop" ~/.local/share/applications/
 ```
 
-설치한 다음 `brew info flockswitch`에 나오는 명령을 실행하세요. udev 규칙을 설치하고(sudo로 한 번) 앱 메뉴에 flockswitch를 추가합니다. 업데이트는 `brew upgrade flockswitch`입니다.
+업데이트는 `brew upgrade flockswitch`입니다.
 
 또는 [Releases](../../releases)에서 `flockswitch-linux-<x86_64|aarch64>-<버전>.tar.gz`를 받은 뒤:
 
