@@ -261,6 +261,9 @@ pub struct Haptics {
     pub switch_waveform: u8,
     pub arrive_waveform: u8,
     pub edge_waveform: u8,
+    /// Strength in percent (1-100), put on the mouse whenever it is here; 0 leaves the
+    /// mouse as Logi Options+ set it.
+    pub intensity: u8,
 }
 
 impl Default for Haptics {
@@ -271,6 +274,7 @@ impl Default for Haptics {
             switch_waveform: crate::device::waveform::COMPLETED,
             arrive_waveform: crate::device::waveform::DAMP_COLLISION,
             edge_waveform: crate::device::waveform::SUBTLE_COLLISION,
+            intensity: 0,
         }
     }
 }
@@ -536,7 +540,15 @@ impl Config {
                 "switch_waveform" => self.haptics.switch_waveform = wave()?,
                 "arrive_waveform" => self.haptics.arrive_waveform = wave()?,
                 "edge_waveform" => self.haptics.edge_waveform = wave()?,
-                _ => anyhow::bail!("unknown setting '{key}' (haptics.switch, haptics.edge, haptics.switch_waveform, haptics.arrive_waveform, haptics.edge_waveform)"),
+                "intensity" | "strength" => {
+                    let v = value.trim().trim_end_matches('%');
+                    self.haptics.intensity = if v.eq_ignore_ascii_case("options+") || v.eq_ignore_ascii_case("default") {
+                        0
+                    } else {
+                        v.parse::<u8>().context("haptics.intensity must be 0 (as Options+ sets it) or 1-100 percent")?
+                    };
+                }
+                _ => anyhow::bail!("unknown setting '{key}' (haptics.switch, haptics.edge, haptics.intensity, haptics.switch_waveform, haptics.arrive_waveform, haptics.edge_waveform)"),
             }
             return Ok(());
         }
@@ -634,6 +646,7 @@ impl Config {
         for w in [self.haptics.switch_waveform, self.haptics.arrive_waveform, self.haptics.edge_waveform] {
             anyhow::ensure!(w <= 31, "haptics: waveforms are numbered 0 to 31");
         }
+        anyhow::ensure!(self.haptics.intensity <= 100, "haptics.intensity must be 0 (as Options+ sets it) or 1-100 percent");
         anyhow::ensure!(self.hotkeys.keys.len() <= 3, "hotkeys: one shortcut per channel (1-3)");
         let mut seen = Vec::new();
         for key in self.hotkeys.keys.iter().filter(|k| !k.is_empty()) {
@@ -919,6 +932,11 @@ mod tests {
         assert!(c.haptics.on_switch && !c.haptics.on_edge);
         assert_eq!(c.haptics.switch_waveform, 12);
         assert!(c.set("haptics.edge_waveform", "40").is_err());
+        c.set("haptics.intensity", "75%").unwrap();
+        assert_eq!(c.haptics.intensity, 75);
+        c.set("haptics.intensity", "options+").unwrap();
+        assert_eq!(c.haptics.intensity, 0);
+        assert!(c.set("haptics.intensity", "120").is_err());
         assert!(c.set("haptics.bogus", "1").is_err());
         c.set("haptics", "false").unwrap();
         assert!(!c.haptics.on_switch && !c.haptics.on_edge);

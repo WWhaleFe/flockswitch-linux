@@ -164,14 +164,22 @@ impl Device {
         })
     }
 
-    /// Whether haptic playback is enabled on the device (0x19B0 getConfiguration, flag
-    /// bit 0), which Logi Options+ controls. None when unknown.
-    pub fn haptics_enabled(&self, ep: &mut Endpoint) -> Result<Option<bool>> {
+    /// The haptic configuration (0x19B0 getConfiguration): flags (bit 0 = haptics on,
+    /// bit 1 = power save) and the strength in percent, as Logi Options+ sets them.
+    pub fn haptic_config(&self, ep: &mut Endpoint) -> Result<Option<(u8, u8)>> {
         let Some(fi) = self.feature(FEATURE_HAPTIC) else { return Ok(None) };
         Ok(match ep.request(self.index, fi, 1, &[], FAST_TIMEOUT)? {
-            Reply::Ok(r) if !r.is_empty() => Some(r[0] & 0x01 != 0),
+            Reply::Ok(r) if r.len() >= 2 => Some((r[0], r[1])),
             _ => None,
         })
+    }
+
+    /// Sets the haptic flags and strength (0x19B0 setConfiguration). The device keeps
+    /// this only until it loses power, so the engine applies it again when the mouse
+    /// comes back.
+    pub fn set_haptic_config(&self, ep: &mut Endpoint, flags: u8, intensity: u8) -> Result<bool> {
+        let Some(fi) = self.feature(FEATURE_HAPTIC) else { return Ok(false) };
+        Ok(matches!(ep.request(self.index, fi, 2, &[flags, intensity, 0], FAST_TIMEOUT)?, Reply::Ok(_)))
     }
 
     /// Plays a haptic waveform (0x19B0 play). The device answers at once; the waveform

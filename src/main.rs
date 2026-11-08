@@ -54,6 +54,7 @@ USAGE:
                               set edge.cursor true  put the cursor at that edge when the mouse comes back
                               set haptics.switch true          MX Master 4: a pulse when switching
                               set haptics.edge true            pulses while waiting at a screen edge
+                              set haptics.intensity 75         strength 1-100% (0 = as Logi Options+ sets it)
                               set haptics.edge_waveform 4      waveform IDs 0-14, 27 (also switch_waveform,
                                                     arrive_waveform)
     flockswitch help

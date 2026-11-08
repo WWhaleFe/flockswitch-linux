@@ -963,6 +963,14 @@ impl SettingsApp {
             if switch_row(ui, p, t.haptics_edge, None, &mut on) {
                 self.apply(|c| c.haptics.on_edge = on);
             }
+            divider(ui, p);
+            // 0 = as Logi Options+ sets it; otherwise the strength in percent.
+            let choices: [(u8, &str); 5] = [(0, t.haptics_follow), (25, "25%"), (50, "50%"), (75, "75%"), (100, "100%")];
+            let mut level = self.cfg.haptics.intensity;
+            let width = (ui.available_width() * 0.66).min(320.0);
+            if labeled_row(ui, p, t.haptics_intensity, width, ROW_SMALL, |ui| segmented(ui, p, "haptic-intensity", &mut level, &choices, SEG_SMALL)) {
+                self.apply(|c| c.haptics.intensity = level);
+            }
             hint(ui, p, t.haptics_hint);
             ui.add_space(10.0);
         });

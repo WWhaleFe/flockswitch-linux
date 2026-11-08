@@ -251,8 +251,16 @@ impl Engine {
             self.held.clear();
             self.gesture = None;
         }
+        let intensity_changed = next.haptics.intensity != self.cfg.haptics.intensity;
         self.cfg = next;
         log::info!("settings changed ({})", self.mode_text());
+        if intensity_changed {
+            self.apply_haptic_intensity();
+            // A pulse at the new strength, so the hand can judge it.
+            if self.cfg.haptics.intensity != 0 {
+                self.buzz(self.cfg.haptics.switch_waveform);
+            }
+        }
         if self.cfg.enabled {
             self.ensure_diverted()?;
         } else {
@@ -344,11 +352,32 @@ impl Engine {
         let mask = d.haptic_waveforms(ep).ok().flatten()?;
         if self.trigger_haptics != Some(mask) {
             log::info!("haptics: {} offers waveforms {mask:#010x}", d.label());
-            if d.haptics_enabled(ep).ok().flatten() == Some(false) {
+            if self.cfg.haptics.intensity == 0 && d.haptic_config(ep).ok().flatten().is_some_and(|(flags, _)| flags & 0x01 == 0) {
                 log::warn!("haptics are turned off on {} (a Logi Options+ setting), so it will not vibrate", d.label());
             }
         }
         Some(mask)
+    }
+
+    /// Puts the strength the settings ask for on the mouse (0x19B0 setConfiguration),
+    /// turning haptics on if they were off; 0 leaves the mouse as Logi Options+ set it.
+    /// The mouse forgets this when it loses power, so it is applied whenever it is here.
+    fn apply_haptic_intensity(&mut self) {
+        let wanted = self.cfg.haptics.intensity;
+        let (Some(d), Some(_)) = (self.trigger.clone(), self.trigger_haptics) else { return };
+        if wanted == 0 || !self.online.contains(&(d.endpoint, d.index)) {
+            return;
+        }
+        let Some(ep) = self.endpoints.get_mut(d.endpoint) else { return };
+        let Ok(Some((flags, now))) = d.haptic_config(ep) else { return };
+        if now == wanted && flags & 0x01 != 0 {
+            return;
+        }
+        match d.set_haptic_config(ep, flags | 0x01, wanted) {
+            Ok(true) => log::info!("haptics: {} strength {wanted}% (was {now}%)", d.label()),
+            Ok(false) => log::warn!("haptics: {} did not accept strength {wanted}%", d.label()),
+            Err(e) => log::debug!("haptics: {e:#}"),
+        }
     }
 
     /// Plays a haptic waveform on the master mouse, if it is here and has that waveform.
@@ -401,6 +430,7 @@ impl Engine {
                 log::info!("trigger: {}", t.label());
                 self.read_channel();
             }
+            self.apply_haptic_intensity();
             self.greet_trigger();
             self.publish();
         }
@@ -677,6 +707,7 @@ impl Engine {
                 }
                 if self.is_trigger(endpoint, slot) {
                     self.read_channel();
+                    self.apply_haptic_intensity();
                     self.greet_trigger();
                 }
             } else if left > 1 {

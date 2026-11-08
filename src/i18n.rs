@@ -115,6 +115,8 @@ pub struct Texts {
     pub haptics_switch: &'static str,
     pub haptics_edge: &'static str,
     pub haptics_hint: &'static str,
+    pub haptics_intensity: &'static str,
+    pub haptics_follow: &'static str,
 }
 
 const KO: Texts = Texts {
@@ -231,7 +233,9 @@ const KO: Texts = Texts {
     section_haptics: "진동 (MX Master 4)",
     haptics_switch: "채널을 전환할 때 진동",
     haptics_edge: "모서리에서 전환을 기다리는 동안 진동",
-    haptics_hint: "진동 모터가 있는 Logitech 마우스(MX Master 4)에서만 울립니다. 마우스가 떠날 때와 돌아왔을 때 한 번씩, 모서리에서는 머무는 동안 짧게 반복됩니다. 세기는 Logi Options+의 햅틱 설정을 따릅니다. 명령줄 set haptics.switch_waveform 등으로 파형(0~14, 27)을 바꿀 수 있습니다.",
+    haptics_hint: "진동 모터가 있는 Logitech 마우스(MX Master 4)에서만 울립니다. 마우스가 떠날 때와 돌아왔을 때 한 번씩, 모서리에서는 머무는 동안 짧게 반복됩니다. 세기를 고르면 마우스에 바로 적용되고 한 번 울려서 확인할 수 있습니다. 마우스는 전원이 꺼지면 세기를 잊으므로 돌아올 때마다 다시 적용합니다. 'Options+'는 Logi Options+의 설정을 그대로 둡니다. 명령줄 set haptics.switch_waveform 등으로 파형(0~14, 27)을 바꿀 수 있습니다.",
+    haptics_intensity: "진동 세기",
+    haptics_follow: "Options+",
 };
 
 const EN: Texts = Texts {
@@ -348,7 +352,9 @@ Supported mice: flockswitch was built and tested with MX Master 3 and 4. The Lin
     section_haptics: "Haptics (MX Master 4)",
     haptics_switch: "Pulse when switching channels",
     haptics_edge: "Pulse while waiting at a screen edge",
-    haptics_hint: "Only a Logitech mouse with a haptic motor (MX Master 4) vibrates. One pulse as the mouse leaves and one when it is back; at a screen edge, short pulses while the cursor waits. The strength follows the haptics setting in Logi Options+. The waveforms (0-14, 27) can be changed on the command line with set haptics.switch_waveform and the like.",
+    haptics_hint: "Only a Logitech mouse with a haptic motor (MX Master 4) vibrates. One pulse as the mouse leaves and one when it is back; at a screen edge, short pulses while the cursor waits. A strength you choose goes to the mouse at once, with a pulse to judge it by; the mouse forgets it when it loses power, so it is applied again whenever the mouse is here. 'Options+' leaves the Logi Options+ setting alone. The waveforms (0-14, 27) can be changed on the command line with set haptics.switch_waveform and the like.",
+    haptics_intensity: "Strength",
+    haptics_follow: "Options+",
 };
 
 /// 0 = not set yet (follow the system), 1 = Korean, 2 = English.
