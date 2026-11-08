@@ -22,6 +22,8 @@ const DISPLAYS_POLL: Duration = Duration::from_secs(2);
 const COOLDOWN: Duration = Duration::from_secs(2);
 /// How far in from the edge the cursor is put when the mouse arrives.
 const INSET: f64 = 24.0;
+/// While the cursor waits at an edge, the mouse pulses this often (if it has a motor).
+const HAPTIC_TICK: Duration = Duration::from_millis(150);
 
 /// A display, in the global desktop coordinates the platform uses.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -119,6 +121,7 @@ fn watch(shared: Arc<Shared>) {
     // The cursor has left the edges since the last decision, so a new rest counts.
     let mut armed = true;
     let mut last_switch: Option<Instant> = None;
+    let mut last_tick: Option<Instant> = None;
 
     while !shared.stopped() {
         std::thread::sleep(POLL);
@@ -180,15 +183,23 @@ fn watch(shared: Arc<Shared>) {
         let Some(edge) = edge_at(&displays, x, y, f64::from(cfg.edges.corner_margin)) else {
             resting = None;
             armed = true;
+            last_tick = None;
             continue;
         };
         let since = match resting {
             Some((e, t)) if e == edge => t,
             _ => {
                 resting = Some((edge, Instant::now()));
+                last_tick = None;
                 continue;
             }
         };
+        // Waiting at an edge that will switch: the mouse pulses so the hand knows.
+        let will_switch = armed && cfg.edges.channel(edge) != 0 && mouse_here && here != Some(cfg.edges.channel(edge));
+        if will_switch && cfg.haptics.on_edge && last_tick.is_none_or(|t| t.elapsed() >= HAPTIC_TICK) {
+            last_tick = Some(Instant::now());
+            shared.request_haptic(cfg.haptics.edge_waveform);
+        }
         if !armed || since.elapsed() < Duration::from_millis(cfg.edges.dwell_ms) {
             continue;
         }

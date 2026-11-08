@@ -492,6 +492,7 @@ impl eframe::App for SettingsApp {
                         }
                         Tab::General => {
                             notice(ui, p, t);
+                            self.haptics_section(ui, t, p);
                             self.general_section(ui, t, p);
                             self.update_section(ui, t, p);
                             self.report_section(ui, t, p);
@@ -946,6 +947,24 @@ impl SettingsApp {
                     self.apply(|c| c.toggle_follow(&keys, &key));
                 }
             }
+        });
+    }
+
+    /// Vibration on a mouse with a haptic motor: when switching, and while waiting at
+    /// a screen edge.
+    fn haptics_section(&mut self, ui: &mut Ui, t: &Texts, p: Palette) {
+        section(ui, p, t.section_haptics, |ui| {
+            let mut on = self.cfg.haptics.on_switch;
+            if switch_row(ui, p, t.haptics_switch, None, &mut on) {
+                self.apply(|c| c.haptics.on_switch = on);
+            }
+            divider(ui, p);
+            let mut on = self.cfg.haptics.on_edge;
+            if switch_row(ui, p, t.haptics_edge, None, &mut on) {
+                self.apply(|c| c.haptics.on_edge = on);
+            }
+            hint(ui, p, t.haptics_hint);
+            ui.add_space(10.0);
         });
     }
 

@@ -52,6 +52,10 @@ USAGE:
                               set edge.right 2      the channel of that edge (left/right/top/bottom; none = off)
                               set edge.dwell 500    how long the cursor must rest there (ms)
                               set edge.cursor true  put the cursor at that edge when the mouse comes back
+                              set haptics.switch true          MX Master 4: a pulse when switching
+                              set haptics.edge true            pulses while waiting at a screen edge
+                              set haptics.edge_waveform 4      waveform IDs 0-14, 27 (also switch_waveform,
+                                                    arrive_waveform)
     flockswitch help
 
 Set RUST_LOG=debug for more detail.";
@@ -221,8 +225,16 @@ fn list() -> Result<()> {
             })
             .collect();
         let trig = if buttons.is_empty() { String::new() } else { format!(", buttons {}", buttons.join(" ")) };
+        // Haptic waveforms the device offers (MX Master 4), for the haptics.*_waveform settings.
+        let haptics = match d.haptic_waveforms(ep) {
+            Ok(Some(mask)) => {
+                let ids: Vec<String> = (0..32).filter(|&i| mask & (1u32 << i) != 0).map(|i| i.to_string()).collect();
+                format!(", haptic waveforms {}", ids.join(","))
+            }
+            _ => String::new(),
+        };
         let kind = d.kind.map(|k| format!("{k:?}")).unwrap_or_else(|| "?".into());
-        println!("  slot {:>3}  {:<28} {:<9} {host}{trig}", d.index, d.label(), kind);
+        println!("  slot {:>3}  {:<28} {:<9} {host}{trig}{haptics}", d.index, d.label(), kind);
     }
     Ok(())
 }

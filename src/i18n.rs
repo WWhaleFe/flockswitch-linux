@@ -111,6 +111,10 @@ pub struct Texts {
     pub edges_corner_hint: &'static str,
     pub seconds_short: &'static str,
     pub edges_wayland: &'static str,
+    pub section_haptics: &'static str,
+    pub haptics_switch: &'static str,
+    pub haptics_edge: &'static str,
+    pub haptics_hint: &'static str,
 }
 
 const KO: Texts = Texts {
@@ -224,6 +228,10 @@ const KO: Texts = Texts {
     edges_corner_hint: "네 귀퉁이(핫 코너, 창 버튼 부근)는 제외됩니다. 모니터가 여러 대면 다른 모니터로 이어지는 가장자리는 전환하지 않습니다.",
     seconds_short: "초",
     edges_wayland: "Wayland에서는 앱이 커서 위치를 읽을 수 없어 화면 모서리 전환을 쓸 수 없습니다. 로그인 화면에서 X11(Xorg) 세션을 고르면 동작합니다.",
+    section_haptics: "진동 (MX Master 4)",
+    haptics_switch: "채널을 전환할 때 진동",
+    haptics_edge: "모서리에서 전환을 기다리는 동안 진동",
+    haptics_hint: "진동 모터가 있는 Logitech 마우스(MX Master 4)에서만 울립니다. 마우스가 떠날 때와 돌아왔을 때 한 번씩, 모서리에서는 머무는 동안 짧게 반복됩니다. 세기는 Logi Options+의 햅틱 설정을 따릅니다. 명령줄 set haptics.switch_waveform 등으로 파형(0~14, 27)을 바꿀 수 있습니다.",
 };
 
 const EN: Texts = Texts {
@@ -337,6 +345,10 @@ Supported mice: flockswitch was built and tested with MX Master 3 and 4. The Lin
     edges_corner_hint: "The corners (hot corners, window buttons) do not count. With several displays, an edge that continues onto another display does not switch.",
     seconds_short: " s",
     edges_wayland: "On Wayland no app can read the cursor position, so switching at the screen edge is not available. It works in an X11 (Xorg) session, chosen on the login screen.",
+    section_haptics: "Haptics (MX Master 4)",
+    haptics_switch: "Pulse when switching channels",
+    haptics_edge: "Pulse while waiting at a screen edge",
+    haptics_hint: "Only a Logitech mouse with a haptic motor (MX Master 4) vibrates. One pulse as the mouse leaves and one when it is back; at a screen edge, short pulses while the cursor waits. The strength follows the haptics setting in Logi Options+. The waveforms (0-14, 27) can be changed on the command line with set haptics.switch_waveform and the like.",
 };
 
 /// 0 = not set yet (follow the system), 1 = Korean, 2 = English.

@@ -248,6 +248,33 @@ impl Edges {
     }
 }
 
+/// Vibration on a mouse with a haptic motor (MX Master 4): a pulse when the mouse is
+/// switched away and when it comes back, and pulses while the cursor waits at a screen
+/// edge. Waveforms are the IDs of HID++ feature 0x19B0 (see `device::waveform`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Haptics {
+    /// A pulse as the mouse leaves, and one when it is back.
+    pub on_switch: bool,
+    /// Pulses while the cursor rests at a screen edge, waiting to switch.
+    pub on_edge: bool,
+    pub switch_waveform: u8,
+    pub arrive_waveform: u8,
+    pub edge_waveform: u8,
+}
+
+impl Default for Haptics {
+    fn default() -> Self {
+        Haptics {
+            on_switch: true,
+            on_edge: true,
+            switch_waveform: crate::device::waveform::COMPLETED,
+            arrive_waveform: crate::device::waveform::DAMP_COLLISION,
+            edge_waveform: crate::device::waveform::SUBTLE_COLLISION,
+        }
+    }
+}
+
 /// Names used for the buttons in the settings file and on the command line.
 pub fn button_name(cid: u16) -> &'static str {
     match cid {
@@ -287,6 +314,8 @@ pub struct Config {
     pub hotkeys: Hotkeys,
     /// Switching at the screen edge.
     pub edges: Edges,
+    /// Vibration on a mouse with a haptic motor.
+    pub haptics: Haptics,
 }
 
 /// Keyboard shortcuts that send the group and the master mouse to a channel; pressed on
@@ -330,6 +359,7 @@ impl Default for Config {
             buttons: Buttons::default(),
             hotkeys: Hotkeys::default(),
             edges: Edges::default(),
+            haptics: Haptics::default(),
         }
     }
 }
@@ -493,6 +523,23 @@ impl Config {
             self.hotkeys.on = value.parse().context("hotkeys must be true or false")?;
             return Ok(());
         }
+        if let Some(what) = key.strip_prefix("haptics.").or((key == "haptics").then_some("on")) {
+            let flag = || value.parse::<bool>().with_context(|| format!("{key} must be true or false"));
+            let wave = || value.trim().parse::<u8>().with_context(|| format!("{key} must be a waveform number (0-31)"));
+            match what {
+                "on" => {
+                    self.haptics.on_switch = flag()?;
+                    self.haptics.on_edge = self.haptics.on_switch;
+                }
+                "switch" => self.haptics.on_switch = flag()?,
+                "edge" => self.haptics.on_edge = flag()?,
+                "switch_waveform" => self.haptics.switch_waveform = wave()?,
+                "arrive_waveform" => self.haptics.arrive_waveform = wave()?,
+                "edge_waveform" => self.haptics.edge_waveform = wave()?,
+                _ => anyhow::bail!("unknown setting '{key}' (haptics.switch, haptics.edge, haptics.switch_waveform, haptics.arrive_waveform, haptics.edge_waveform)"),
+            }
+            return Ok(());
+        }
         if key == "edges" || key == "edges.on" {
             self.edges.on = value.parse().context("edges must be true or false")?;
             return Ok(());
@@ -584,6 +631,9 @@ impl Config {
         }
         anyhow::ensure!((100..=5000).contains(&self.edges.dwell_ms), "edge.dwell must be between 100 and 5000 ms");
         anyhow::ensure!(self.edges.corner_margin <= 1000, "edge.corner must be at most 1000 pixels");
+        for w in [self.haptics.switch_waveform, self.haptics.arrive_waveform, self.haptics.edge_waveform] {
+            anyhow::ensure!(w <= 31, "haptics: waveforms are numbered 0 to 31");
+        }
         anyhow::ensure!(self.hotkeys.keys.len() <= 3, "hotkeys: one shortcut per channel (1-3)");
         let mut seen = Vec::new();
         for key in self.hotkeys.keys.iter().filter(|k| !k.is_empty()) {
@@ -858,6 +908,23 @@ mod tests {
         assert_eq!(back.edges, c.edges);
         // Settings from before edges existed have them off.
         assert_eq!(Config::parse("enabled = true").unwrap().edges, Edges::default());
+    }
+
+    #[test]
+    fn haptics() {
+        let mut c = Config::default();
+        assert!(c.haptics.on_switch && c.haptics.on_edge);
+        c.set("haptics.edge", "false").unwrap();
+        c.set("haptics.switch_waveform", "12").unwrap();
+        assert!(c.haptics.on_switch && !c.haptics.on_edge);
+        assert_eq!(c.haptics.switch_waveform, 12);
+        assert!(c.set("haptics.edge_waveform", "40").is_err());
+        assert!(c.set("haptics.bogus", "1").is_err());
+        c.set("haptics", "false").unwrap();
+        assert!(!c.haptics.on_switch && !c.haptics.on_edge);
+        let back = Config::parse(&toml::to_string_pretty(&c).unwrap()).unwrap();
+        assert_eq!(back.haptics, c.haptics);
+        assert_eq!(Config::parse("enabled = true").unwrap().haptics, Haptics::default());
     }
 
     #[test]

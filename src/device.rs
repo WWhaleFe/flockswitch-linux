@@ -1,5 +1,6 @@
 //! HID++ 2.0 devices reachable through an endpoint, and the features flockswitch uses:
-//! device name (0x0005), Change Host (0x1814) and Reprogrammable Controls v4 (0x1B04).
+//! device name (0x0005), Change Host (0x1814), Reprogrammable Controls v4 (0x1B04) and
+//! Haptic Feedback (0x19B0, the MX Master 4's vibration motor).
 
 use crate::hidpp::{Endpoint, EndpointKind, Reply, DIRECT_INDEX};
 use anyhow::Result;
@@ -10,6 +11,32 @@ pub const FEATURE_ROOT: u16 = 0x0000;
 pub const FEATURE_NAME: u16 = 0x0005;
 pub const FEATURE_CHANGE_HOST: u16 = 0x1814;
 pub const FEATURE_REPROG_V4: u16 = 0x1B04;
+/// Haptic feedback: not in Logitech's public documents; reverse-engineered by Solaar,
+/// OpenLogi and others. Function 0 lists the waveforms the device has, 4 plays one.
+pub const FEATURE_HAPTIC: u16 = 0x19B0;
+
+/// Haptic waveform IDs of feature 0x19B0 (the names Logi Options+ uses). The MX Master 4
+/// offers 0-14 and 27; see `Device::haptic_waveforms`. Kept whole as the reference for
+/// the `haptics.*_waveform` settings.
+#[allow(dead_code)]
+pub mod waveform {
+    pub const SHARP_STATE_CHANGE: u8 = 0;
+    pub const DAMP_STATE_CHANGE: u8 = 1;
+    pub const SHARP_COLLISION: u8 = 2;
+    pub const DAMP_COLLISION: u8 = 3;
+    pub const SUBTLE_COLLISION: u8 = 4;
+    pub const HAPPY_ALERT: u8 = 5;
+    pub const ANGRY_ALERT: u8 = 6;
+    pub const COMPLETED: u8 = 7;
+    pub const SQUARE: u8 = 8;
+    pub const WAVE: u8 = 9;
+    pub const FIREWORK: u8 = 10;
+    pub const MAD: u8 = 11;
+    pub const KNOCK: u8 = 12;
+    pub const JINGLE: u8 = 13;
+    pub const RINGING: u8 = 14;
+    pub const WHISPER_COLLISION: u8 = 27;
+}
 
 /// Keyboards answer slowly when they wake from sleep; 0.6 s was measured to be too short.
 pub const SLOW_TIMEOUT: Duration = Duration::from_millis(2000);
@@ -125,6 +152,33 @@ impl Device {
         let Some(fi) = self.feature(FEATURE_CHANGE_HOST) else { return Ok(false) };
         ep.request(self.index, fi, 1, &[channel], Duration::from_millis(300))?;
         Ok(true)
+    }
+
+    /// The haptic waveforms the device offers, as a bit mask (bit N = waveform N), from
+    /// feature 0x19B0 getCapabilities. None when the device has no haptics or is away.
+    pub fn haptic_waveforms(&self, ep: &mut Endpoint) -> Result<Option<u32>> {
+        let Some(fi) = self.feature(FEATURE_HAPTIC) else { return Ok(None) };
+        Ok(match ep.request(self.index, fi, 0, &[], FAST_TIMEOUT)? {
+            Reply::Ok(r) if r.len() >= 8 => Some(u32::from_be_bytes([r[4], r[5], r[6], r[7]])),
+            _ => None,
+        })
+    }
+
+    /// Whether haptic playback is enabled on the device (0x19B0 getConfiguration, flag
+    /// bit 0), which Logi Options+ controls. None when unknown.
+    pub fn haptics_enabled(&self, ep: &mut Endpoint) -> Result<Option<bool>> {
+        let Some(fi) = self.feature(FEATURE_HAPTIC) else { return Ok(None) };
+        Ok(match ep.request(self.index, fi, 1, &[], FAST_TIMEOUT)? {
+            Reply::Ok(r) if !r.is_empty() => Some(r[0] & 0x01 != 0),
+            _ => None,
+        })
+    }
+
+    /// Plays a haptic waveform (0x19B0 play). The device answers at once; the waveform
+    /// itself takes a moment, so a caller about to move the mouse away should wait.
+    pub fn play_haptic(&self, ep: &mut Endpoint, waveform: u8) -> Result<bool> {
+        let Some(fi) = self.feature(FEATURE_HAPTIC) else { return Ok(false) };
+        Ok(matches!(ep.request(self.index, fi, 4, &[waveform, 0, 0], Duration::from_millis(300))?, Reply::Ok(_)))
     }
 
     /// Reads how a control reports right now; None when the device lacks it (or is away).
@@ -263,7 +317,7 @@ pub fn probe_slot(
         return Ok(None);
     }
     let mut features = HashMap::new();
-    for f in [FEATURE_NAME, FEATURE_CHANGE_HOST, FEATURE_REPROG_V4] {
+    for f in [FEATURE_NAME, FEATURE_CHANGE_HOST, FEATURE_REPROG_V4, FEATURE_HAPTIC] {
         if let Some(fi) = feature_index(ep, index, f, SLOW_TIMEOUT)? {
             features.insert(f, fi);
         }

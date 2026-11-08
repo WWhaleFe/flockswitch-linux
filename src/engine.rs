@@ -32,6 +32,8 @@ const ENUMERATE_INTERVAL: Duration = Duration::from_secs(3);
 const MAX_BACKOFF: Duration = Duration::from_secs(60);
 /// The settings window writes config.toml; pick its changes up quickly.
 const CONFIG_CHECK: Duration = Duration::from_millis(700);
+/// A haptic pulse takes a moment to play; Change Host right after would cut it short.
+const HAPTIC_SETTLE: Duration = Duration::from_millis(150);
 
 pub struct Engine {
     shared: Arc<Shared>,
@@ -51,6 +53,10 @@ pub struct Engine {
     original_divert: HashMap<u16, Reporting>,
     /// Which of the trigger buttons the master mouse has.
     trigger_buttons: Vec<u16>,
+    /// Haptic waveforms the master mouse offers (bit N = waveform N); None without a motor.
+    trigger_haptics: Option<u32>,
+    /// The master mouse was switched away from here; a pulse greets it when it is back.
+    away_by_switch: bool,
     /// Trigger buttons held down right now (a press counts once until released).
     held: HashSet<u16>,
     /// A button with gestures is held: (button, total dx, total dy) of the mouse since.
@@ -86,6 +92,8 @@ impl Engine {
             trigger: None,
             original_divert: HashMap::new(),
             trigger_buttons: Vec::new(),
+            trigger_haptics: None,
+            away_by_switch: false,
             held: HashSet::new(),
             gesture: None,
             pending: HashMap::new(),
@@ -320,11 +328,64 @@ impl Engine {
             let has = buttons_on(&d, &mut self.endpoints[d.endpoint], &BUTTONS);
             if has.iter().any(|&c| self.cfg.button(c).on) {
                 self.trigger_buttons = has;
+                self.trigger_haptics = self.read_haptics(&d);
                 return Ok(Some(d));
             }
         }
         self.trigger_buttons.clear();
+        self.trigger_haptics = None;
         Ok(None)
+    }
+
+    /// The haptic waveforms the mouse offers, logged once; a mouse without a motor (or
+    /// away right now) gives None, which is simply "no vibration".
+    fn read_haptics(&mut self, d: &Device) -> Option<u32> {
+        let ep = self.endpoints.get_mut(d.endpoint)?;
+        let mask = d.haptic_waveforms(ep).ok().flatten()?;
+        if self.trigger_haptics != Some(mask) {
+            log::info!("haptics: {} offers waveforms {mask:#010x}", d.label());
+            if d.haptics_enabled(ep).ok().flatten() == Some(false) {
+                log::warn!("haptics are turned off on {} (a Logi Options+ setting), so it will not vibrate", d.label());
+            }
+        }
+        Some(mask)
+    }
+
+    /// Plays a haptic waveform on the master mouse, if it is here and has that waveform.
+    /// Quiet on a mouse without a motor.
+    fn buzz(&mut self, waveform: u8) -> bool {
+        let (Some(d), Some(mask)) = (self.trigger.clone(), self.trigger_haptics) else { return false };
+        if waveform > 31 || mask & (1u32 << waveform) == 0 {
+            log::debug!("haptics: {} has no waveform {waveform}", d.label());
+            return false;
+        }
+        if !self.online.contains(&(d.endpoint, d.index)) {
+            return false;
+        }
+        let Some(ep) = self.endpoints.get_mut(d.endpoint) else { return false };
+        match d.play_haptic(ep, waveform) {
+            Ok(true) => true,
+            Ok(false) => {
+                log::debug!("haptics: {} did not confirm waveform {waveform}", d.label());
+                false
+            }
+            Err(e) => {
+                log::debug!("haptics: {e:#}");
+                false
+            }
+        }
+    }
+
+    /// The master mouse is back on this computer after being switched away from here:
+    /// a pulse says so.
+    fn greet_trigger(&mut self) {
+        if !self.away_by_switch || !self.trigger.as_ref().is_some_and(|t| self.online.contains(&(t.endpoint, t.index))) {
+            return;
+        }
+        self.away_by_switch = false;
+        if self.cfg.haptics.on_switch {
+            self.buzz(self.cfg.haptics.arrive_waveform);
+        }
     }
 
     /// Makes sure the buttons switched on are diverted to us, and that a button switched
@@ -340,6 +401,7 @@ impl Engine {
                 log::info!("trigger: {}", t.label());
                 self.read_channel();
             }
+            self.greet_trigger();
             self.publish();
         }
         let Some(d) = self.trigger.clone() else { return Ok(()) };
@@ -420,6 +482,10 @@ impl Engine {
     /// Followers go first so the mouse — the thing the user just pressed — leaves last.
     /// Stale pairing slots answer with an error and are skipped on their own.
     pub fn switch_to(&mut self, channel: u8) -> Result<()> {
+        // A pulse on the mouse as it goes, felt before Change Host takes it away.
+        if self.cfg.haptics.on_switch && self.buzz(self.cfg.haptics.switch_waveform) {
+            std::thread::sleep(HAPTIC_SETTLE);
+        }
         let trigger = self.trigger.clone();
         let is_trigger = |d: &Device| trigger.as_ref().is_some_and(|t| t.endpoint == d.endpoint && t.index == d.index);
         let order: Vec<Device> = self
@@ -463,7 +529,12 @@ impl Engine {
             match state {
                 Some(s) if s.current + 1 == channel => log::debug!("{} already on {channel}", d.label()),
                 Some(s) if channel <= s.count => match d.set_host(ep, channel - 1) {
-                    Ok(_) => log::info!("{} -> channel {channel}", d.label()),
+                    Ok(_) => {
+                        log::info!("{} -> channel {channel}", d.label());
+                        if is_trigger(&d) {
+                            self.away_by_switch = true;
+                        }
+                    }
                     Err(e) => log::warn!("{}: {e:#}", d.label()),
                 },
                 Some(_) => log::warn!("{} has no channel {channel}", d.label()),
@@ -606,6 +677,7 @@ impl Engine {
                 }
                 if self.is_trigger(endpoint, slot) {
                     self.read_channel();
+                    self.greet_trigger();
                 }
             } else if left > 1 {
                 self.pending.insert((endpoint, slot), (now + SLOT_SETTLE, left - 1));
@@ -650,6 +722,9 @@ impl Engine {
             }
             if let Some(channel) = self.shared.take_switch_request().or_else(shared::take_switch_file) {
                 self.on_shortcut(channel);
+            }
+            if let Some(waveform) = self.shared.take_haptic_request() {
+                self.buzz(waveform);
             }
 
             // Rescan when a receiver or Bluetooth device went away (read error, with

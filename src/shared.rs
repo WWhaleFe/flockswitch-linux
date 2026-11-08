@@ -223,6 +223,8 @@ pub struct Shared {
     pub stop: AtomicBool,
     /// Channel asked for by a keyboard shortcut, for the engine to act on (0 = none).
     switch_request: AtomicU8,
+    /// Haptic waveform the edge watcher asks the engine to play on the mouse (+1; 0 = none).
+    haptic_request: AtomicU8,
 }
 
 impl Shared {
@@ -236,6 +238,7 @@ impl Shared {
             last_status_file: Mutex::new(StatusFile { online: vec!["-".into()], ..StatusFile::default() }),
             stop: AtomicBool::new(false),
             switch_request: AtomicU8::new(0),
+            haptic_request: AtomicU8::new(0),
         }
     }
 
@@ -326,6 +329,15 @@ impl Shared {
 
     pub fn take_switch_request(&self) -> Option<u8> {
         Some(self.switch_request.swap(0, Ordering::SeqCst)).filter(|&c| c > 0)
+    }
+
+    /// Asks the engine to play a haptic waveform on the master mouse (if it has a motor).
+    pub fn request_haptic(&self, waveform: u8) {
+        self.haptic_request.store(waveform.saturating_add(1), Ordering::SeqCst);
+    }
+
+    pub fn take_haptic_request(&self) -> Option<u8> {
+        Some(self.haptic_request.swap(0, Ordering::SeqCst)).filter(|&w| w > 0).map(|w| w - 1)
     }
 
     pub fn stopped(&self) -> bool {
