@@ -1,6 +1,6 @@
 [package]
 name = "flockswitch"
-version = "0.1.2"
+version = "0.2.0"
 edition = "2021"
 license = "MIT"
 description = "Turn a spare Logitech mouse button into an Easy-Switch key that moves your mouse and keyboard to another computer together"
@@ -22,6 +22,8 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sys-locale = "0.3.2"
 toml = "0.8"
+# Cursor position and display layout for switching at the screen edge (X11 only).
+x11-dl = "2.21"
 # StatusNotifierItem over D-Bus: no GTK or libappindicator needed.
 tray-icon = { version = "0.26.1", default-features = false, features = ["ksni"] }
 # Load libwayland at run time (no -dev package to build) and draw a title bar where the

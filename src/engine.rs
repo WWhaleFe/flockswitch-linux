@@ -474,13 +474,13 @@ impl Engine {
         Ok(())
     }
 
-    /// A keyboard shortcut: the group and the master mouse go to `channel`. Only devices
-    /// on this computer can be told to move.
+    /// A keyboard shortcut or the screen edge: the group and the master mouse go to
+    /// `channel`. Only devices on this computer can be told to move.
     fn on_shortcut(&mut self, channel: u8) {
         if !self.cfg.enabled {
             return;
         }
-        log::info!("shortcut: channel {channel}");
+        log::info!("shortcut or screen edge: channel {channel}");
         if let Err(e) = self.switch_to(channel) {
             log::warn!("{e:#}");
         }

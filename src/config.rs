@@ -166,6 +166,88 @@ impl Default for Buttons {
     }
 }
 
+/// A side of the screen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Edge {
+    Left,
+    Right,
+    Top,
+    Bottom,
+}
+
+pub const EDGES: [Edge; 4] = [Edge::Left, Edge::Right, Edge::Top, Edge::Bottom];
+
+impl Edge {
+    /// Name in the settings file and on the command line.
+    pub fn name(self) -> &'static str {
+        match self {
+            Edge::Left => "left",
+            Edge::Right => "right",
+            Edge::Top => "top",
+            Edge::Bottom => "bottom",
+        }
+    }
+
+    pub fn from_name(name: &str) -> Option<Edge> {
+        EDGES.into_iter().find(|e| e.name() == name.trim().to_lowercase())
+    }
+}
+
+/// Switching at the screen edge: rest the cursor against an outer edge of the desktop
+/// and the group goes to that edge's channel. Each computer watches its own screen.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Edges {
+    pub on: bool,
+    /// How long (ms) the cursor must rest against the edge first.
+    pub dwell_ms: u64,
+    /// Channel (1-3) each edge goes to; 0 = that edge does nothing.
+    pub left: u8,
+    pub right: u8,
+    pub top: u8,
+    pub bottom: u8,
+    /// Pixels at each end of an edge that do not count (hot corners, window buttons).
+    pub corner_margin: u32,
+    /// When the mouse comes back, put the cursor at the edge it left by.
+    pub place_cursor: bool,
+}
+
+impl Default for Edges {
+    fn default() -> Self {
+        Edges { on: false, dwell_ms: 500, left: 0, right: 0, top: 0, bottom: 0, corner_margin: 80, place_cursor: true }
+    }
+}
+
+impl Edges {
+    pub fn channel(&self, edge: Edge) -> u8 {
+        match edge {
+            Edge::Left => self.left,
+            Edge::Right => self.right,
+            Edge::Top => self.top,
+            Edge::Bottom => self.bottom,
+        }
+    }
+
+    pub fn channel_mut(&mut self, edge: Edge) -> &mut u8 {
+        match edge {
+            Edge::Left => &mut self.left,
+            Edge::Right => &mut self.right,
+            Edge::Top => &mut self.top,
+            Edge::Bottom => &mut self.bottom,
+        }
+    }
+
+    /// The (first) edge that leads to `channel`.
+    pub fn edge_for(&self, channel: u8) -> Option<Edge> {
+        EDGES.into_iter().find(|&e| channel != 0 && self.channel(e) == channel)
+    }
+
+    /// Whether any edge has a channel.
+    pub fn any(&self) -> bool {
+        EDGES.into_iter().any(|e| self.channel(e) != 0)
+    }
+}
+
 /// Names used for the buttons in the settings file and on the command line.
 pub fn button_name(cid: u16) -> &'static str {
     match cid {
@@ -203,6 +285,8 @@ pub struct Config {
     pub buttons: Buttons,
     /// Keyboard shortcuts, one per channel.
     pub hotkeys: Hotkeys,
+    /// Switching at the screen edge.
+    pub edges: Edges,
 }
 
 /// Keyboard shortcuts that send the group and the master mouse to a channel; pressed on
@@ -245,6 +329,7 @@ impl Default for Config {
             check_updates: true,
             buttons: Buttons::default(),
             hotkeys: Hotkeys::default(),
+            edges: Edges::default(),
         }
     }
 }
@@ -408,6 +493,27 @@ impl Config {
             self.hotkeys.on = value.parse().context("hotkeys must be true or false")?;
             return Ok(());
         }
+        if key == "edges" || key == "edges.on" {
+            self.edges.on = value.parse().context("edges must be true or false")?;
+            return Ok(());
+        }
+        if let Some(what) = key.strip_prefix("edge.") {
+            match what {
+                "dwell" | "dwell_ms" => self.edges.dwell_ms = value.trim().parse().context("edge.dwell must be milliseconds, e.g. 500")?,
+                "cursor" | "place_cursor" => self.edges.place_cursor = value.parse().context("edge.cursor must be true or false")?,
+                "corner" | "corner_margin" => self.edges.corner_margin = value.trim().parse().context("edge.corner must be pixels, e.g. 80")?,
+                side => {
+                    let edge = Edge::from_name(side).with_context(|| format!("unknown edge '{side}' (left, right, top, bottom)"))?;
+                    let channel = if value.eq_ignore_ascii_case("none") || value.eq_ignore_ascii_case("off") {
+                        0
+                    } else {
+                        value.trim().parse::<u8>().context("the edge's channel must be 1, 2, 3 or none")?
+                    };
+                    *self.edges.channel_mut(edge) = channel;
+                }
+            }
+            return Ok(());
+        }
         if let Some(n) = key.strip_prefix("hotkey.") {
             let channel = n.parse::<u8>().ok().filter(|c| (1..=3).contains(c)).context("use hotkey.1, hotkey.2 or hotkey.3")?;
             let value = if value.eq_ignore_ascii_case("none") { "" } else { value };
@@ -473,6 +579,11 @@ impl Config {
         }
         anyhow::ensure!(!self.triggers().is_empty(), "turn on at least one button");
         anyhow::ensure!(["ko", "en"].contains(&self.language.as_str()), "language must be ko or en");
+        for e in EDGES {
+            anyhow::ensure!(self.edges.channel(e) <= 3, "edge.{}: the channel must be 1, 2, 3 or none", e.name());
+        }
+        anyhow::ensure!((100..=5000).contains(&self.edges.dwell_ms), "edge.dwell must be between 100 and 5000 ms");
+        anyhow::ensure!(self.edges.corner_margin <= 1000, "edge.corner must be at most 1000 pixels");
         anyhow::ensure!(self.hotkeys.keys.len() <= 3, "hotkeys: one shortcut per channel (1-3)");
         let mut seen = Vec::new();
         for key in self.hotkeys.keys.iter().filter(|k| !k.is_empty()) {
@@ -725,6 +836,28 @@ mod tests {
         assert!(c.follows(None, "MX Keys S"));
         c.follow = vec![];
         assert!(!c.follows(Some(0xB366), "MX Mechanical"));
+    }
+
+    #[test]
+    fn edges() {
+        let mut c = Config::default();
+        assert!(!c.edges.on && !c.edges.any());
+        c.set("edges", "true").unwrap();
+        c.set("edge.right", "2").unwrap();
+        c.set("edge.left", "none").unwrap();
+        c.set("edge.dwell", "800").unwrap();
+        assert!(c.edges.on && c.edges.any());
+        assert_eq!(c.edges.channel(Edge::Right), 2);
+        assert_eq!(c.edges.edge_for(2), Some(Edge::Right));
+        assert_eq!(c.edges.edge_for(1), None);
+        assert_eq!(c.edges.dwell_ms, 800);
+        assert!(c.set("edge.right", "4").is_err());
+        assert!(c.set("edge.dwell", "50").is_err());
+        assert!(c.set("edge.middle", "1").is_err());
+        let back = Config::parse(&toml::to_string_pretty(&c).unwrap()).unwrap();
+        assert_eq!(back.edges, c.edges);
+        // Settings from before edges existed have them off.
+        assert_eq!(Config::parse("enabled = true").unwrap().edges, Edges::default());
     }
 
     #[test]

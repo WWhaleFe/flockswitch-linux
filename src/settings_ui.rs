@@ -3,7 +3,7 @@
 //! engine reloads within a second. Every change applies immediately and the window
 //! stays open, unlike a native menu that closes after each click.
 
-use crate::config::{pick, Config, Gesture, BUTTON_GESTURE, BUTTON_MIDDLE, BUTTON_WHEEL_MODE};
+use crate::config::{pick, Config, Edge, Gesture, BUTTON_GESTURE, BUTTON_MIDDLE, BUTTON_WHEEL_MODE};
 use crate::i18n::{texts, Texts};
 use crate::shared::{self, DeviceInfo, StatusFile};
 use crate::update::{self, Release};
@@ -18,8 +18,9 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 const REFRESH: Duration = Duration::from_secs(1);
-/// The "Shortcuts" entry next to the buttons on the switching tab.
+/// The "Shortcuts" and "Edges" entries next to the buttons on the switching tab.
 const SHORTCUTS_TAB: u16 = 0xFFFF;
+const EDGES_TAB: u16 = 0xFFFE;
 
 /// The app icon, scaled by build.rs (WINDOW_ICON there).
 const ICON_SIDE: u32 = 96;
@@ -174,6 +175,9 @@ struct Palette {
     text: Color32,
     muted: Color32,
     accent: Color32,
+    /// A chosen "Off" segment: neutral gray (Apple's systemGray), so it reads as
+    /// switched off rather than as a choice made.
+    off: Color32,
     green: Color32,
     amber: Color32,
     red: Color32,
@@ -191,6 +195,7 @@ impl Palette {
                 text: Color32::from_rgb(0xF2, 0xF2, 0xF5),
                 muted: Color32::from_rgb(0xA8, 0xA8, 0xB0),
                 accent: Color32::from_rgb(0x6E, 0x7B, 0xFF),
+                off: Color32::from_rgb(0x8E, 0x8E, 0x93),
                 green: Color32::from_rgb(0x30, 0xD1, 0x58),
                 amber: Color32::from_rgb(0xFF, 0xB3, 0x40),
                 red: Color32::from_rgb(0xFF, 0x5A, 0x50),
@@ -205,6 +210,7 @@ impl Palette {
                 text: Color32::from_rgb(0x1C, 0x1C, 0x1E),
                 muted: Color32::from_rgb(0x60, 0x60, 0x68),
                 accent: Color32::from_rgb(0x46, 0x55, 0xE8),
+                off: Color32::from_rgb(0x8E, 0x8E, 0x93),
                 green: Color32::from_rgb(0x1F, 0xA8, 0x45),
                 amber: Color32::from_rgb(0xC2, 0x6A, 0x00),
                 red: Color32::from_rgb(0xD7, 0x2C, 0x24),
@@ -459,7 +465,7 @@ impl eframe::App for SettingsApp {
                 (Tab::General, t.section_general),
             ];
             let labels: Vec<String> = tabs.iter().map(|(_, l)| l.to_string()).collect();
-            if let Some(i) = segments(ui, p, "tabs", &labels, Role::Tab, SEG_NORMAL, None, |i| tabs[i].0 == self.tab) {
+            if let Some(i) = segments(ui, p, "tabs", &labels, Role::Tab, SEG_NORMAL, None, None, |i| tabs[i].0 == self.tab) {
                 self.tab = tabs[i].0;
             }
             // Pages are short enough to fit; if one grows (many devices, a long error),
@@ -595,14 +601,14 @@ impl SettingsApp {
             ui.label(RichText::new(t.section_buttons).font(bold(13.0)).color(p.muted));
         });
         ui.add_space(4.0);
-        let tab_ids: Vec<u16> = buttons.iter().map(|b| b.0).chain([SHORTCUTS_TAB]).collect();
+        let tab_ids: Vec<u16> = buttons.iter().map(|b| b.0).chain([SHORTCUTS_TAB, EDGES_TAB]).collect();
         let labels: Vec<String> = buttons
             .iter()
             .map(|(cid, short, _)| (*short, self.cfg.button(*cid).on))
-            .chain([(t.hotkeys_short, self.cfg.hotkeys.on)])
+            .chain([(t.hotkeys_short, self.cfg.hotkeys.on), (t.edges_short, self.cfg.edges.any())])
             .map(|(short, on)| if on { format!("{short} ✓") } else { short.to_string() })
             .collect();
-        if let Some(i) = segments(ui, p, "button-tabs", &labels, Role::Tab, SEG_NORMAL, None, |i| tab_ids[i] == self.button_tab) {
+        if let Some(i) = segments(ui, p, "button-tabs", &labels, Role::Tab, SEG_NORMAL, None, None, |i| tab_ids[i] == self.button_tab) {
             self.button_tab = tab_ids[i];
             self.stop_recording();
         }
@@ -611,23 +617,19 @@ impl SettingsApp {
             card(ui, p, |ui| self.shortcut_rows(ui, t, p));
             return;
         }
+        if self.button_tab == EDGES_TAB {
+            ui.add_space(8.0);
+            card(ui, p, |ui| self.edge_rows(ui, t, p));
+            return;
+        }
         let (cid, _, label) = buttons.into_iter().find(|b| b.0 == self.button_tab).unwrap_or(buttons[0]);
 
         ui.add_space(8.0);
         card(ui, p, |ui| {
-            // Only known while the master mouse is on this computer.
+            // Only known while the master mouse is on this computer. The button is
+            // turned off with the "Off" segment of its channel row.
             let missing = self.status.trigger.is_some() && !self.status.buttons.contains(&cid);
-            let mut on = self.cfg.button(cid).on;
-            if switch_row(ui, p, label, missing.then_some(t.not_on_mouse), &mut on) {
-                if !on && self.cfg.triggers() == [cid] {
-                    self.error = Some(t.need_one_button.into());
-                } else {
-                    self.apply(|c| c.button_mut(cid).on = on);
-                }
-            }
-            if !self.cfg.button(cid).on {
-                return;
-            }
+            title_row(ui, p, label, missing.then_some(t.not_on_mouse));
             divider(ui, p);
             if cid == BUTTON_GESTURE {
                 self.gesture_rows(ui, t, p, cid);
@@ -707,6 +709,64 @@ impl SettingsApp {
         }
     }
 
+    /// Switching at the screen edge: on/off, the channel of each side, how long the
+    /// cursor must rest there, and the cursor's return.
+    fn edge_rows(&mut self, ui: &mut Ui, t: &Texts, p: Palette) {
+        if !crate::edge::available() {
+            ui.add_space(8.0);
+            info_box(ui, p, t.edges_wayland);
+            ui.add_space(10.0);
+            return;
+        }
+        // No on/off switch: an edge is on when it has a channel, off on "Off".
+        title_row(ui, p, t.edges_title, None);
+        hint(ui, p, t.edges_hint);
+        ui.add_space(6.0);
+        divider(ui, p);
+        let here = self.status.channel.filter(|c| (1..=3).contains(c));
+        let labels: Vec<String> = [t.off.to_string()].into_iter().chain((1..=3).map(|n| n.to_string())).collect();
+        let width = (ui.available_width() * 0.6).min(260.0);
+        let sides = [(Edge::Left, t.edge_left), (Edge::Right, t.edge_right), (Edge::Top, t.edge_top), (Edge::Bottom, t.edge_bottom)];
+        for (edge, label) in sides {
+            let current = self.cfg.edges.channel(edge);
+            let mut clicked = None;
+            labeled_row(ui, p, label, width, ROW_SMALL, |ui| {
+                // Segment 0 is "off"; this computer's own channel is shown but locked.
+                clicked = segments(ui, p, &format!("edge-{edge:?}"), &labels, Role::RadioButton, SEG_SMALL, here.map(|c| c as usize), Some(0), |i| {
+                    i as u8 == current
+                });
+                false
+            });
+            if let Some(n) = clicked.map(|i| i as u8).filter(|&n| n != current) {
+                self.apply(|c| {
+                    *c.edges.channel_mut(edge) = n;
+                    c.edges.on = c.edges.any();
+                });
+            }
+        }
+        if let Some(c) = here {
+            hint(ui, p, &format!("{} {c}: {}", t.channel, t.here_channel));
+        }
+        ui.add_space(4.0);
+        divider(ui, p);
+        let choices: Vec<(u64, String)> = [(300, "0.3"), (500, "0.5"), (1000, "1"), (2000, "2")]
+            .into_iter()
+            .map(|(ms, text)| (ms, format!("{text}{}", t.seconds_short)))
+            .collect();
+        let choices: Vec<(u64, &str)> = choices.iter().map(|(ms, s)| (*ms, s.as_str())).collect();
+        let mut dwell = self.cfg.edges.dwell_ms;
+        if labeled_row(ui, p, t.edge_dwell, width, ROW_SMALL, |ui| segmented(ui, p, "edge-dwell", &mut dwell, &choices, SEG_SMALL)) {
+            self.apply(|c| c.edges.dwell_ms = dwell);
+        }
+        divider(ui, p);
+        let mut place = self.cfg.edges.place_cursor;
+        if switch_row(ui, p, t.edge_place, None, &mut place) {
+            self.apply(|c| c.edges.place_cursor = place);
+        }
+        hint(ui, p, t.edges_corner_hint);
+        ui.add_space(10.0);
+    }
+
     fn stop_recording(&mut self) {
         if self.recording.take().is_some() {
             crate::hotkey::end_pause();
@@ -752,59 +812,75 @@ impl SettingsApp {
             .map(|(g, l)| if moves.get(*g).is_some_and(|m| m.on) { format!("{l} ✓") } else { l.to_string() })
             .collect();
         ui.add_space(10.0);
-        if let Some(i) = segments(ui, p, "gesture-tabs", &labels, Role::Tab, SEG_SMALL, None, |i| gestures[i].0 == self.gesture_tab) {
+        if let Some(i) = segments(ui, p, "gesture-tabs", &labels, Role::Tab, SEG_SMALL, None, None, |i| gestures[i].0 == self.gesture_tab) {
             self.gesture_tab = gestures[i].0;
         }
         hint(ui, p, t.gesture_hint);
         let g = self.gesture_tab;
-        if g == Gesture::Press {
-            self.action_rows(ui, t, p, Slot::Press(cid));
-            return;
-        }
-        ui.add_space(4.0);
-        let mut on = moves.get(g).is_some_and(|m| m.on);
-        if switch_row(ui, p, t.gesture_on, None, &mut on) {
-            self.apply(|c| {
-                if let Some(m) = c.button_mut(cid).moves.get_mut(g) {
-                    m.on = on;
-                }
-            });
-        }
-        if on {
-            self.action_rows(ui, t, p, Slot::Move(cid, g));
-        }
+        let slot = if g == Gesture::Press { Slot::Press(cid) } else { Slot::Move(cid, g) };
+        self.action_rows(ui, t, p, slot);
     }
 
-    /// 이동할 채널 of one slot: the one channel a press sends everything to. Settings are
-    /// kept per computer, so this computer's own channel is shown but cannot be chosen.
+    /// 이동할 채널 of one slot: "Off", or the one channel a press sends everything to.
+    /// Settings are kept per computer, so this computer's own channel is shown but
+    /// cannot be chosen. "Off" turns the button (or the gesture direction) off.
     fn action_rows(&mut self, ui: &mut Ui, t: &Texts, p: Palette, slot: Slot) {
         let channels = slot_channels(&self.cfg, slot);
+        let is_on = match slot {
+            Slot::Press(cid) => self.cfg.button(cid).on,
+            Slot::Move(cid, g) => self.cfg.button(cid).moves.get(g).is_some_and(|m| m.on),
+        };
         let here = self.status.channel.filter(|c| (1..=3).contains(c));
         // Shown as chosen: where a press goes from here (older settings may list several).
         let target = match here {
-            Some(c) => pick(&channels, c, 3),
-            None => channels.first().copied(),
+            Some(c) if is_on => pick(&channels, c, 3),
+            None if is_on => channels.first().copied(),
+            _ => None,
         };
-        let numbers: Vec<String> = (1..=3).map(|n| n.to_string()).collect();
-        let seg_width = (ui.available_width() * 0.5).min(210.0);
+        let labels: Vec<String> = [t.off.to_string()].into_iter().chain((1..=3).map(|n| n.to_string())).collect();
+        let seg_width = (ui.available_width() * 0.6).min(260.0);
         let mut clicked = None;
         ui.add_space(2.0);
         labeled_row(ui, p, t.channels, seg_width, ROW_SMALL, |ui| {
-            let locked = here.map(|c| c as usize - 1);
-            clicked = segments(ui, p, &format!("channels-{slot:?}"), &numbers, Role::RadioButton, SEG_SMALL, locked, |i| {
-                target == Some(i as u8 + 1)
-            })
-            .map(|i| i as u8 + 1);
+            // Segment 0 is "Off"; this computer's own channel is shown but locked.
+            let locked = here.map(|c| c as usize);
+            clicked = segments(ui, p, &format!("channels-{slot:?}"), &labels, Role::RadioButton, SEG_SMALL, locked, Some(0), |i| {
+                if i == 0 { !is_on } else { target == Some(i as u8) }
+            });
             false
         });
         if let Some(c) = here {
             hint(ui, p, &format!("{} {c}: {}", t.channel, t.here_channel));
         }
-        let Some(n) = clicked else { return };
-        if channels == [n] {
+        let Some(i) = clicked else { return };
+        if i == 0 {
+            if !is_on {
+                return;
+            }
+            match slot {
+                Slot::Press(cid) if self.cfg.triggers() == [cid] => self.error = Some(t.need_one_button.into()),
+                Slot::Press(cid) => self.apply(|c| c.button_mut(cid).on = false),
+                Slot::Move(cid, g) => self.apply(|c| {
+                    if let Some(m) = c.button_mut(cid).moves.get_mut(g) {
+                        m.on = false;
+                    }
+                }),
+            }
+            return;
+        }
+        let n = i as u8;
+        if is_on && channels == [n] {
             return;
         }
         self.apply(|c| {
+            match slot {
+                Slot::Press(cid) => c.button_mut(cid).on = true,
+                Slot::Move(cid, g) => {
+                    if let Some(m) = c.button_mut(cid).moves.get_mut(g) {
+                        m.on = true;
+                    }
+                }
+            }
             if let Some(channels) = slot_channels_mut(c, slot) {
                 *channels = vec![n];
             }
@@ -1177,6 +1253,24 @@ fn empty(ui: &mut Ui, p: Palette, text: &str) {
     ui.add_space(8.0);
 }
 
+/// A row with just a label (the setting's rows follow), and a `note` in smaller amber
+/// text under it.
+fn title_row(ui: &mut Ui, p: Palette, label: &str, note: Option<&str>) {
+    let h = if note.is_some() { 50.0 } else { 40.0 };
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), h), Sense::hover());
+    let painter = ui.painter();
+    let left = Pos2::new(rect.left(), rect.center().y);
+    match note {
+        Some(note) => {
+            painter.text(left - Vec2::new(0.0, 1.0), Align2::LEFT_BOTTOM, label, FontId::proportional(14.5), p.text);
+            painter.text(left + Vec2::new(0.0, 3.0), Align2::LEFT_TOP, note, FontId::proportional(12.5), p.amber);
+        }
+        None => {
+            painter.text(left, Align2::LEFT_CENTER, label, FontId::proportional(14.5), p.text);
+        }
+    }
+}
+
 /// A row with a label and an on/off switch on the right. Returns true when flipped.
 /// A `note` shows in smaller text under the label.
 fn switch_row(ui: &mut Ui, p: Palette, label: &str, note: Option<&str>, on: &mut bool) -> bool {
@@ -1263,6 +1357,8 @@ fn segments(
     size: SegSize,
     // A segment shown but not clickable (this computer's channel).
     locked: Option<usize>,
+    // The "Off" segment: chosen, it is drawn gray instead of in the accent colour.
+    off: Option<usize>,
     selected: impl Fn(usize) -> bool,
 ) -> Option<usize> {
     let toggles = role == Role::CheckBox;
@@ -1292,6 +1388,8 @@ fn segments(
         let painter = ui.painter();
         let (fill, color) = if locked {
             (locked_fill(p), Color32::WHITE.gamma_multiply(0.7))
+        } else if on && off == Some(i) {
+            (p.off, Color32::WHITE)
         } else if on {
             (p.accent, Color32::WHITE)
         } else if resp.hovered() {
@@ -1340,7 +1438,7 @@ fn segmented<T: PartialEq + Copy>(
     size: SegSize,
 ) -> bool {
     let labels: Vec<String> = options.iter().map(|(_, l)| l.to_string()).collect();
-    match segments(ui, p, name, &labels, Role::RadioButton, size, None, |i| options[i].0 == *value) {
+    match segments(ui, p, name, &labels, Role::RadioButton, size, None, None, |i| options[i].0 == *value) {
         Some(i) if options[i].0 != *value => {
             *value = options[i].0;
             true

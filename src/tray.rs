@@ -43,6 +43,7 @@ pub fn run(shared: Arc<Shared>) -> Result<()> {
     ctrlc::set_handler(move || s.stop.store(true, std::sync::atomic::Ordering::SeqCst))?;
     let mut engine = Some(spawn_engine(shared.clone()));
     spawn_update_check(shared.clone());
+    crate::edge::spawn(shared.clone());
 
     let mut ui = Ui {
         shared: shared.clone(),

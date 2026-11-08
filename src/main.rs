@@ -3,6 +3,7 @@
 
 mod config;
 mod device;
+mod edge;
 mod engine;
 mod hidpp;
 mod hotkey;
@@ -47,6 +48,10 @@ USAGE:
                               set enabled true|false
                               set hotkeys true      keyboard shortcuts on (any keyboard)
                               set hotkey.2 ctrl+alt+2          shortcut for channel 2 (none = off)
+                              set edges true        switch when the cursor rests at a screen edge
+                              set edge.right 2      the channel of that edge (left/right/top/bottom; none = off)
+                              set edge.dwell 500    how long the cursor must rest there (ms)
+                              set edge.cursor true  put the cursor at that edge when the mouse comes back
     flockswitch help
 
 Set RUST_LOG=debug for more detail.";
@@ -186,6 +191,7 @@ fn run_headless() -> Result<()> {
     let shared = Arc::new(Shared::new(cfg));
     let s = shared.clone();
     ctrlc::set_handler(move || s.stop.store(true, Ordering::SeqCst))?;
+    edge::spawn(shared.clone());
     Engine::new(shared)?.run()
 }
 
