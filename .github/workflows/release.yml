@@ -85,49 +85,10 @@ jobs:
           {
             printf '## 변경 사항\n\n'
             section CHANGELOG.ko.md
-            cat <<'EOF'
-
-### Homebrew 설치 (Linux)
-
-```sh
-# 설치
-brew install wwhalefe/tap/flockswitch
-
-# 초기 설정 (최초 1회 — udev 규칙 및 앱 메뉴 등록)
-sudo install -m 644 "$(brew --prefix)/opt/flockswitch/share/flockswitch/70-flockswitch.rules" /etc/udev/rules.d/
-sudo udevadm control --reload-rules
-sudo udevadm trigger --subsystem-match=hidraw
-mkdir -p ~/.local/share/applications
-ln -sf "$(brew --prefix)/opt/flockswitch/share/applications/flockswitch.desktop" ~/.local/share/applications/
-
-# 업데이트 / 제거
-brew upgrade flockswitch
-flockswitch uninstall && brew uninstall flockswitch
-```
-
-EOF
+            printf '\n### Homebrew 설치 (Linux)\n\n```sh\n# 설치\nbrew install wwhalefe/tap/flockswitch\n\n# 초기 설정 (최초 1회 — udev 규칙 및 앱 메뉴 등록)\nsudo install -m 644 "$(brew --prefix)/opt/flockswitch/share/flockswitch/70-flockswitch.rules" /etc/udev/rules.d/\nsudo udevadm control --reload-rules\nsudo udevadm trigger --subsystem-match=hidraw\nmkdir -p ~/.local/share/applications\nln -sf "$(brew --prefix)/opt/flockswitch/share/applications/flockswitch.desktop" ~/.local/share/applications/\n\n# 업데이트 / 제거\nbrew upgrade flockswitch\nflockswitch uninstall && brew uninstall flockswitch\n```\n\n'
             printf '## Changes\n\n'
             section CHANGELOG.md
-            cat <<'EOF'
-
-### Install with Homebrew (Linux)
-
-```sh
-# Install
-brew install wwhalefe/tap/flockswitch
-
-# First-time setup (udev rule and app menu entry)
-sudo install -m 644 "$(brew --prefix)/opt/flockswitch/share/flockswitch/70-flockswitch.rules" /etc/udev/rules.d/
-sudo udevadm control --reload-rules
-sudo udevadm trigger --subsystem-match=hidraw
-mkdir -p ~/.local/share/applications
-ln -sf "$(brew --prefix)/opt/flockswitch/share/applications/flockswitch.desktop" ~/.local/share/applications/
-
-# Upgrade / Uninstall
-brew upgrade flockswitch
-flockswitch uninstall && brew uninstall flockswitch
-```
-EOF
+            printf '\n### Install with Homebrew (Linux)\n\n```sh\n# Install\nbrew install wwhalefe/tap/flockswitch\n\n# First-time setup (udev rule and app menu entry)\nsudo install -m 644 "$(brew --prefix)/opt/flockswitch/share/flockswitch/70-flockswitch.rules" /etc/udev/rules.d/\nsudo udevadm control --reload-rules\nsudo udevadm trigger --subsystem-match=hidraw\nmkdir -p ~/.local/share/applications\nln -sf "$(brew --prefix)/opt/flockswitch/share/applications/flockswitch.desktop" ~/.local/share/applications/\n\n# Upgrade / Uninstall\nbrew upgrade flockswitch\nflockswitch uninstall && brew uninstall flockswitch\n```\n'
           } > notes.md
           cat notes.md
       - uses: actions/download-artifact@v4
