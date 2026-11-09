@@ -7,8 +7,11 @@
 //! The shared part (edge geometry, the watcher) is the same in every port; the
 //! `platform` module at the end reads the cursor and the displays.
 
-use crate::config::Edge;
+use crate::config::{Edge, Edges, EDGES};
+use crate::device::waveform;
+use crate::overlay;
 use crate::shared::Shared;
+use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -24,6 +27,14 @@ const COOLDOWN: Duration = Duration::from_secs(2);
 const INSET: f64 = 24.0;
 /// While the cursor waits at an edge, the mouse pulses this often (if it has a motor).
 const HAPTIC_TICK: Duration = Duration::from_millis(150);
+/// A pulse takes a moment to play; Change Host right after would cut it short.
+const FINAL_PULSE: Duration = Duration::from_millis(150);
+/// A shake is this many turns within this long, each after this many points of travel.
+const SHAKE_TURNS: usize = 4;
+const SHAKE_WINDOW: Duration = Duration::from_millis(900);
+const SHAKE_MIN_RUN: f64 = 80.0;
+/// After a shake is noticed, the next one counts only after this long.
+const SHAKE_REST: Duration = Duration::from_secs(2);
 
 /// A display, in the global desktop coordinates the platform uses.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -86,6 +97,75 @@ fn last_channel(text: &str) -> Option<u8> {
     text.rsplit(' ').next()?.parse().ok()
 }
 
+/// How the pulses go at `progress` (0..1) of the wait at an edge: the gap to the next
+/// one and its waveform, quicker and sharper as the switch nears.
+fn rising_pulse(progress: f64) -> (Duration, u8) {
+    if progress < 0.40 {
+        (Duration::from_millis(180), waveform::SUBTLE_COLLISION)
+    } else if progress < 0.75 {
+        (Duration::from_millis(110), waveform::DAMP_COLLISION)
+    } else {
+        (Duration::from_millis(60), waveform::SHARP_COLLISION)
+    }
+}
+
+/// Notices the cursor being shaken from side to side.
+#[derive(Default)]
+struct Shake {
+    last_x: Option<f64>,
+    /// Which way the cursor is going (+1 or -1), and how far it has come that way.
+    heading: f64,
+    run: f64,
+    turns: VecDeque<Instant>,
+    noticed: Option<Instant>,
+}
+
+impl Shake {
+    /// Takes the cursor's x position; true at the moment a shake is noticed.
+    fn update(&mut self, x: f64, now: Instant) -> bool {
+        let Some(last) = self.last_x.replace(x) else { return false };
+        let dx = x - last;
+        if dx == 0.0 {
+            return false;
+        }
+        if dx.signum() == self.heading {
+            self.run += dx.abs();
+        } else {
+            if self.run >= SHAKE_MIN_RUN {
+                self.turns.push_back(now);
+            }
+            self.heading = dx.signum();
+            self.run = dx.abs();
+        }
+        self.turns.retain(|t| now.duration_since(*t) <= SHAKE_WINDOW);
+        if self.turns.len() < SHAKE_TURNS || self.noticed.is_some_and(|t| now.duration_since(t) < SHAKE_REST) {
+            return false;
+        }
+        self.noticed = Some(now);
+        self.turns.clear();
+        true
+    }
+}
+
+/// Plays the countdown once, at an edge of the display the cursor is on, for the
+/// settings window. At least a second, so a short wait can still be judged.
+pub fn preview(edges: &Edges) {
+    let displays = platform::displays();
+    let cursor = platform::cursor();
+    let on_cursor = cursor.and_then(|(x, y)| displays.iter().find(|d| d.contains(x, y)));
+    let Some(display) = on_cursor.or(displays.first()) else { return };
+    let edge = EDGES.into_iter().find(|&e| edges.channel(e) != 0).unwrap_or(Edge::Right);
+    let duration = Duration::from_millis(edges.dwell_ms.max(1000));
+    overlay::edge_begin(edges, edge, display, Duration::ZERO, duration, true);
+}
+
+/// Takes the countdown away, if one is showing.
+fn end_countdown(showing: &mut bool) {
+    if std::mem::take(showing) {
+        overlay::edge_end();
+    }
+}
+
 /// Whether this computer can watch its screen edges at all.
 pub fn available() -> bool {
     platform::available()
@@ -122,6 +202,9 @@ fn watch(shared: Arc<Shared>) {
     let mut armed = true;
     let mut last_switch: Option<Instant> = None;
     let mut last_tick: Option<Instant> = None;
+    // The countdown is on the screen.
+    let mut counting_down = false;
+    let mut shake = Shake::default();
 
     while !shared.stopped() {
         std::thread::sleep(POLL);
@@ -154,7 +237,8 @@ fn watch(shared: Arc<Shared>) {
                 landing_channel = st.last_switch.as_deref().and_then(last_channel);
             }
             let now_here = st.trigger.is_some();
-            if now_here && !mouse_here && !first && active && cfg.edges.place_cursor {
+            let arrived = now_here && !mouse_here && !first;
+            if arrived && active && cfg.edges.place_cursor {
                 // The mouse has come back from the channel it was sent to: put the
                 // cursor at that channel's edge, as if it had come in from there.
                 if let Some(edge) = landing_channel.take().and_then(|c| cfg.edges.edge_for(c)) {
@@ -169,10 +253,22 @@ fn watch(shared: Arc<Shared>) {
                     }
                 }
             }
+            if arrived && cfg.locate.on && cfg.locate.on_arrival {
+                overlay::locate(cfg.locate.style);
+            }
             mouse_here = now_here;
+        }
+        if shared.take_locate_request() && cfg.locate.on {
+            overlay::locate(cfg.locate.style);
+        }
+        if cfg.locate.on && cfg.locate.on_shake {
+            if platform::cursor().is_some_and(|(x, _)| shake.update(x, Instant::now())) {
+                overlay::locate(cfg.locate.style);
+            }
         }
         if !active {
             resting = None;
+            end_countdown(&mut counting_down);
             continue;
         }
         if displays_read.is_none_or(|t| t.elapsed() >= DISPLAYS_POLL) {
@@ -184,28 +280,56 @@ fn watch(shared: Arc<Shared>) {
             resting = None;
             armed = true;
             last_tick = None;
+            end_countdown(&mut counting_down);
             continue;
         };
+        // With "hold Control" the wait starts only with the key down; letting go calls
+        // it off, and pressing again at the same edge starts over.
+        if cfg.edges.require_control && !platform::control_down() {
+            resting = None;
+            last_tick = None;
+            end_countdown(&mut counting_down);
+            continue;
+        }
         let since = match resting {
             Some((e, t)) if e == edge => t,
             _ => {
                 resting = Some((edge, Instant::now()));
                 last_tick = None;
+                end_countdown(&mut counting_down);
                 continue;
             }
         };
-        // Waiting at an edge that will switch: the mouse pulses so the hand knows.
-        let will_switch = armed && cfg.edges.channel(edge) != 0 && mouse_here && here != Some(cfg.edges.channel(edge));
-        if will_switch && cfg.haptics.on_edge && last_tick.is_none_or(|t| t.elapsed() >= HAPTIC_TICK) {
-            last_tick = Some(Instant::now());
-            shared.request_haptic(cfg.haptics.edge_waveform);
+        let channel = cfg.edges.channel(edge);
+        let dwell = Duration::from_millis(cfg.edges.dwell_ms);
+        let cooling = last_switch.is_some_and(|t| t.elapsed() < COOLDOWN);
+        let will_switch = armed && channel != 0 && mouse_here && here != Some(channel) && !cooling;
+        if will_switch {
+            if !counting_down {
+                if let Some(display) = displays.iter().find(|d| d.contains(x, y)) {
+                    overlay::edge_begin(&cfg.edges, edge, display, since.elapsed(), dwell, false);
+                    counting_down = true;
+                }
+            }
+            // Waiting at an edge that will switch: the mouse pulses so the hand knows.
+            if cfg.haptics.on_edge {
+                let progress = since.elapsed().as_secs_f64() / dwell.as_secs_f64();
+                let (gap, wave) =
+                    if cfg.haptics.progressive { rising_pulse(progress) } else { (HAPTIC_TICK, cfg.haptics.edge_waveform) };
+                if last_tick.is_none_or(|t| t.elapsed() >= gap) {
+                    last_tick = Some(Instant::now());
+                    shared.request_haptic(wave);
+                }
+            }
+        } else {
+            end_countdown(&mut counting_down);
         }
-        if !armed || since.elapsed() < Duration::from_millis(cfg.edges.dwell_ms) {
+        if !armed || since.elapsed() < dwell {
             continue;
         }
         // One decision per visit to the edge.
         armed = false;
-        let channel = cfg.edges.channel(edge);
+        end_countdown(&mut counting_down);
         if channel == 0 {
             continue;
         }
@@ -217,13 +341,20 @@ fn watch(shared: Arc<Shared>) {
             log::debug!("{} edge: channel {channel} is this computer", edge.name());
             continue;
         }
-        if last_switch.is_some_and(|t| t.elapsed() < COOLDOWN) {
+        if cooling {
             continue;
         }
         log::info!("{} edge: channel {channel}", edge.name());
         last_switch = Some(Instant::now());
+        // The rising pulses end in one last pulse. With pulses on switching, the
+        // engine's own switch pulse is that one.
+        if cfg.haptics.on_edge && cfg.haptics.progressive && !cfg.haptics.on_switch {
+            shared.request_haptic(waveform::COMPLETED);
+            std::thread::sleep(FINAL_PULSE);
+        }
         shared.request_switch(channel);
     }
+    end_countdown(&mut counting_down);
 }
 
 /// The cursor and the displays, from the X server (root-window coordinates, y down),
@@ -233,7 +364,7 @@ mod platform {
     use super::Rect;
     use std::sync::OnceLock;
     use x11_dl::xinerama::Xlib as Xinerama;
-    use x11_dl::xlib::{Display, Xlib};
+    use x11_dl::xlib::{ControlMask, Display, Xlib};
 
     struct X {
         xlib: Xlib,
@@ -241,7 +372,8 @@ mod platform {
         display: *mut Display,
         root: u64,
     }
-    // Safety: only the watcher thread makes X calls; the connection is never shared.
+    // Safety: only one thread per process makes X calls on this connection (the watcher
+    // in the background process, the window's thread for the preview in the settings one).
     unsafe impl Send for X {}
     unsafe impl Sync for X {}
 
@@ -274,8 +406,8 @@ mod platform {
         .as_ref()
     }
 
-    /// Where the cursor is right now.
-    pub fn cursor() -> Option<(f64, f64)> {
+    /// The cursor position and the modifier keys, as of now.
+    fn pointer() -> Option<(f64, f64, u32)> {
         let x = x()?;
         let (mut root, mut child) = (0u64, 0u64);
         let (mut rx, mut ry, mut wx, mut wy) = (0i32, 0i32, 0i32, 0i32);
@@ -283,7 +415,17 @@ mod platform {
         let found = unsafe {
             (x.xlib.XQueryPointer)(x.display, x.root, &mut root, &mut child, &mut rx, &mut ry, &mut wx, &mut wy, &mut mask)
         };
-        (found != 0).then(|| (f64::from(rx), f64::from(ry)))
+        (found != 0).then(|| (f64::from(rx), f64::from(ry), mask))
+    }
+
+    /// Where the cursor is right now.
+    pub fn cursor() -> Option<(f64, f64)> {
+        pointer().map(|(x, y, _)| (x, y))
+    }
+
+    /// Whether a Control key is held right now.
+    pub fn control_down() -> bool {
+        pointer().is_some_and(|(_, _, mask)| mask & ControlMask != 0)
     }
 
     pub fn displays() -> Vec<Rect> {
@@ -378,6 +520,47 @@ mod tests {
         assert!(cursor.is_some());
         let (x, y) = cursor.unwrap();
         println!("edge now: {:?}", edge_at(&displays, x, y, 80.0));
+    }
+
+    #[test]
+    fn pulses_quicken_and_sharpen_towards_the_switch() {
+        assert_eq!(rising_pulse(0.0), (Duration::from_millis(180), waveform::SUBTLE_COLLISION));
+        assert_eq!(rising_pulse(0.39), (Duration::from_millis(180), waveform::SUBTLE_COLLISION));
+        assert_eq!(rising_pulse(0.40), (Duration::from_millis(110), waveform::DAMP_COLLISION));
+        assert_eq!(rising_pulse(0.74), (Duration::from_millis(110), waveform::DAMP_COLLISION));
+        assert_eq!(rising_pulse(0.75), (Duration::from_millis(60), waveform::SHARP_COLLISION));
+        assert_eq!(rising_pulse(1.2), (Duration::from_millis(60), waveform::SHARP_COLLISION));
+    }
+
+    /// Feeds x positions, one poll apart; returns at which positions a shake was noticed.
+    fn shake_on(xs: &[f64]) -> Vec<usize> {
+        let mut s = Shake::default();
+        let start = Instant::now();
+        xs.iter()
+            .enumerate()
+            .filter(|(i, x)| s.update(**x, start + POLL * *i as u32))
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    #[test]
+    fn a_quick_shake_is_noticed_once() {
+        // Back and forth by 300 points, three polls each way.
+        let xs: Vec<f64> = (0..40).map(|i| [0.0, 100.0, 200.0, 300.0, 200.0, 100.0][i % 6]).collect();
+        let noticed = shake_on(&xs);
+        assert_eq!(noticed.len(), 1, "{noticed:?}");
+    }
+
+    #[test]
+    fn ordinary_movement_is_not_a_shake() {
+        let straight: Vec<f64> = (0..60).map(|i| i as f64 * 40.0).collect();
+        assert!(shake_on(&straight).is_empty());
+        // Small wobbles never travel far enough to count.
+        let wobble: Vec<f64> = (0..60).map(|i| if i % 2 == 0 { 0.0 } else { 20.0 }).collect();
+        assert!(shake_on(&wobble).is_empty());
+        // Far enough, but so slowly the turns fall out of the window.
+        let slow: Vec<f64> = (0..400).map(|i| [0.0, 5.0, 10.0, 15.0][i % 4] + ((i / 40) % 2) as f64 * 200.0).collect();
+        assert!(shake_on(&slow).len() <= 1);
     }
 
     #[test]

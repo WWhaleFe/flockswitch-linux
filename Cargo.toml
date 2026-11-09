@@ -1,6 +1,6 @@
 [package]
 name = "flockswitch"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 license = "MIT"
 description = "Turn a spare Logitech mouse button into an Easy-Switch key that moves your mouse and keyboard to another computer together"
@@ -22,6 +22,8 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sys-locale = "0.3.2"
 toml = "0.8"
+# Draws the countdown and locate effects (overlay_render.rs).
+tiny-skia = { version = "0.11", default-features = false, features = ["std", "simd"] }
 # Cursor position and display layout for switching at the screen edge (X11 only).
 x11-dl = "2.21"
 # StatusNotifierItem over D-Bus: no GTK or libappindicator needed.

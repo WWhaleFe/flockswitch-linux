@@ -35,7 +35,7 @@ pub struct Status {
     pub last_switch: Option<String>,
     /// Trigger buttons the master mouse has (control IDs).
     pub buttons: Vec<u16>,
-    /// Channels whose keyboard shortcut could not be registered.
+    /// Channels whose keyboard shortcut could not be registered (0 = the locate shortcut).
     pub hotkeys_failed: Vec<u8>,
     /// This computer's channel (1-based): the one the master mouse was on when last
     /// seen here. Kept while the mouse is away.
@@ -225,6 +225,8 @@ pub struct Shared {
     switch_request: AtomicU8,
     /// Haptic waveform the edge watcher asks the engine to play on the mouse (+1; 0 = none).
     haptic_request: AtomicU8,
+    /// The locate-the-cursor shortcut was pressed.
+    locate_request: AtomicBool,
 }
 
 impl Shared {
@@ -239,6 +241,7 @@ impl Shared {
             stop: AtomicBool::new(false),
             switch_request: AtomicU8::new(0),
             haptic_request: AtomicU8::new(0),
+            locate_request: AtomicBool::new(false),
         }
     }
 
@@ -338,6 +341,15 @@ impl Shared {
 
     pub fn take_haptic_request(&self) -> Option<u8> {
         Some(self.haptic_request.swap(0, Ordering::SeqCst)).filter(|&w| w > 0).map(|w| w - 1)
+    }
+
+    /// The locate shortcut was pressed: the screen watcher shows the cursor.
+    pub fn request_locate(&self) {
+        self.locate_request.store(true, Ordering::SeqCst);
+    }
+
+    pub fn take_locate_request(&self) -> bool {
+        self.locate_request.swap(false, Ordering::SeqCst)
     }
 
     pub fn stopped(&self) -> bool {

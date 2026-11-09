@@ -193,6 +193,116 @@ impl Edge {
     }
 }
 
+/// What is drawn near the cursor while it waits at a screen edge. The number of each
+/// variant indexes the table of drawing functions in overlay_render.rs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum EdgeAnimStyle {
+    None,
+    #[default]
+    Ring,
+    Semicircle,
+    Bar,
+    Pulse,
+    Laser,
+    Vortex,
+    Scan,
+    Liquid,
+}
+
+pub const EDGE_ANIM_STYLES: [EdgeAnimStyle; 9] = [
+    EdgeAnimStyle::None,
+    EdgeAnimStyle::Ring,
+    EdgeAnimStyle::Semicircle,
+    EdgeAnimStyle::Bar,
+    EdgeAnimStyle::Pulse,
+    EdgeAnimStyle::Laser,
+    EdgeAnimStyle::Vortex,
+    EdgeAnimStyle::Scan,
+    EdgeAnimStyle::Liquid,
+];
+
+impl EdgeAnimStyle {
+    /// Name in the settings file and on the command line.
+    pub fn name(self) -> &'static str {
+        match self {
+            EdgeAnimStyle::None => "none",
+            EdgeAnimStyle::Ring => "ring",
+            EdgeAnimStyle::Semicircle => "semicircle",
+            EdgeAnimStyle::Bar => "bar",
+            EdgeAnimStyle::Pulse => "pulse",
+            EdgeAnimStyle::Laser => "laser",
+            EdgeAnimStyle::Vortex => "vortex",
+            EdgeAnimStyle::Scan => "scan",
+            EdgeAnimStyle::Liquid => "liquid",
+        }
+    }
+
+    fn from_name(name: &str) -> Option<EdgeAnimStyle> {
+        EDGE_ANIM_STYLES.into_iter().find(|s| s.name() == name.trim().to_lowercase())
+    }
+
+    /// Whether the effect drains in a direction the user can choose.
+    pub fn has_direction(self) -> bool {
+        matches!(self, EdgeAnimStyle::Ring | EdgeAnimStyle::Semicircle | EdgeAnimStyle::Bar)
+    }
+
+    /// Whether the effect can shrink away instead of draining.
+    pub fn can_shrink(self) -> bool {
+        matches!(self, EdgeAnimStyle::Ring | EdgeAnimStyle::Semicircle)
+    }
+}
+
+/// Which way the ring, semicircle or bar drains. Numbered as in overlay_render.rs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum EdgeAnimDirection {
+    #[default]
+    Clockwise,
+    CounterClockwise,
+    Both,
+}
+
+/// How the cursor is shown. The number of each variant indexes the table of drawing
+/// functions in overlay_render.rs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LocateStyle {
+    #[default]
+    Ring,
+    Radar,
+    Spotlight,
+}
+
+/// Showing where the cursor is with a short highlight around it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Locate {
+    pub on: bool,
+    /// Shown when the shortcut below is pressed.
+    pub on_hotkey: bool,
+    /// e.g. "ctrl+alt+l"; empty for none.
+    pub hotkey: String,
+    /// Shown when the mouse arrives from another computer.
+    pub on_arrival: bool,
+    /// Shown when the mouse is shaken from side to side.
+    pub on_shake: bool,
+    pub style: LocateStyle,
+}
+
+impl Default for Locate {
+    fn default() -> Self {
+        Locate {
+            on: false,
+            on_hotkey: true,
+            hotkey: "ctrl+alt+l".into(),
+            on_arrival: true,
+            on_shake: false,
+            style: LocateStyle::default(),
+        }
+    }
+}
+
 /// Switching at the screen edge: rest the cursor against an outer edge of the desktop
 /// and the group goes to that edge's channel. Each computer watches its own screen.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -210,11 +320,31 @@ pub struct Edges {
     pub corner_margin: u32,
     /// When the mouse comes back, put the cursor at the edge it left by.
     pub place_cursor: bool,
+    /// The wait runs only while Control is held; letting go calls it off.
+    pub require_control: bool,
+    /// What is drawn while the cursor waits.
+    pub anim_style: EdgeAnimStyle,
+    pub anim_direction: EdgeAnimDirection,
+    /// The ring or semicircle shrinks away instead of draining.
+    pub anim_shrink: bool,
 }
 
 impl Default for Edges {
     fn default() -> Self {
-        Edges { on: false, dwell_ms: 500, left: 0, right: 0, top: 0, bottom: 0, corner_margin: 80, place_cursor: true }
+        Edges {
+            on: false,
+            dwell_ms: 500,
+            left: 0,
+            right: 0,
+            top: 0,
+            bottom: 0,
+            corner_margin: 80,
+            place_cursor: true,
+            require_control: false,
+            anim_style: EdgeAnimStyle::default(),
+            anim_direction: EdgeAnimDirection::default(),
+            anim_shrink: false,
+        }
     }
 }
 
@@ -264,6 +394,9 @@ pub struct Haptics {
     /// Strength in percent (1-100), put on the mouse whenever it is here; 0 leaves the
     /// mouse as Logi Options+ set it.
     pub intensity: u8,
+    /// The pulses at a screen edge get faster and stronger as the switch nears, instead
+    /// of repeating `edge_waveform` evenly.
+    pub progressive: bool,
 }
 
 impl Default for Haptics {
@@ -275,6 +408,7 @@ impl Default for Haptics {
             arrive_waveform: crate::device::waveform::DAMP_COLLISION,
             edge_waveform: crate::device::waveform::SUBTLE_COLLISION,
             intensity: 0,
+            progressive: true,
         }
     }
 }
@@ -320,6 +454,8 @@ pub struct Config {
     pub edges: Edges,
     /// Vibration on a mouse with a haptic motor.
     pub haptics: Haptics,
+    /// Showing where the cursor is.
+    pub locate: Locate,
 }
 
 /// Keyboard shortcuts that send the group and the master mouse to a channel; pressed on
@@ -364,6 +500,7 @@ impl Default for Config {
             hotkeys: Hotkeys::default(),
             edges: Edges::default(),
             haptics: Haptics::default(),
+            locate: Locate::default(),
         }
     }
 }
@@ -510,6 +647,19 @@ impl Config {
         BUTTONS.into_iter().filter(|&c| self.button(c).on).collect()
     }
 
+    /// The shortcut in slot `n`: channel 1-3, or `hotkey::LOCATE`.
+    pub fn shortcut(&self, n: u8) -> &str {
+        if n == crate::hotkey::LOCATE { &self.locate.hotkey } else { self.hotkeys.key(n) }
+    }
+
+    pub fn set_shortcut(&mut self, n: u8, key: &str) {
+        if n == crate::hotkey::LOCATE {
+            self.locate.hotkey = key.trim().to_lowercase();
+        } else {
+            self.hotkeys.set_key(n, key);
+        }
+    }
+
     /// Changes one setting from the command line, validating the result.
     /// `channels` applies to every button, or to one with a prefix such as
     /// `gesture.channels`.
@@ -540,6 +690,7 @@ impl Config {
                 "switch_waveform" => self.haptics.switch_waveform = wave()?,
                 "arrive_waveform" => self.haptics.arrive_waveform = wave()?,
                 "edge_waveform" => self.haptics.edge_waveform = wave()?,
+                "progressive" => self.haptics.progressive = flag()?,
                 "intensity" | "strength" => {
                     let v = value.trim().trim_end_matches('%');
                     self.haptics.intensity = if v.eq_ignore_ascii_case("options+") || v.eq_ignore_ascii_case("default") {
@@ -548,7 +699,30 @@ impl Config {
                         v.parse::<u8>().context("haptics.intensity must be 0 (as Options+ sets it) or 1-100 percent")?
                     };
                 }
-                _ => anyhow::bail!("unknown setting '{key}' (haptics.switch, haptics.edge, haptics.intensity, haptics.switch_waveform, haptics.arrive_waveform, haptics.edge_waveform)"),
+                _ => anyhow::bail!("unknown setting '{key}' (haptics.switch, haptics.edge, haptics.progressive, haptics.intensity, haptics.switch_waveform, haptics.arrive_waveform, haptics.edge_waveform)"),
+            }
+            return Ok(());
+        }
+        if let Some(what) = key.strip_prefix("locate.").or((key == "locate").then_some("on")) {
+            let flag = || value.parse::<bool>().with_context(|| format!("{key} must be true or false"));
+            match what {
+                "on" => self.locate.on = flag()?,
+                "arrival" => self.locate.on_arrival = flag()?,
+                "shake" => self.locate.on_shake = flag()?,
+                "shortcut" => self.locate.on_hotkey = flag()?,
+                "hotkey" => {
+                    let value = if value.eq_ignore_ascii_case("none") { "" } else { value };
+                    self.locate.hotkey = value.trim().to_lowercase();
+                }
+                "style" => {
+                    self.locate.style = match value.trim().to_lowercase().as_str() {
+                        "ring" => LocateStyle::Ring,
+                        "radar" => LocateStyle::Radar,
+                        "spotlight" => LocateStyle::Spotlight,
+                        _ => anyhow::bail!("locate.style must be ring, radar or spotlight"),
+                    };
+                }
+                _ => anyhow::bail!("unknown setting '{key}' (locate, locate.style, locate.hotkey, locate.shortcut, locate.arrival, locate.shake)"),
             }
             return Ok(());
         }
@@ -561,6 +735,20 @@ impl Config {
                 "dwell" | "dwell_ms" => self.edges.dwell_ms = value.trim().parse().context("edge.dwell must be milliseconds, e.g. 500")?,
                 "cursor" | "place_cursor" => self.edges.place_cursor = value.parse().context("edge.cursor must be true or false")?,
                 "corner" | "corner_margin" => self.edges.corner_margin = value.trim().parse().context("edge.corner must be pixels, e.g. 80")?,
+                "control" | "require_control" => self.edges.require_control = value.parse().context("edge.control must be true or false")?,
+                "anim" | "anim_style" => {
+                    self.edges.anim_style = EdgeAnimStyle::from_name(value)
+                        .context("edge.anim must be none, ring, semicircle, bar, pulse, laser, vortex, scan or liquid")?;
+                }
+                "anim_direction" => {
+                    self.edges.anim_direction = match value.trim().to_lowercase().as_str() {
+                        "clockwise" => EdgeAnimDirection::Clockwise,
+                        "counterclockwise" => EdgeAnimDirection::CounterClockwise,
+                        "both" => EdgeAnimDirection::Both,
+                        _ => anyhow::bail!("edge.anim_direction must be clockwise, counterclockwise or both"),
+                    };
+                }
+                "anim_shrink" => self.edges.anim_shrink = value.parse().context("edge.anim_shrink must be true or false")?,
                 side => {
                     let edge = Edge::from_name(side).with_context(|| format!("unknown edge '{side}' (left, right, top, bottom)"))?;
                     let channel = if value.eq_ignore_ascii_case("none") || value.eq_ignore_ascii_case("off") {
@@ -649,7 +837,7 @@ impl Config {
         anyhow::ensure!(self.haptics.intensity <= 100, "haptics.intensity must be 0 (as Options+ sets it) or 1-100 percent");
         anyhow::ensure!(self.hotkeys.keys.len() <= 3, "hotkeys: one shortcut per channel (1-3)");
         let mut seen = Vec::new();
-        for key in self.hotkeys.keys.iter().filter(|k| !k.is_empty()) {
+        for key in self.hotkeys.keys.iter().chain([&self.locate.hotkey]).filter(|k| !k.is_empty()) {
             let parsed = crate::hotkey::parse(key)?;
             anyhow::ensure!(!seen.contains(&parsed), "shortcut '{key}' is used for two channels");
             seen.push(parsed);
@@ -938,11 +1126,59 @@ mod tests {
         assert_eq!(c.haptics.intensity, 0);
         assert!(c.set("haptics.intensity", "120").is_err());
         assert!(c.set("haptics.bogus", "1").is_err());
+        assert!(c.haptics.progressive);
+        c.set("haptics.progressive", "false").unwrap();
+        assert!(!c.haptics.progressive);
         c.set("haptics", "false").unwrap();
         assert!(!c.haptics.on_switch && !c.haptics.on_edge);
         let back = Config::parse(&toml::to_string_pretty(&c).unwrap()).unwrap();
         assert_eq!(back.haptics, c.haptics);
         assert_eq!(Config::parse("enabled = true").unwrap().haptics, Haptics::default());
+    }
+
+    #[test]
+    fn edge_countdown_settings() {
+        let mut c = Config::default();
+        assert!(!c.edges.require_control);
+        assert_eq!(c.edges.anim_style, EdgeAnimStyle::Ring);
+        c.set("edge.control", "true").unwrap();
+        c.set("edge.anim", "Vortex").unwrap();
+        c.set("edge.anim_direction", "both").unwrap();
+        c.set("edge.anim_shrink", "true").unwrap();
+        assert!(c.edges.require_control && c.edges.anim_shrink);
+        assert_eq!(c.edges.anim_style, EdgeAnimStyle::Vortex);
+        assert_eq!(c.edges.anim_direction, EdgeAnimDirection::Both);
+        assert!(c.set("edge.anim", "sparkle").is_err());
+        assert!(c.set("edge.anim_direction", "up").is_err());
+        let back = Config::parse(&toml::to_string_pretty(&c).unwrap()).unwrap();
+        assert_eq!(back.edges, c.edges);
+        // The table of drawing functions in overlay_render.rs is indexed by these numbers.
+        for (i, style) in EDGE_ANIM_STYLES.into_iter().enumerate() {
+            assert_eq!(style as usize, i);
+            assert_eq!(EdgeAnimStyle::from_name(style.name()), Some(style));
+        }
+    }
+
+    #[test]
+    fn locate() {
+        let mut c = Config::default();
+        assert!(!c.locate.on);
+        assert_eq!(c.shortcut(crate::hotkey::LOCATE), "ctrl+alt+l");
+        c.set("locate", "true").unwrap();
+        c.set("locate.style", "spotlight").unwrap();
+        c.set("locate.shake", "true").unwrap();
+        c.set("locate.hotkey", "ctrl+alt+shift+k").unwrap();
+        assert!(c.locate.on && c.locate.on_shake);
+        assert_eq!(c.locate.style, LocateStyle::Spotlight);
+        assert_eq!(c.locate.hotkey, "ctrl+alt+shift+k");
+        assert!(c.set("locate.hotkey", "ctrl+alt+1").is_err(), "already channel 1's");
+        assert!(c.set("locate.style", "laser").is_err());
+        assert!(c.set("locate.bogus", "1").is_err());
+        c.set("locate.hotkey", "none").unwrap();
+        assert_eq!(c.locate.hotkey, "");
+        let back = Config::parse(&toml::to_string_pretty(&c).unwrap()).unwrap();
+        assert_eq!(back.locate, c.locate);
+        assert_eq!(Config::parse("enabled = true").unwrap().locate, Locate::default());
     }
 
     #[test]

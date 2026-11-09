@@ -3,7 +3,12 @@
 //! engine reloads within a second. Every change applies immediately and the window
 //! stays open, unlike a native menu that closes after each click.
 
-use crate::config::{pick, Config, Edge, Gesture, BUTTON_GESTURE, BUTTON_MIDDLE, BUTTON_WHEEL_MODE};
+use crate::config::{
+    pick, Config, Edge, EdgeAnimDirection, EdgeAnimStyle, Gesture, Haptics, LocateStyle, BUTTON_GESTURE, BUTTON_MIDDLE,
+    BUTTON_WHEEL_MODE, EDGE_ANIM_STYLES,
+};
+use crate::device::waveform;
+use crate::hotkey::LOCATE;
 use crate::i18n::{texts, Texts};
 use crate::shared::{self, DeviceInfo, StatusFile};
 use crate::update::{self, Release};
@@ -41,8 +46,10 @@ pub fn run(lock: std::net::TcpListener, show_update: bool) -> Result<()> {
             // Matches flockswitch.desktop, so the dock shows the app's name and icon.
             .with_app_id("flockswitch")
             .with_icon(icon)
-            .with_inner_size([520.0, 720.0])
-            .with_min_inner_size([400.0, 360.0])
+            .with_inner_size([540.0, 680.0])
+            .with_min_inner_size([480.0, 580.0])
+            .with_max_inner_size([680.0, 820.0])
+            .with_maximize_button(false)
             .with_active(true),
         ..Default::default()
     };
@@ -50,6 +57,7 @@ pub fn run(lock: std::net::TcpListener, show_update: bool) -> Result<()> {
         "flockswitch-settings",
         options,
         Box::new(|cc| {
+            crate::overlay::set_ready();
             install_fonts(&cc.egui_ctx);
             install_style(&cc.egui_ctx);
             let raise = Arc::new(AtomicBool::new(false));
@@ -286,6 +294,26 @@ struct SettingsApp {
     update: Arc<Mutex<UpdateUi>>,
     /// When the e-mail address was copied (shows "Copied" for a moment).
     copied_at: Option<Instant>,
+    /// The haptics window, while it is open; the main window waits for it.
+    haptics_dialog: Option<HapticsDialog>,
+    /// "Reset settings…" was pressed and waits for its confirmation.
+    confirm_reset: bool,
+}
+
+/// The modal haptics window. Its controls change `draft`; nothing reaches the settings
+/// file or the mouse until Apply or OK.
+struct HapticsDialog {
+    draft: Haptics,
+    /// What Close goes back to, even after an Apply.
+    opened_with: Haptics,
+    /// Top left of the window, centred on the main window when opened.
+    position: Option<Pos2>,
+}
+
+const HAPTICS_DIALOG_SIZE: [f32; 2] = [470.0, 640.0];
+
+fn haptics_viewport() -> egui::ViewportId {
+    egui::ViewportId::from_hash_of("haptics-settings")
 }
 
 /// What the update card shows.
@@ -326,6 +354,8 @@ impl SettingsApp {
             icon: ctx.load_texture("app-icon", image, egui::TextureOptions::LINEAR),
             update: Arc::new(Mutex::new(UpdateUi::Idle)),
             copied_at: None,
+            haptics_dialog: None,
+            confirm_reset: false,
         };
         app.refresh();
         if show_update || app.cfg.check_updates {
@@ -452,8 +482,23 @@ impl eframe::App for SettingsApp {
             self.capture_shortcut(&ctx, t, n);
         }
 
+        // While the haptics window is open this one cannot be closed or used, and
+        // coming back to it hands the focus straight on.
+        let modal = self.haptics_dialog.is_some();
+        if modal {
+            if ctx.input(|i| i.viewport().close_requested()) {
+                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            }
+            if ctx.input(|i| i.focused) {
+                ctx.send_viewport_cmd_to(haptics_viewport(), egui::ViewportCommand::Focus);
+            }
+        }
+
         // The header and the tabs stay in place; only the page below them scrolls.
         egui::CentralPanel::default().frame(panel).show(ui, |ui| {
+            if modal {
+                ui.disable();
+            }
             self.header(ui, t, p);
             if self.status.hid_denied {
                 warning(ui, p, t.hid_denied_title, t.hid_denied);
@@ -467,10 +512,10 @@ impl eframe::App for SettingsApp {
             let labels: Vec<String> = tabs.iter().map(|(_, l)| l.to_string()).collect();
             if let Some(i) = segments(ui, p, "tabs", &labels, Role::Tab, SEG_NORMAL, None, None, |i| tabs[i].0 == self.tab) {
                 self.tab = tabs[i].0;
+                self.stop_recording();
             }
-            // Pages are short enough to fit; if one grows (many devices, a long error),
-            // the window grows with it instead of scrolling.
-            let page = egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+            // The window keeps its size; a page taller than it scrolls.
+            egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
                 {
                     if let Some(err) = self.error.clone() {
                         ui.add_space(10.0);
@@ -492,10 +537,13 @@ impl eframe::App for SettingsApp {
                         }
                         Tab::General => {
                             notice(ui, p, t);
-                            self.haptics_section(ui, t, p);
-                            self.general_section(ui, t, p);
+                            self.autostart_card(ui, t, p);
+                            self.locate_section(ui, t, p);
+                            self.haptics_summary(ui, t, p);
+                            self.language_card(ui, t, p);
                             self.update_section(ui, t, p);
                             self.report_section(ui, t, p);
+                            self.maintenance_card(ui, t, p);
                         }
                     }
 
@@ -509,18 +557,8 @@ impl eframe::App for SettingsApp {
                     });
                 }
             });
-            let overflow = page.content_size.y - page.inner_rect.height();
-            if overflow > 1.0 {
-                let (size, monitor) = ctx.input(|i| (i.viewport().inner_rect.map(|r| r.size()), i.viewport().monitor_size));
-                if let Some(size) = size {
-                    let max = monitor.map_or(f32::INFINITY, |m| m.y - 80.0);
-                    let height = (size.y + overflow).min(max);
-                    if height > size.y + 1.0 {
-                        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(Vec2::new(size.x, height)));
-                    }
-                }
-            }
         });
+        self.haptics_window(&ctx, t);
     }
 }
 
@@ -667,46 +705,52 @@ impl SettingsApp {
         }
         ui.add_space(6.0);
         divider(ui, p);
-        let width = (ui.available_width() * 0.66).min(300.0);
-        let (mut start, mut clear) = (None, None);
         for n in 1..=3u8 {
-            let key = self.cfg.hotkeys.key(n).to_string();
-            let recording = self.recording == Some(n);
-            let failed = !recording && !key.is_empty() && self.status.hotkeys_failed.contains(&n);
-            let (shown, color) = if recording {
-                (t.hotkey_press.to_string(), p.accent)
-            } else if key.is_empty() {
-                (t.hotkey_none.to_string(), p.muted)
-            } else {
-                (crate::hotkey::display(&key), if failed { p.amber } else { p.text })
-            };
-            labeled_row(ui, p, &format!("{} {n}", t.channel), width, ROW_SMALL, |ui| {
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.spacing_mut().item_spacing.x = 6.0;
-                    if !recording && !key.is_empty() && button(ui, p, t.hotkey_clear, ButtonKind::Plain).clicked() {
-                        clear = Some(n);
-                    }
-                    if !recording && button(ui, p, t.hotkey_change, ButtonKind::Plain).clicked() {
-                        start = Some(n);
-                    }
-                    ui.add_space(4.0);
-                    ui.label(RichText::new(shown).font(bold(14.0)).color(color));
-                });
-                false
-            });
-            if failed {
-                hint(ui, p, t.hotkey_taken);
-            }
+            self.shortcut_row(ui, t, p, n, &format!("{} {n}", t.channel));
         }
         hint(ui, p, t.hotkey_rule);
         ui.add_space(10.0);
-        if let Some(n) = start {
+    }
+
+    /// One recordable shortcut: its slot `n` (channel, or LOCATE), the keys and buttons
+    /// to change or clear them.
+    fn shortcut_row(&mut self, ui: &mut Ui, t: &Texts, p: Palette, n: u8, label: &str) {
+        let width = (ui.available_width() * 0.66).min(300.0);
+        let (mut start, mut clear) = (false, false);
+        let key = self.cfg.shortcut(n).to_string();
+        let recording = self.recording == Some(n);
+        let failed = !recording && !key.is_empty() && self.status.hotkeys_failed.contains(&n);
+        let (shown, color) = if recording {
+            (t.hotkey_press.to_string(), p.accent)
+        } else if key.is_empty() {
+            (t.hotkey_none.to_string(), p.muted)
+        } else {
+            (crate::hotkey::display(&key), if failed { p.amber } else { p.text })
+        };
+        labeled_row(ui, p, label, width, ROW_SMALL, |ui| {
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.spacing_mut().item_spacing.x = 6.0;
+                if !recording && !key.is_empty() && button(ui, p, t.hotkey_clear, ButtonKind::Plain).clicked() {
+                    clear = true;
+                }
+                if !recording && button(ui, p, t.hotkey_change, ButtonKind::Plain).clicked() {
+                    start = true;
+                }
+                ui.add_space(4.0);
+                ui.label(RichText::new(shown).font(bold(14.0)).color(color));
+            });
+            false
+        });
+        if failed {
+            hint(ui, p, t.hotkey_taken);
+        }
+        if start {
             self.recording = Some(n);
             self.error = None;
             crate::hotkey::hold_pause();
         }
-        if let Some(n) = clear {
-            self.apply(|c| c.hotkeys.set_key(n, ""));
+        if clear {
+            self.apply(|c| c.set_shortcut(n, ""));
         }
     }
 
@@ -760,12 +804,65 @@ impl SettingsApp {
             self.apply(|c| c.edges.dwell_ms = dwell);
         }
         divider(ui, p);
+        let mut control = self.cfg.edges.require_control;
+        if switch_row(ui, p, t.edge_require_control, None, &mut control) {
+            self.apply(|c| c.edges.require_control = control);
+        }
+        hint(ui, p, t.edge_require_control_hint);
+        ui.add_space(6.0);
+        divider(ui, p);
+        self.edge_anim_rows(ui, t, p, width);
+        divider(ui, p);
         let mut place = self.cfg.edges.place_cursor;
         if switch_row(ui, p, t.edge_place, None, &mut place) {
             self.apply(|c| c.edges.place_cursor = place);
         }
         hint(ui, p, t.edges_corner_hint);
         ui.add_space(10.0);
+    }
+
+    /// Which countdown is drawn at the edge, and how it drains where that can be chosen.
+    fn edge_anim_rows(&mut self, ui: &mut Ui, t: &Texts, p: Palette, width: f32) {
+        let options: Vec<(EdgeAnimStyle, &str)> = EDGE_ANIM_STYLES.into_iter().zip(t.edge_anim_names).collect();
+        let mut style = self.cfg.edges.anim_style;
+        let (mut changed, mut preview) = (false, false);
+        labeled_row(ui, p, t.edge_anim, width, ROW_SMALL, |ui| {
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.spacing_mut().item_spacing.x = 6.0;
+                preview = style != EdgeAnimStyle::None && button(ui, p, t.preview, ButtonKind::Plain).clicked();
+                changed = combo(ui, "edge-anim", &mut style, &options);
+            });
+            false
+        });
+        if changed {
+            self.apply(|c| c.edges.anim_style = style);
+        }
+        if preview {
+            crate::edge::preview(&self.cfg.edges);
+        }
+        if self.cfg.edges.anim_style.can_shrink() {
+            let mut shrink = self.cfg.edges.anim_shrink;
+            if switch_row(ui, p, t.edge_anim_shrink, None, &mut shrink) {
+                self.apply(|c| c.edges.anim_shrink = shrink);
+            }
+        }
+        let shrinks = self.cfg.edges.anim_shrink && self.cfg.edges.anim_style.can_shrink();
+        if self.cfg.edges.anim_style.has_direction() && !shrinks {
+            let labels = if self.cfg.edges.anim_style == EdgeAnimStyle::Bar {
+                [t.bar_forward, t.bar_reverse, t.bar_both]
+            } else {
+                [t.dir_clockwise, t.dir_counter, t.dir_both]
+            };
+            let choices = [
+                (EdgeAnimDirection::Clockwise, labels[0]),
+                (EdgeAnimDirection::CounterClockwise, labels[1]),
+                (EdgeAnimDirection::Both, labels[2]),
+            ];
+            let mut direction = self.cfg.edges.anim_direction;
+            if labeled_row(ui, p, t.edge_anim_direction, width, ROW_SMALL, |ui| segmented(ui, p, "edge-anim-dir", &mut direction, &choices, SEG_SMALL)) {
+                self.apply(|c| c.edges.anim_direction = direction);
+            }
+        }
     }
 
     fn stop_recording(&mut self) {
@@ -789,11 +886,11 @@ impl SettingsApp {
             }
             let Some(text) = shortcut_text(key, modifiers) else { continue };
             self.stop_recording();
-            if (1..=3).any(|m| m != n && self.cfg.hotkeys.key(m) == text) {
+            if (LOCATE..=3).any(|m| m != n && self.cfg.shortcut(m) == text) {
                 self.error = Some(t.hotkey_duplicate.into());
                 return;
             }
-            self.apply(|c| c.hotkeys.set_key(n, &text));
+            self.apply(|c| c.set_shortcut(n, &text));
             return;
         }
     }
@@ -950,34 +1047,205 @@ impl SettingsApp {
         });
     }
 
-    /// Vibration on a mouse with a haptic motor: when switching, and while waiting at
-    /// a screen edge.
-    fn haptics_section(&mut self, ui: &mut Ui, t: &Texts, p: Palette) {
+    /// Haptics in one line, with the button that opens their window.
+    fn haptics_summary(&mut self, ui: &mut Ui, t: &Texts, p: Palette) {
+        let h = &self.cfg.haptics;
+        let state = if h.on_switch || h.on_edge { t.haptics_state_on } else { t.haptics_state_off };
+        let strength = if h.intensity == 0 { t.haptics_follow.to_string() } else { format!("{}%", h.intensity) };
+        let line = format!("{state} · {} {strength}", t.haptics_intensity);
+        let mut open = false;
         section(ui, p, t.section_haptics, |ui| {
-            let mut on = self.cfg.haptics.on_switch;
-            if switch_row(ui, p, t.haptics_switch, None, &mut on) {
-                self.apply(|c| c.haptics.on_switch = on);
-            }
-            divider(ui, p);
-            let mut on = self.cfg.haptics.on_edge;
-            if switch_row(ui, p, t.haptics_edge, None, &mut on) {
-                self.apply(|c| c.haptics.on_edge = on);
-            }
-            divider(ui, p);
-            // 0 = as Logi Options+ sets it; otherwise the strength in percent.
-            let choices: [(u8, &str); 5] = [(0, t.haptics_follow), (25, "25%"), (50, "50%"), (75, "75%"), (100, "100%")];
-            let mut level = self.cfg.haptics.intensity;
-            let width = (ui.available_width() * 0.66).min(320.0);
-            if labeled_row(ui, p, t.haptics_intensity, width, ROW_SMALL, |ui| segmented(ui, p, "haptic-intensity", &mut level, &choices, SEG_SMALL)) {
-                self.apply(|c| c.haptics.intensity = level);
-            }
-            hint(ui, p, t.haptics_hint);
+            let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), ROW_NORMAL), Sense::hover());
+            ui.painter().text(Pos2::new(rect.left(), rect.center().y), Align2::LEFT_CENTER, &line, FontId::proportional(14.0), p.text);
+            let width = button_width(ui, t.haptics_open, ButtonKind::Plain);
+            let area = Rect::from_min_max(
+                Pos2::new(rect.right() - width, rect.center().y - 15.0),
+                Pos2::new(rect.right(), rect.center().y + 15.0),
+            );
+            ui.scope_builder(UiBuilder::new().max_rect(area), |ui| {
+                open = button(ui, p, t.haptics_open, ButtonKind::Plain).clicked();
+            });
+        });
+        if open {
+            self.stop_recording();
+            let position = ui
+                .ctx()
+                .input(|i| i.viewport().outer_rect)
+                .map(|r| r.center() - Vec2::from(HAPTICS_DIALOG_SIZE) / 2.0);
+            let current = self.cfg.haptics.clone();
+            self.haptics_dialog = Some(HapticsDialog { draft: current.clone(), opened_with: current, position });
+        }
+    }
+
+    /// The haptics window, a real window of its own, while it is open.
+    fn haptics_window(&mut self, ctx: &egui::Context, t: &Texts) {
+        let Some(dialog) = &self.haptics_dialog else { return };
+        let mut builder = egui::ViewportBuilder::default()
+            .with_title(t.haptics_dialog_title)
+            .with_inner_size(HAPTICS_DIALOG_SIZE)
+            .with_resizable(false)
+            .with_minimize_button(false)
+            .with_maximize_button(false);
+        if let Some(position) = dialog.position {
+            builder = builder.with_position(position);
+        }
+        ctx.show_viewport_immediate(haptics_viewport(), builder, |ui, _| self.haptics_dialog_ui(ui, t));
+    }
+
+    fn haptics_dialog_ui(&mut self, ui: &mut Ui, t: &Texts) {
+        let Some(mut dialog) = self.haptics_dialog.take() else { return };
+        let p = Palette::new(ui.visuals().dark_mode);
+        let closing = ui.ctx().input(|i| i.viewport().close_requested());
+        let (mut apply, mut ok, mut close) = (false, false, closing);
+        let panel = egui::Frame::new().fill(p.bg).inner_margin(Margin::symmetric(18, 14));
+        let d = &mut dialog.draft;
+        let error = self.error.clone();
+        egui::CentralPanel::default().frame(panel).show(ui, |ui| {
+            egui::ScrollArea::vertical().auto_shrink([false, false]).max_height(ui.available_height() - 46.0).show(ui, |ui| {
+                card(ui, p, |ui| {
+                    let mut on = d.on_switch || d.on_edge;
+                    if switch_row(ui, p, t.haptics_master, None, &mut on) {
+                        d.on_switch = on;
+                        d.on_edge = on;
+                    }
+                    divider(ui, p);
+                    ui.add_enabled_ui(on, |ui| {
+                        switch_row(ui, p, t.haptics_switch, None, &mut d.on_switch);
+                        divider(ui, p);
+                        switch_row(ui, p, t.haptics_edge, None, &mut d.on_edge);
+                        divider(ui, p);
+                        switch_row(ui, p, t.haptics_progressive, None, &mut d.progressive);
+                        hint(ui, p, t.haptics_progressive_hint);
+                        ui.add_space(6.0);
+                        divider(ui, p);
+                        // 0 = as Logi Options+ sets it; otherwise the strength in percent.
+                        let choices: [(u8, &str); 5] = [(0, t.haptics_follow), (25, "25%"), (50, "50%"), (75, "75%"), (100, "100%")];
+                        let width = (ui.available_width() * 0.8).min(340.0);
+                        labeled_row(ui, p, t.haptics_intensity, width, ROW_SMALL, |ui| segmented(ui, p, "haptic-intensity", &mut d.intensity, &choices, SEG_SMALL));
+                        divider(ui, p);
+                        let waves: Vec<(u8, &str)> = waveform::ALL.into_iter().zip(t.waveform_names).collect();
+                        let width = (ui.available_width() * 0.5).min(220.0);
+                        labeled_row(ui, p, t.haptics_wave_switch, width, ROW_SMALL, |ui| combo(ui, "wave-switch", &mut d.switch_waveform, &waves));
+                        labeled_row(ui, p, t.haptics_wave_arrive, width, ROW_SMALL, |ui| combo(ui, "wave-arrive", &mut d.arrive_waveform, &waves));
+                        let even = !d.progressive;
+                        ui.add_enabled_ui(even, |ui| {
+                            labeled_row(ui, p, t.haptics_wave_edge, width, ROW_SMALL, |ui| combo(ui, "wave-edge", &mut d.edge_waveform, &waves));
+                        });
+                    });
+                    hint(ui, p, t.haptics_hint);
+                    ui.add_space(10.0);
+                });
+                if let Some(err) = &error {
+                    ui.add_space(8.0);
+                    ui.label(RichText::new(err).color(p.red));
+                }
+            });
             ui.add_space(10.0);
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.spacing_mut().item_spacing.x = 8.0;
+                close |= button(ui, p, t.close, ButtonKind::Plain).clicked();
+                ok = button(ui, p, t.ok, ButtonKind::Primary).clicked();
+                apply = button(ui, p, t.apply, ButtonKind::Plain).clicked();
+            });
+        });
+        if close {
+            // Back to how it was when the window opened, undoing an Apply too.
+            if self.cfg.haptics != dialog.opened_with {
+                let original = dialog.opened_with.clone();
+                self.apply(|c| c.haptics = original);
+            }
+            return;
+        }
+        if apply || ok {
+            let chosen = dialog.draft.clone();
+            self.apply(|c| c.haptics = chosen);
+            if ok && self.error.is_none() {
+                return;
+            }
+        }
+        self.haptics_dialog = Some(dialog);
+    }
+
+    /// Highlighting the cursor: on/off, the effect, and what brings it up.
+    fn locate_section(&mut self, ui: &mut Ui, t: &Texts, p: Palette) {
+        section(ui, p, t.section_locate, |ui| {
+            if !crate::edge::available() {
+                ui.add_space(8.0);
+                info_box(ui, p, t.locate_wayland);
+                ui.add_space(10.0);
+                return;
+            }
+            let mut on = self.cfg.locate.on;
+            if switch_row(ui, p, t.locate_on, None, &mut on) {
+                self.apply(|c| c.locate.on = on);
+                self.stop_recording();
+            }
+            if !self.cfg.locate.on {
+                return;
+            }
+            divider(ui, p);
+            let choices = [
+                (LocateStyle::Ring, t.locate_ring),
+                (LocateStyle::Radar, t.locate_radar),
+                (LocateStyle::Spotlight, t.locate_spotlight),
+            ];
+            let mut style = self.cfg.locate.style;
+            let width = (ui.available_width() * 0.72).min(340.0);
+            let mut changed = false;
+            let mut preview = false;
+            labeled_row(ui, p, t.locate_style, width, ROW_SMALL, |ui| {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.spacing_mut().item_spacing.x = 6.0;
+                    preview = button(ui, p, t.preview, ButtonKind::Plain).clicked();
+                    ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                        changed = segmented(ui, p, "locate-style", &mut style, &choices, SEG_SMALL);
+                    });
+                });
+                false
+            });
+            if changed {
+                self.apply(|c| c.locate.style = style);
+            }
+            if preview {
+                crate::overlay::locate(style);
+            }
+            divider(ui, p);
+            let mut on = self.cfg.locate.on_hotkey;
+            if switch_row(ui, p, t.locate_use_hotkey, None, &mut on) {
+                self.apply(|c| c.locate.on_hotkey = on);
+                self.stop_recording();
+            }
+            if self.cfg.locate.on_hotkey {
+                self.shortcut_row(ui, t, p, LOCATE, t.locate_key);
+            }
+            divider(ui, p);
+            let mut on = self.cfg.locate.on_arrival;
+            if switch_row(ui, p, t.locate_arrival, None, &mut on) {
+                self.apply(|c| c.locate.on_arrival = on);
+            }
+            divider(ui, p);
+            let mut on = self.cfg.locate.on_shake;
+            if switch_row(ui, p, t.locate_shake, None, &mut on) {
+                self.apply(|c| c.locate.on_shake = on);
+            }
         });
     }
 
-    /// Language, start at login, and uninstall.
-    fn general_section(&mut self, ui: &mut Ui, t: &Texts, p: Palette) {
+    fn autostart_card(&mut self, ui: &mut Ui, t: &Texts, p: Palette) {
+        let Some(al) = self.autostart.as_ref() else { return };
+        let mut on = self.autostart_on;
+        let mut flipped = false;
+        ui.add_space(12.0);
+        card(ui, p, |ui| flipped = switch_row(ui, p, t.autostart, None, &mut on));
+        if flipped {
+            match if on { al.enable() } else { al.disable() } {
+                Ok(()) => self.autostart_on = on,
+                Err(e) => self.error = Some(e.to_string()),
+            }
+        }
+    }
+
+    fn language_card(&mut self, ui: &mut Ui, t: &Texts, p: Palette) {
         ui.add_space(12.0);
         card(ui, p, |ui| {
             let mut language = self.cfg.language.clone();
@@ -988,48 +1256,39 @@ impl SettingsApp {
                 language = chosen.to_string();
                 self.apply(|c| c.language = language);
             }
-            divider(ui, p);
-            if let Some(al) = &self.autostart {
-                let mut on = self.autostart_on;
-                if switch_row(ui, p, t.autostart, None, &mut on) {
-                    let res = if on { al.enable() } else { al.disable() };
-                    match res {
-                        Ok(()) => self.autostart_on = on,
-                        Err(e) => self.error = Some(e.to_string()),
-                    }
+        });
+    }
+
+    /// Putting the settings back, and uninstalling.
+    fn maintenance_card(&mut self, ui: &mut Ui, t: &Texts, p: Palette) {
+        ui.add_space(12.0);
+        card(ui, p, |ui| {
+            let labels: &[(&str, ButtonKind)] = if self.confirm_reset {
+                &[(t.reset_confirm, ButtonKind::DangerFilled), (t.cancel, ButtonKind::Plain)]
+            } else {
+                &[(t.reset_button, ButtonKind::Plain)]
+            };
+            match (self.confirm_reset, confirm_row(ui, p, t.reset_explain, labels)) {
+                (false, Some(_)) => self.confirm_reset = true,
+                (true, Some(0)) => {
+                    self.confirm_reset = false;
+                    self.stop_recording();
+                    self.apply(|c| *c = Config { language: c.language.clone(), ..Config::default() });
                 }
-                divider(ui, p);
+                (true, Some(_)) => self.confirm_reset = false,
+                _ => {}
             }
+            divider(ui, p);
             self.uninstall_row(ui, t, p);
         });
     }
 
-    /// What uninstalling does on the left, the button (then confirm/cancel) on the right.
     fn uninstall_row(&mut self, ui: &mut Ui, t: &Texts, p: Palette) {
         let labels: &[(&str, ButtonKind)] = match self.uninstall {
             Uninstall::Confirming => &[(t.uninstall_confirm, ButtonKind::DangerFilled), (t.cancel, ButtonKind::Plain)],
             _ => &[(t.uninstall_button, ButtonKind::Danger)],
         };
-        let buttons: f32 = labels.iter().map(|(l, k)| button_width(ui, l, *k)).sum::<f32>() + 8.0 * (labels.len() - 1) as f32;
-        let width = ui.available_width();
-        let text = ui.painter().layout(t.uninstall_explain.to_string(), FontId::proportional(12.5), p.muted, width - buttons - 16.0);
-        let (rect, _) = ui.allocate_exact_size(Vec2::new(width, (text.size().y + 20.0).max(48.0)), Sense::hover());
-        ui.painter().galley(Pos2::new(rect.left(), rect.center().y - text.size().y / 2.0), text, p.muted);
-        let area = Rect::from_min_max(
-            Pos2::new(rect.right() - buttons, rect.center().y - 15.0),
-            Pos2::new(rect.right(), rect.center().y + 15.0),
-        );
-        let mut clicked = None;
-        ui.scope_builder(UiBuilder::new().max_rect(area), |ui| {
-            ui.spacing_mut().item_spacing.x = 8.0;
-            ui.horizontal(|ui| {
-                for (i, (label, kind)) in labels.iter().enumerate() {
-                    if button(ui, p, label, *kind).clicked() {
-                        clicked = Some(i);
-                    }
-                }
-            });
-        });
+        let clicked = confirm_row(ui, p, t.uninstall_explain, labels);
         match (&self.uninstall, clicked) {
             (Uninstall::Idle, Some(_)) => self.uninstall = Uninstall::Confirming,
             (Uninstall::Confirming, Some(0)) => self.start_uninstall(),
@@ -1124,6 +1383,9 @@ impl SettingsApp {
                 }
                 if button(ui, p, t.report_issue, ButtonKind::Plain).clicked() {
                     update::open_url(update::ISSUES_PAGE);
+                }
+                if button(ui, p, t.report_log, ButtonKind::Plain).clicked() {
+                    update::reveal(&crate::log_path());
                 }
             });
             ui.add_space(12.0);
@@ -1472,6 +1734,43 @@ fn segmented<T: PartialEq + Copy>(
         }
         _ => false,
     }
+}
+
+/// One-of-many choice in a drop-down filling the space it is given. Returns true on change.
+fn combo<T: PartialEq + Copy>(ui: &mut Ui, name: &str, value: &mut T, options: &[(T, &str)]) -> bool {
+    let shown = options.iter().find(|(v, _)| v == value).map_or("", |(_, l)| *l);
+    let mut changed = false;
+    egui::ComboBox::from_id_salt(name).selected_text(shown).width(ui.available_width().min(220.0)).show_ui(ui, |ui| {
+        for (v, label) in options {
+            changed |= ui.selectable_value(value, *v, *label).changed();
+        }
+    });
+    changed
+}
+
+/// An explanation on the left and buttons on the right. Returns the index clicked.
+fn confirm_row(ui: &mut Ui, p: Palette, explain: &str, labels: &[(&str, ButtonKind)]) -> Option<usize> {
+    let buttons: f32 = labels.iter().map(|(l, k)| button_width(ui, l, *k)).sum::<f32>() + 8.0 * (labels.len() - 1) as f32;
+    let width = ui.available_width();
+    let text = ui.painter().layout(explain.to_string(), FontId::proportional(12.5), p.muted, width - buttons - 16.0);
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(width, (text.size().y + 20.0).max(48.0)), Sense::hover());
+    ui.painter().galley(Pos2::new(rect.left(), rect.center().y - text.size().y / 2.0), text, p.muted);
+    let area = Rect::from_min_max(
+        Pos2::new(rect.right() - buttons, rect.center().y - 15.0),
+        Pos2::new(rect.right(), rect.center().y + 15.0),
+    );
+    let mut clicked = None;
+    ui.scope_builder(UiBuilder::new().max_rect(area), |ui| {
+        ui.spacing_mut().item_spacing.x = 8.0;
+        ui.horizontal(|ui| {
+            for (i, (label, kind)) in labels.iter().enumerate() {
+                if button(ui, p, label, *kind).clicked() {
+                    clicked = Some(i);
+                }
+            }
+        });
+    });
+    clicked
 }
 
 #[derive(Clone, Copy, PartialEq)]

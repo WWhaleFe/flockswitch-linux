@@ -252,14 +252,20 @@ impl Engine {
             self.gesture = None;
         }
         let intensity_changed = next.haptics.intensity != self.cfg.haptics.intensity;
+        // A waveform just chosen, played once so the hand can judge it.
+        let waveforms = |h: &crate::config::Haptics| [h.switch_waveform, h.arrive_waveform, h.edge_waveform];
+        let new_waveform =
+            waveforms(&next.haptics).into_iter().zip(waveforms(&self.cfg.haptics)).find(|(new, old)| new != old).map(|(new, _)| new);
         self.cfg = next;
         log::info!("settings changed ({})", self.mode_text());
         if intensity_changed {
             self.apply_haptic_intensity();
+        }
+        if let Some(waveform) = new_waveform {
+            self.buzz(waveform);
+        } else if intensity_changed && self.cfg.haptics.intensity != 0 {
             // A pulse at the new strength, so the hand can judge it.
-            if self.cfg.haptics.intensity != 0 {
-                self.buzz(self.cfg.haptics.switch_waveform);
-            }
+            self.buzz(self.cfg.haptics.switch_waveform);
         }
         if self.cfg.enabled {
             self.ensure_diverted()?;
@@ -282,20 +288,38 @@ impl Engine {
         }
         let dev = match probed {
             Some(d) => {
+                // Remove stale offline slots of the same device on this receiver.
+                let key = d.key();
+                self.devices.retain(|x| {
+                    !(x.endpoint == endpoint
+                        && x.index != slot
+                        && x.key() == key
+                        && !self.online.contains(&(x.endpoint, x.index)))
+                });
+                let is_mouse = d.kind.map_or(true, |k| k == DeviceKind::Mouse);
                 // A mouse with any of the trigger buttons can be chosen as the master.
-                let can_be_master = d.kind.map_or(true, |k| k == DeviceKind::Mouse)
+                let can_be_master = is_mouse
                     && d.has(FEATURE_REPROG_V4)
                     && d.has(FEATURE_CHANGE_HOST)
                     && !buttons_on(&d, &mut self.endpoints[endpoint], &BUTTONS).is_empty();
                 if can_be_master {
                     self.masters.insert(d.key());
+                } else if !d.has(FEATURE_CHANGE_HOST) || (is_mouse && !d.has(FEATURE_REPROG_V4)) {
+                    // Device answered Root ping while still waking/handshaking; re-probe shortly.
+                    self.pending.entry((endpoint, slot)).or_insert((Instant::now() + SLOT_SETTLE, SLOT_RETRIES));
                 }
                 self.known.insert(d.key(), d.clone());
                 Some(d)
             }
-            None => pairing
-                .and_then(|p| self.known.get(&format!("{:04X}", p.wpid)))
-                .map(|d| d.relocated(endpoint, slot)),
+            None => pairing.and_then(|p| {
+                let key = format!("{:04X}", p.wpid);
+                let already_on_endpoint = self.devices.iter().any(|x| x.endpoint == endpoint && x.key() == key);
+                if already_on_endpoint {
+                    None
+                } else {
+                    self.known.get(&key).map(|d| d.relocated(endpoint, slot))
+                }
+            }),
         };
         if let Some(d) = dev {
             // The slot was re-paired to another device: the old trigger is gone.
@@ -700,6 +724,15 @@ impl Engine {
             let pairings = device::receiver_pairings(&mut self.endpoints[endpoint])?;
             let pairing = pairings.iter().find(|p| p.slot == slot);
             let online = self.load_slot(endpoint, slot, pairing)?;
+            // A device still waking asks for another look; that uses up this slot's
+            // attempts, so one that simply lacks the features is not read forever.
+            if left > 1 {
+                if let Some(again) = self.pending.get_mut(&(endpoint, slot)) {
+                    again.1 = left - 1;
+                }
+            } else {
+                self.pending.remove(&(endpoint, slot));
+            }
             self.publish();
             if online {
                 if self.trigger.is_none() || self.is_trigger(endpoint, slot) {
@@ -717,7 +750,7 @@ impl Engine {
         Ok(())
     }
 
-    /// Queues paired receiver slots that have no device entry yet, in case a device was
+    /// Queues paired receiver slots that are offline right now, in case a device was
     /// asleep at start-up and has not sent a link notification since.
     fn queue_unlisted(&mut self) -> Result<()> {
         for endpoint in 0..self.endpoints.len() {
@@ -725,8 +758,7 @@ impl Engine {
                 continue;
             }
             for p in device::receiver_pairings(&mut self.endpoints[endpoint])? {
-                let listed = self.devices.iter().any(|d| d.endpoint == endpoint && d.index == p.slot);
-                if !listed {
+                if !self.online.contains(&(endpoint, p.slot)) {
                     self.pending.entry((endpoint, p.slot)).or_insert((Instant::now(), 1));
                 }
             }
@@ -810,7 +842,8 @@ impl Engine {
             if let Err(e) = self.process_pending() {
                 log::warn!("refresh failed: {e:#}");
             }
-            if self.last_check.elapsed() > HEALTH_CHECK {
+            let check_interval = if self.trigger.is_none() { RESCAN_INTERVAL } else { HEALTH_CHECK };
+            if self.last_check.elapsed() > check_interval {
                 self.last_check = Instant::now();
                 if let Err(e) = self.queue_unlisted().and_then(|_| self.ensure_diverted()) {
                     log::warn!("health check failed: {e:#}");

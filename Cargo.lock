@@ -1257,7 +1257,7 @@ dependencies = [
 
 [[package]]
 name = "flockswitch"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "auto-launch",
@@ -1273,6 +1273,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sys-locale",
+ "tiny-skia",
  "toml",
  "tray-icon",
  "winit",

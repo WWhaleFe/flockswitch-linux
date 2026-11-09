@@ -12,6 +12,9 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+/// The slot of the locate-the-cursor shortcut, next to channels 1-3.
+pub const LOCATE: u8 = 0;
+
 /// Reads a shortcut as written in the settings, e.g. "ctrl+alt+1".
 pub fn parse(text: &str) -> Result<HotKey> {
     text.parse::<HotKey>().map_err(|e| anyhow!("shortcut '{text}': {e}"))
@@ -84,8 +87,10 @@ impl Shortcuts {
         // Called as the key goes down, so the switch does not wait for the menu loop.
         GlobalHotKeyEvent::set_event_handler(Some(move |ev: GlobalHotKeyEvent| {
             if ev.state == HotKeyState::Pressed {
-                if let Some(&channel) = map.lock().unwrap().get(&ev.id) {
-                    shared.request_switch(channel);
+                match map.lock().unwrap().get(&ev.id) {
+                    Some(&LOCATE) => shared.request_locate(),
+                    Some(&channel) => shared.request_switch(channel),
+                    None => {}
                 }
             }
         }));
@@ -95,11 +100,16 @@ impl Shortcuts {
     /// Registers what the settings ask for. Returns the channels whose shortcut could
     /// not be registered (usually taken by another app) when anything changed.
     pub fn sync(&mut self, cfg: &Config) -> Option<Vec<u8>> {
-        let wanted: Vec<(u8, String)> = if cfg.enabled && cfg.hotkeys.on && !paused() {
-            (1..=3).map(|n| (n, cfg.hotkeys.key(n).to_string())).filter(|(_, k)| !k.is_empty()).collect()
-        } else {
-            Vec::new()
-        };
+        let mut wanted: Vec<(u8, String)> = Vec::new();
+        if !paused() {
+            if cfg.enabled && cfg.hotkeys.on {
+                wanted.extend((1..=3).map(|n| (n, cfg.hotkeys.key(n).to_string())));
+            }
+            if cfg.locate.on && cfg.locate.on_hotkey {
+                wanted.push((LOCATE, cfg.locate.hotkey.clone()));
+            }
+            wanted.retain(|(_, k)| !k.is_empty());
+        }
         if wanted == self.current {
             return None;
         }
@@ -115,7 +125,7 @@ impl Shortcuts {
                     self.registered.push(hk);
                 }
                 Err(e) => {
-                    log::warn!("channel {n} shortcut not registered: {e:#}");
+                    log::warn!("shortcut {n} not registered: {e:#}");
                     failed.push(*n);
                 }
             }
