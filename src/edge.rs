@@ -254,16 +254,16 @@ fn watch(shared: Arc<Shared>) {
                 }
             }
             if arrived && cfg.locate.on && cfg.locate.on_arrival {
-                overlay::locate(cfg.locate.style);
+                overlay::locate(&cfg.locate);
             }
             mouse_here = now_here;
         }
         if shared.take_locate_request() && cfg.locate.on {
-            overlay::locate(cfg.locate.style);
+            overlay::locate(&cfg.locate);
         }
         if cfg.locate.on && cfg.locate.on_shake {
             if platform::cursor().is_some_and(|(x, _)| shake.update(x, Instant::now())) {
-                overlay::locate(cfg.locate.style);
+                overlay::locate(&cfg.locate);
             }
         }
         if !active {

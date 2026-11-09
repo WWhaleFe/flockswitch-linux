@@ -4,8 +4,8 @@
 //! stays open, unlike a native menu that closes after each click.
 
 use crate::config::{
-    pick, Config, Edge, EdgeAnimDirection, EdgeAnimStyle, Gesture, Haptics, LocateStyle, BUTTON_GESTURE, BUTTON_MIDDLE,
-    BUTTON_WHEEL_MODE, EDGE_ANIM_STYLES,
+    format_color, parse_color, pick, Config, Edge, EdgeAnimDirection, EdgeAnimStyle, Gesture, Haptics, LocateStyle,
+    BUTTON_GESTURE, BUTTON_MIDDLE, BUTTON_WHEEL_MODE, EDGE_ANIM_STYLES,
 };
 use crate::device::waveform;
 use crate::hotkey::LOCATE;
@@ -46,9 +46,9 @@ pub fn run(lock: std::net::TcpListener, show_update: bool) -> Result<()> {
             // Matches flockswitch.desktop, so the dock shows the app's name and icon.
             .with_app_id("flockswitch")
             .with_icon(icon)
-            .with_inner_size([540.0, 680.0])
-            .with_min_inner_size([480.0, 580.0])
-            .with_max_inner_size([680.0, 820.0])
+            .with_inner_size([840.0, 840.0])
+            .with_min_inner_size([760.0, 640.0])
+            .with_max_inner_size([1200.0, 1100.0])
             .with_maximize_button(false)
             .with_active(true),
         ..Default::default()
@@ -298,7 +298,27 @@ struct SettingsApp {
     haptics_dialog: Option<HapticsDialog>,
     /// "Reset settings…" was pressed and waits for its confirmation.
     confirm_reset: bool,
+    /// A colour being dragged in the picker; saved when the mouse button comes up.
+    color_draft: Option<(EffectColor, [u8; 3])>,
 }
+
+/// Which on-screen effect a colour row sets.
+#[derive(Clone, Copy, PartialEq)]
+enum EffectColor {
+    Edge,
+    Locate,
+}
+
+/// The ready-made colours of a colour row; any other comes from the picker beside them.
+const COLOR_PRESETS: [[u8; 3]; 7] = [
+    [0xFF, 0xCC, 0x00],
+    [0xFF, 0x7A, 0x1A],
+    [0xFF, 0x3B, 0x30],
+    [0xFF, 0x2D, 0x92],
+    [0x0A, 0x84, 0xFF],
+    [0x34, 0xC7, 0x59],
+    [0xFF, 0xFF, 0xFF],
+];
 
 /// The modal haptics window. Its controls change `draft`; nothing reaches the settings
 /// file or the mouse until Apply or OK.
@@ -356,6 +376,7 @@ impl SettingsApp {
             copied_at: None,
             haptics_dialog: None,
             confirm_reset: false,
+            color_draft: None,
         };
         app.refresh();
         if show_update || app.cfg.check_updates {
@@ -536,14 +557,15 @@ impl eframe::App for SettingsApp {
                             self.group_section(ui, t, p);
                         }
                         Tab::General => {
-                            notice(ui, p, t);
-                            self.autostart_card(ui, t, p);
-                            self.locate_section(ui, t, p);
-                            self.haptics_summary(ui, t, p);
-                            self.language_card(ui, t, p);
-                            self.update_section(ui, t, p);
-                            self.report_section(ui, t, p);
-                            self.maintenance_card(ui, t, p);
+                            two_columns(ui, |left, right| {
+                                notice(left, p, t);
+                                self.locate_section(left, t, p);
+                                self.haptics_summary(left, t, p);
+                                self.preferences_card(right, t, p);
+                                self.update_section(right, t, p);
+                                self.report_section(right, t, p);
+                                self.maintenance_card(right, t, p);
+                            });
                         }
                     }
 
@@ -754,8 +776,8 @@ impl SettingsApp {
         }
     }
 
-    /// Switching at the screen edge: on/off, the channel of each side, how long the
-    /// cursor must rest there, and the cursor's return.
+    /// Switching at the screen edge, in two columns so the page fits the window: where
+    /// each side goes on the left, how the wait looks and feels on the right.
     fn edge_rows(&mut self, ui: &mut Ui, t: &Texts, p: Palette) {
         if !crate::edge::available() {
             ui.add_space(8.0);
@@ -768,9 +790,18 @@ impl SettingsApp {
         hint(ui, p, t.edges_hint);
         ui.add_space(6.0);
         divider(ui, p);
+        two_columns(ui, |left, right| {
+            self.edge_sides(left, t, p);
+            self.edge_wait(right, t, p);
+        });
+        ui.add_space(8.0);
+    }
+
+    /// The channel of each side, how long the cursor must rest there, and its return.
+    fn edge_sides(&mut self, ui: &mut Ui, t: &Texts, p: Palette) {
         let here = self.status.channel.filter(|c| (1..=3).contains(c));
         let labels: Vec<String> = [t.off.to_string()].into_iter().chain((1..=3).map(|n| n.to_string())).collect();
-        let width = (ui.available_width() * 0.6).min(260.0);
+        let width = (ui.available_width() * 0.66).min(260.0);
         let sides = [(Edge::Left, t.edge_left), (Edge::Right, t.edge_right), (Edge::Top, t.edge_top), (Edge::Bottom, t.edge_bottom)];
         for (edge, label) in sides {
             let current = self.cfg.edges.channel(edge);
@@ -804,6 +835,15 @@ impl SettingsApp {
             self.apply(|c| c.edges.dwell_ms = dwell);
         }
         divider(ui, p);
+        let mut place = self.cfg.edges.place_cursor;
+        if switch_row(ui, p, t.edge_place, None, &mut place) {
+            self.apply(|c| c.edges.place_cursor = place);
+        }
+        hint(ui, p, t.edges_corner_hint);
+    }
+
+    /// What it takes to start the wait, and what shows while it runs.
+    fn edge_wait(&mut self, ui: &mut Ui, t: &Texts, p: Palette) {
         let mut control = self.cfg.edges.require_control;
         if switch_row(ui, p, t.edge_require_control, None, &mut control) {
             self.apply(|c| c.edges.require_control = control);
@@ -811,18 +851,12 @@ impl SettingsApp {
         hint(ui, p, t.edge_require_control_hint);
         ui.add_space(6.0);
         divider(ui, p);
-        self.edge_anim_rows(ui, t, p, width);
-        divider(ui, p);
-        let mut place = self.cfg.edges.place_cursor;
-        if switch_row(ui, p, t.edge_place, None, &mut place) {
-            self.apply(|c| c.edges.place_cursor = place);
-        }
-        hint(ui, p, t.edges_corner_hint);
-        ui.add_space(10.0);
+        self.edge_anim_rows(ui, t, p);
     }
 
     /// Which countdown is drawn at the edge, and how it drains where that can be chosen.
-    fn edge_anim_rows(&mut self, ui: &mut Ui, t: &Texts, p: Palette, width: f32) {
+    fn edge_anim_rows(&mut self, ui: &mut Ui, t: &Texts, p: Palette) {
+        let width = (ui.available_width() * 0.72).min(280.0);
         let options: Vec<(EdgeAnimStyle, &str)> = EDGE_ANIM_STYLES.into_iter().zip(t.edge_anim_names).collect();
         let mut style = self.cfg.edges.anim_style;
         let (mut changed, mut preview) = (false, false);
@@ -863,6 +897,61 @@ impl SettingsApp {
                 self.apply(|c| c.edges.anim_direction = direction);
             }
         }
+        if self.cfg.edges.anim_style != EdgeAnimStyle::None {
+            self.effect_color_row(ui, t, p, EffectColor::Edge, false);
+        }
+    }
+
+    fn saved_color(&self, slot: EffectColor) -> String {
+        match slot {
+            EffectColor::Edge => self.cfg.edges.anim_color.clone(),
+            EffectColor::Locate => self.cfg.locate.color.clone(),
+        }
+    }
+
+    fn save_color(&mut self, slot: EffectColor, color: [u8; 3]) {
+        let text = format_color(color);
+        self.apply(|c| match slot {
+            EffectColor::Edge => c.edges.anim_color = text,
+            EffectColor::Locate => c.locate.color = text,
+        });
+    }
+
+    /// Ready-made colours and a picker for any other, with a Preview button if asked for.
+    /// Returns true when it was pressed.
+    fn effect_color_row(&mut self, ui: &mut Ui, t: &Texts, p: Palette, slot: EffectColor, offer_preview: bool) -> bool {
+        let saved = parse_color(&self.saved_color(slot)).unwrap_or(COLOR_PRESETS[0]);
+        let mut shown = self.color_draft.filter(|(s, _)| *s == slot).map_or(saved, |(_, c)| c);
+        let (mut preset, mut dragged, mut preview) = (None, false, false);
+        let width = ui.available_width() - 70.0;
+        labeled_row(ui, p, t.effect_color, width, ROW_SMALL, |ui| {
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.spacing_mut().item_spacing.x = 5.0;
+                preview = offer_preview && button(ui, p, t.preview, ButtonKind::Plain).clicked();
+                dragged = ui.color_edit_button_srgb(&mut shown).changed();
+                for color in COLOR_PRESETS.iter().rev() {
+                    if color_swatch(ui, p, *color, *color == shown).clicked() {
+                        preset = Some(*color);
+                    }
+                }
+            });
+            false
+        });
+        if let Some(color) = preset {
+            self.color_draft = None;
+            self.save_color(slot, color);
+        } else if dragged {
+            self.color_draft = Some((slot, shown));
+            ui.ctx().request_repaint();
+        }
+        // Saved once the mouse button is up, not on every step of a drag.
+        if let Some((s, color)) = self.color_draft.filter(|(s, _)| *s == slot) {
+            if !ui.ctx().input(|i| i.pointer.any_down()) {
+                self.color_draft = None;
+                self.save_color(s, color);
+            }
+        }
+        preview
     }
 
     fn stop_recording(&mut self) {
@@ -1188,26 +1277,15 @@ impl SettingsApp {
                 (LocateStyle::Ring, t.locate_ring),
                 (LocateStyle::Radar, t.locate_radar),
                 (LocateStyle::Spotlight, t.locate_spotlight),
+                (LocateStyle::Random, t.locate_random),
             ];
             let mut style = self.cfg.locate.style;
-            let width = (ui.available_width() * 0.72).min(340.0);
-            let mut changed = false;
-            let mut preview = false;
-            labeled_row(ui, p, t.locate_style, width, ROW_SMALL, |ui| {
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.spacing_mut().item_spacing.x = 6.0;
-                    preview = button(ui, p, t.preview, ButtonKind::Plain).clicked();
-                    ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                        changed = segmented(ui, p, "locate-style", &mut style, &choices, SEG_SMALL);
-                    });
-                });
-                false
-            });
-            if changed {
+            let width = (ui.available_width() * 0.8).min(340.0);
+            if labeled_row(ui, p, t.locate_style, width, ROW_SMALL, |ui| combo(ui, "locate-style", &mut style, &choices)) {
                 self.apply(|c| c.locate.style = style);
             }
-            if preview {
-                crate::overlay::locate(style);
+            if self.effect_color_row(ui, t, p, EffectColor::Locate, true) {
+                crate::overlay::locate(&self.cfg.locate);
             }
             divider(ui, p);
             let mut on = self.cfg.locate.on_hotkey;
@@ -1231,21 +1309,8 @@ impl SettingsApp {
         });
     }
 
-    fn autostart_card(&mut self, ui: &mut Ui, t: &Texts, p: Palette) {
-        let Some(al) = self.autostart.as_ref() else { return };
-        let mut on = self.autostart_on;
-        let mut flipped = false;
-        ui.add_space(12.0);
-        card(ui, p, |ui| flipped = switch_row(ui, p, t.autostart, None, &mut on));
-        if flipped {
-            match if on { al.enable() } else { al.disable() } {
-                Ok(()) => self.autostart_on = on,
-                Err(e) => self.error = Some(e.to_string()),
-            }
-        }
-    }
-
-    fn language_card(&mut self, ui: &mut Ui, t: &Texts, p: Palette) {
+    /// The language, and starting at login.
+    fn preferences_card(&mut self, ui: &mut Ui, t: &Texts, p: Palette) {
         ui.add_space(12.0);
         card(ui, p, |ui| {
             let mut language = self.cfg.language.clone();
@@ -1255,6 +1320,16 @@ impl SettingsApp {
             if labeled_row(ui, p, t.language, width, ROW_NORMAL, |ui| segmented(ui, p, "language", &mut chosen, &choices, SEG_NORMAL)) {
                 language = chosen.to_string();
                 self.apply(|c| c.language = language);
+            }
+            if let Some(al) = self.autostart.as_ref() {
+                divider(ui, p);
+                let mut on = self.autostart_on;
+                if switch_row(ui, p, t.autostart, None, &mut on) {
+                    match if on { al.enable() } else { al.disable() } {
+                        Ok(()) => self.autostart_on = on,
+                        Err(e) => self.error = Some(e.to_string()),
+                    }
+                }
             }
         });
     }
@@ -1367,10 +1442,17 @@ impl SettingsApp {
             ui.add_space(10.0);
             ui.label(RichText::new(t.report_desc).size(12.5).color(p.muted));
             ui.add_space(6.0);
-            ui.label(RichText::new(update::REPORT_EMAIL).font(bold(14.0)).color(p.text));
-            ui.add_space(8.0);
             ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = 8.0;
+                ui.label(RichText::new(update::REPORT_EMAIL).font(bold(14.0)).color(p.text));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if button(ui, p, t.report_log, ButtonKind::Plain).clicked() {
+                        update::reveal(&crate::log_path());
+                    }
+                });
+            });
+            ui.add_space(8.0);
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing = Vec2::new(8.0, 6.0);
                 if button(ui, p, t.report_mail, ButtonKind::Primary).clicked() {
                     let body = update::report_body(&self.cfg, &self.devices, self.status.trigger.as_deref());
                     update::open_url(&update::report_mailto(t.report_subject, &body));
@@ -1383,9 +1465,6 @@ impl SettingsApp {
                 }
                 if button(ui, p, t.report_issue, ButtonKind::Plain).clicked() {
                     update::open_url(update::ISSUES_PAGE);
-                }
-                if button(ui, p, t.report_log, ButtonKind::Plain).clicked() {
-                    update::reveal(&crate::log_path());
                 }
             });
             ui.add_space(12.0);
@@ -1456,6 +1535,33 @@ fn away_badge<'a>(d: &DeviceInfo, t: &'a Texts, p: Palette) -> Option<(&'a str, 
 }
 
 // ---- Building blocks -------------------------------------------------------------
+
+/// Two columns side by side, each with the normal spacing inside.
+fn two_columns(ui: &mut Ui, add: impl FnOnce(&mut Ui, &mut Ui)) {
+    ui.scope(|ui| {
+        ui.spacing_mut().item_spacing.x = 28.0;
+        ui.columns(2, |columns| {
+            let (left, right) = columns.split_at_mut(1);
+            left[0].spacing_mut().item_spacing.x = 8.0;
+            right[0].spacing_mut().item_spacing.x = 8.0;
+            add(&mut left[0], &mut right[0]);
+        });
+    });
+}
+
+/// A round button showing one colour, ringed when it is the current one.
+fn color_swatch(ui: &mut Ui, p: Palette, [r, g, b]: [u8; 3], selected: bool) -> Response {
+    let (rect, resp) = ui.allocate_exact_size(Vec2::splat(20.0), Sense::click());
+    let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
+    resp.widget_info(|| WidgetInfo::selected(Role::RadioButton, true, selected, format_color([r, g, b])));
+    let painter = ui.painter();
+    painter.circle_filled(rect.center(), 8.0, Color32::from_rgb(r, g, b));
+    painter.circle_stroke(rect.center(), 8.0, Stroke::new(1.0, p.track));
+    if selected {
+        painter.circle_stroke(rect.center(), 10.0, Stroke::new(1.8, p.text));
+    }
+    resp
+}
 
 /// A titled card: the title sits above a rounded panel, as in the system settings.
 fn section(ui: &mut Ui, p: Palette, title: &str, add: impl FnOnce(&mut Ui)) {

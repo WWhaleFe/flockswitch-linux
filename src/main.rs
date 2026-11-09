@@ -55,9 +55,10 @@ USAGE:
                               set edge.dwell 500    how long the cursor must rest there (ms)
                               set edge.cursor true  put the cursor at that edge when the mouse comes back
                               set edge.control true wait only while Ctrl is held
-                              set edge.anim ring    none, ring, semicircle, bar, pulse, laser, vortex, scan, liquid
+                              set edge.anim ring    none, ring, semicircle, bar, pulse, laser, vortex, scan, liquid, random
                               set edge.anim_direction both     clockwise, counterclockwise, both
                               set edge.anim_shrink true        shrink instead of draining (ring, semicircle)
+                              set edge.anim_color #FFCC00      the colour of the countdown
                               set haptics.switch true          MX Master 4: a pulse when switching
                               set haptics.edge true            pulses while waiting at a screen edge
                               set haptics.progressive true     those pulses get faster and stronger
@@ -65,7 +66,8 @@ USAGE:
                               set haptics.edge_waveform 4      waveform IDs 0-14, 27 (also switch_waveform,
                                                     arrive_waveform)
                               set locate true       show where the cursor is
-                              set locate.style ring            ring, radar, spotlight
+                              set locate.style ring            ring, radar, spotlight, random
+                              set locate.color #FFCC00         the colour of the highlight
                               set locate.hotkey ctrl+alt+l     its shortcut (none = off)
                               set locate.arrival true          when the mouse arrives from another computer
                               set locate.shake true            when the mouse is shaken

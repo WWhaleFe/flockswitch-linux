@@ -193,6 +193,24 @@ impl Edge {
     }
 }
 
+/// The colour of the on-screen effects until another is chosen.
+pub const DEFAULT_EFFECT_COLOR: &str = "#FFCC00";
+
+/// Red, green and blue of a colour written as "#RRGGBB".
+pub fn parse_color(text: &str) -> Option<[u8; 3]> {
+    let hex = text.trim().strip_prefix('#')?;
+    if hex.len() != 6 || !hex.is_ascii() {
+        return None;
+    }
+    let byte = |at: usize| u8::from_str_radix(&hex[at..at + 2], 16).ok();
+    Some([byte(0)?, byte(2)?, byte(4)?])
+}
+
+/// A colour as the settings write it.
+pub fn format_color([r, g, b]: [u8; 3]) -> String {
+    format!("#{r:02X}{g:02X}{b:02X}")
+}
+
 /// What is drawn near the cursor while it waits at a screen edge. The number of each
 /// variant indexes the table of drawing functions in overlay_render.rs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -208,9 +226,11 @@ pub enum EdgeAnimStyle {
     Vortex,
     Scan,
     Liquid,
+    /// A different effect each time; see `resolved`. Has no drawing function of its own.
+    Random,
 }
 
-pub const EDGE_ANIM_STYLES: [EdgeAnimStyle; 9] = [
+pub const EDGE_ANIM_STYLES: [EdgeAnimStyle; 10] = [
     EdgeAnimStyle::None,
     EdgeAnimStyle::Ring,
     EdgeAnimStyle::Semicircle,
@@ -220,7 +240,14 @@ pub const EDGE_ANIM_STYLES: [EdgeAnimStyle; 9] = [
     EdgeAnimStyle::Vortex,
     EdgeAnimStyle::Scan,
     EdgeAnimStyle::Liquid,
+    EdgeAnimStyle::Random,
 ];
+
+/// A number below `n`, different from run to run. Good enough to choose an effect.
+fn random_below(n: usize) -> usize {
+    use std::hash::{BuildHasher, Hasher};
+    std::collections::hash_map::RandomState::new().build_hasher().finish() as usize % n
+}
 
 impl EdgeAnimStyle {
     /// Name in the settings file and on the command line.
@@ -235,11 +262,20 @@ impl EdgeAnimStyle {
             EdgeAnimStyle::Vortex => "vortex",
             EdgeAnimStyle::Scan => "scan",
             EdgeAnimStyle::Liquid => "liquid",
+            EdgeAnimStyle::Random => "random",
         }
     }
 
     fn from_name(name: &str) -> Option<EdgeAnimStyle> {
         EDGE_ANIM_STYLES.into_iter().find(|s| s.name() == name.trim().to_lowercase())
+    }
+
+    /// The effect to draw now: for Random one of the others (never None).
+    pub fn resolved(self) -> EdgeAnimStyle {
+        match self {
+            EdgeAnimStyle::Random => EDGE_ANIM_STYLES[1 + random_below(EDGE_ANIM_STYLES.len() - 2)],
+            style => style,
+        }
     }
 
     /// Whether the effect drains in a direction the user can choose.
@@ -272,6 +308,18 @@ pub enum LocateStyle {
     Ring,
     Radar,
     Spotlight,
+    /// A different effect each time; see `resolved`. Has no drawing function of its own.
+    Random,
+}
+
+impl LocateStyle {
+    /// The effect to draw now: for Random one of the others.
+    pub fn resolved(self) -> LocateStyle {
+        match self {
+            LocateStyle::Random => [LocateStyle::Ring, LocateStyle::Radar, LocateStyle::Spotlight][random_below(3)],
+            style => style,
+        }
+    }
 }
 
 /// Showing where the cursor is with a short highlight around it.
@@ -288,6 +336,8 @@ pub struct Locate {
     /// Shown when the mouse is shaken from side to side.
     pub on_shake: bool,
     pub style: LocateStyle,
+    /// "#RRGGBB".
+    pub color: String,
 }
 
 impl Default for Locate {
@@ -299,6 +349,7 @@ impl Default for Locate {
             on_arrival: true,
             on_shake: false,
             style: LocateStyle::default(),
+            color: DEFAULT_EFFECT_COLOR.into(),
         }
     }
 }
@@ -327,6 +378,8 @@ pub struct Edges {
     pub anim_direction: EdgeAnimDirection,
     /// The ring or semicircle shrinks away instead of draining.
     pub anim_shrink: bool,
+    /// "#RRGGBB".
+    pub anim_color: String,
 }
 
 impl Default for Edges {
@@ -344,6 +397,7 @@ impl Default for Edges {
             anim_style: EdgeAnimStyle::default(),
             anim_direction: EdgeAnimDirection::default(),
             anim_shrink: false,
+            anim_color: DEFAULT_EFFECT_COLOR.into(),
         }
     }
 }
@@ -710,6 +764,7 @@ impl Config {
                 "arrival" => self.locate.on_arrival = flag()?,
                 "shake" => self.locate.on_shake = flag()?,
                 "shortcut" => self.locate.on_hotkey = flag()?,
+                "color" => self.locate.color = value.trim().to_uppercase(),
                 "hotkey" => {
                     let value = if value.eq_ignore_ascii_case("none") { "" } else { value };
                     self.locate.hotkey = value.trim().to_lowercase();
@@ -719,10 +774,11 @@ impl Config {
                         "ring" => LocateStyle::Ring,
                         "radar" => LocateStyle::Radar,
                         "spotlight" => LocateStyle::Spotlight,
-                        _ => anyhow::bail!("locate.style must be ring, radar or spotlight"),
+                        "random" => LocateStyle::Random,
+                        _ => anyhow::bail!("locate.style must be ring, radar, spotlight or random"),
                     };
                 }
-                _ => anyhow::bail!("unknown setting '{key}' (locate, locate.style, locate.hotkey, locate.shortcut, locate.arrival, locate.shake)"),
+                _ => anyhow::bail!("unknown setting '{key}' (locate, locate.style, locate.color, locate.hotkey, locate.shortcut, locate.arrival, locate.shake)"),
             }
             return Ok(());
         }
@@ -738,7 +794,7 @@ impl Config {
                 "control" | "require_control" => self.edges.require_control = value.parse().context("edge.control must be true or false")?,
                 "anim" | "anim_style" => {
                     self.edges.anim_style = EdgeAnimStyle::from_name(value)
-                        .context("edge.anim must be none, ring, semicircle, bar, pulse, laser, vortex, scan or liquid")?;
+                        .context("edge.anim must be none, ring, semicircle, bar, pulse, laser, vortex, scan, liquid or random")?;
                 }
                 "anim_direction" => {
                     self.edges.anim_direction = match value.trim().to_lowercase().as_str() {
@@ -749,6 +805,7 @@ impl Config {
                     };
                 }
                 "anim_shrink" => self.edges.anim_shrink = value.parse().context("edge.anim_shrink must be true or false")?,
+                "anim_color" => self.edges.anim_color = value.trim().to_uppercase(),
                 side => {
                     let edge = Edge::from_name(side).with_context(|| format!("unknown edge '{side}' (left, right, top, bottom)"))?;
                     let channel = if value.eq_ignore_ascii_case("none") || value.eq_ignore_ascii_case("off") {
@@ -831,6 +888,8 @@ impl Config {
         }
         anyhow::ensure!((100..=5000).contains(&self.edges.dwell_ms), "edge.dwell must be between 100 and 5000 ms");
         anyhow::ensure!(self.edges.corner_margin <= 1000, "edge.corner must be at most 1000 pixels");
+        anyhow::ensure!(parse_color(&self.edges.anim_color).is_some(), "edge.anim_color must be a colour like #FFCC00");
+        anyhow::ensure!(parse_color(&self.locate.color).is_some(), "locate.color must be a colour like #FFCC00");
         for w in [self.haptics.switch_waveform, self.haptics.arrive_waveform, self.haptics.edge_waveform] {
             anyhow::ensure!(w <= 31, "haptics: waveforms are numbered 0 to 31");
         }
@@ -1149,9 +1208,23 @@ mod tests {
         assert_eq!(c.edges.anim_style, EdgeAnimStyle::Vortex);
         assert_eq!(c.edges.anim_direction, EdgeAnimDirection::Both);
         assert!(c.set("edge.anim", "sparkle").is_err());
+        assert_eq!(c.edges.anim_color, DEFAULT_EFFECT_COLOR);
+        c.set("edge.anim_color", "#0a84ff").unwrap();
+        assert_eq!(c.edges.anim_color, "#0A84FF");
+        assert_eq!(parse_color(&c.edges.anim_color), Some([0x0A, 0x84, 0xFF]));
+        assert_eq!(format_color([0x0A, 0x84, 0xFF]), "#0A84FF");
+        for bad in ["red", "#12345", "#GGGGGG", "0A84FF", "#한글한"] {
+            assert!(c.set("edge.anim_color", bad).is_err(), "{bad}");
+        }
         assert!(c.set("edge.anim_direction", "up").is_err());
         let back = Config::parse(&toml::to_string_pretty(&c).unwrap()).unwrap();
         assert_eq!(back.edges, c.edges);
+        c.set("edge.anim", "random").unwrap();
+        for _ in 0..200 {
+            let picked = c.edges.anim_style.resolved();
+            assert!(picked != EdgeAnimStyle::None && picked != EdgeAnimStyle::Random, "{picked:?}");
+        }
+        assert_eq!(EdgeAnimStyle::Bar.resolved(), EdgeAnimStyle::Bar);
         // The table of drawing functions in overlay_render.rs is indexed by these numbers.
         for (i, style) in EDGE_ANIM_STYLES.into_iter().enumerate() {
             assert_eq!(style as usize, i);
@@ -1173,6 +1246,12 @@ mod tests {
         assert_eq!(c.locate.hotkey, "ctrl+alt+shift+k");
         assert!(c.set("locate.hotkey", "ctrl+alt+1").is_err(), "already channel 1's");
         assert!(c.set("locate.style", "laser").is_err());
+        c.set("locate.style", "random").unwrap();
+        assert!((0..100).all(|_| c.locate.style.resolved() != LocateStyle::Random));
+        c.set("locate.style", "spotlight").unwrap();
+        c.set("locate.color", "#34c759").unwrap();
+        assert_eq!(c.locate.color, "#34C759");
+        assert!(c.set("locate.color", "green").is_err());
         assert!(c.set("locate.bogus", "1").is_err());
         c.set("locate.hotkey", "none").unwrap();
         assert_eq!(c.locate.hotkey, "");

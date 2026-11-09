@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.5.0 — 2026-11-09
+
+- Effect colours: the screen-edge countdown and the find-the-cursor highlight each have their own colour (seven ready-made, any other from the picker). `set edge.anim_color #0A84FF`, `set locate.color #34C759`
+- Random effects: choose **Random** for the edge countdown or the highlight and each one shows a different effect
+- A larger settings window (840×840 to start, 760×640 to 1200×1100) with two columns on the Switching and General tabs; the Switching tab fits without scrolling at the default size
+
 ## 0.4.0 — 2026-11-09
 
 - Settings window: its size stays within fixed limits (540×680 to start, 480×580 to 680×820), it no longer maximizes, and it keeps its size when you change tabs (a long page scrolls inside). The General tab gains Show log and Reset settings

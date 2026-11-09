@@ -31,9 +31,6 @@ const DIR_CLOCKWISE: i32 = 0;
 const DIR_COUNTERCLOCKWISE: i32 = 1;
 const DIR_BOTH: i32 = 2;
 
-/// The accent of every effect: #FFCC00.
-const YELLOW: (f32, f32, f32) = (1.0, 0.8, 0.0);
-
 const PI: f64 = std::f64::consts::PI;
 const FRAC_PI_2: f64 = std::f64::consts::FRAC_PI_2;
 
@@ -55,6 +52,8 @@ fn v(x: f64, y: f64) -> V {
 /// What the effects draw on: the buffer, plus the drawing state CoreGraphics keeps.
 struct Canvas<'a> {
     pixmap: &'a mut Pixmap,
+    /// The colour of this effect, as chosen in the settings.
+    accent: [f32; 3],
     /// From points with y up to the buffer's pixels with y down.
     to_pixels: Transform,
     line_width: f64,
@@ -86,7 +85,8 @@ impl Canvas<'_> {
             line_cap: if self.round_cap { LineCap::Round } else { LineCap::Butt },
             ..Stroke::default()
         };
-        self.pixmap.stroke_path(path, &yellow_paint(alpha), &stroke, self.to_pixels, None);
+        let paint = self.accent_paint(alpha);
+        self.pixmap.stroke_path(path, &paint, &stroke, self.to_pixels, None);
     }
 
     fn paint_glow(&mut self, path: &Path, width: f64, alpha: f64) {
@@ -97,7 +97,7 @@ impl Canvas<'_> {
         }
     }
 
-    /// Strokes what `pb` holds in yellow, with the current width and glow.
+    /// Strokes what `pb` holds in the accent colour, with the current width and glow.
     fn stroke(&mut self, pb: PathBuilder, alpha: f64) {
         if alpha <= 0.0 {
             return;
@@ -107,22 +107,24 @@ impl Canvas<'_> {
         self.stroke_with(&path, self.line_width, alpha);
     }
 
-    /// Fills what `pb` holds in yellow, with the current glow around its outline.
+    /// Fills what `pb` holds in the accent colour, with the current glow around its outline.
     fn fill(&mut self, pb: PathBuilder, alpha: f64) {
         if alpha <= 0.0 {
             return;
         }
         let Some(path) = pb.finish() else { return };
         self.paint_glow(&path, 0.0, alpha);
-        self.pixmap.fill_path(&path, &yellow_paint(alpha), FillRule::Winding, self.to_pixels, None);
+        let paint = self.accent_paint(alpha);
+        self.pixmap.fill_path(&path, &paint, FillRule::Winding, self.to_pixels, None);
     }
-}
 
-fn yellow_paint(alpha: f64) -> Paint<'static> {
-    let mut paint = Paint::default();
-    paint.anti_alias = true;
-    paint.set_color(Color::from_rgba(YELLOW.0, YELLOW.1, YELLOW.2, clamp01(alpha) as f32).unwrap_or(Color::TRANSPARENT));
-    paint
+    fn accent_paint(&self, alpha: f64) -> Paint<'static> {
+        let [r, g, b] = self.accent;
+        let mut paint = Paint::default();
+        paint.anti_alias = true;
+        paint.set_color(Color::from_rgba(r, g, b, clamp01(alpha) as f32).unwrap_or(Color::TRANSPARENT));
+        paint
+    }
 }
 
 fn circle_path(pb: &mut PathBuilder, o: V, r: f64) {
@@ -494,7 +496,8 @@ fn edge_liquid(c: &mut Canvas, f: &EdgeFrame) {
     pb.line_to(end.x as f32, end.y as f32);
     pb.close();
     let Some(path) = pb.finish() else { return };
-    c.pixmap.fill_path(&path, &yellow_paint(0.9), FillRule::Winding, c.to_pixels, Some(&mask));
+    let paint = c.accent_paint(0.9);
+    c.pixmap.fill_path(&path, &paint, FillRule::Winding, c.to_pixels, Some(&mask));
 }
 
 /// In the order of EdgeAnimStyle in config.rs; its first variant, None, draws nothing.
@@ -603,10 +606,11 @@ pub fn locate_exists(style: i32) -> bool {
     usize::try_from(style).is_ok_and(|s| s < LOCATE_RENDERERS.len())
 }
 
-fn canvas(pixmap: &mut Pixmap, scale: f64) -> Canvas<'_> {
+fn canvas(pixmap: &mut Pixmap, scale: f64, [r, g, b]: [u8; 3]) -> Canvas<'_> {
     let height = pixmap.height() as f32;
     let scale = scale as f32;
-    Canvas { pixmap, to_pixels: Transform::from_row(scale, 0.0, 0.0, -scale, 0.0, height), line_width: 1.0, round_cap: false, glow: None }
+    let accent = [f32::from(r) / 255.0, f32::from(g) / 255.0, f32::from(b) / 255.0];
+    Canvas { pixmap, accent, to_pixels: Transform::from_row(scale, 0.0, 0.0, -scale, 0.0, height), line_width: 1.0, round_cap: false, glow: None }
 }
 
 /// One frame of an edge countdown.
@@ -626,6 +630,8 @@ pub struct EdgeDraw {
     pub t: f64,
     /// Seconds the wait takes.
     pub duration: f64,
+    /// Red, green and blue of the effect.
+    pub color: [u8; 3],
 }
 
 /// Draws one frame of an edge countdown on a cleared `pixmap`, the strip along the edge.
@@ -650,13 +656,14 @@ pub fn draw_edge(pixmap: &mut Pixmap, d: &EdgeDraw) {
         direction: d.direction,
         shrink: d.shrink,
     };
-    let mut c = canvas(pixmap, d.scale);
+    let mut c = canvas(pixmap, d.scale, d.color);
     render(&mut c, &frame);
 }
 
 /// Draws one frame of the cursor highlight on a cleared `pixmap`. `center` is in the
-/// buffer's pixels (y down), `t` the seconds since the effect began.
-pub fn draw_locate(pixmap: &mut Pixmap, style: i32, center: (f64, f64), scale: f64, t: f64) {
+/// buffer's pixels (y down), `t` the seconds since the effect began, `color` its red,
+/// green and blue.
+pub fn draw_locate(pixmap: &mut Pixmap, style: i32, center: (f64, f64), scale: f64, t: f64, color: [u8; 3]) {
     let Some(render) = usize::try_from(style).ok().and_then(|s| LOCATE_RENDERERS.get(s).copied()) else { return };
     let size = v(f64::from(pixmap.width()) / scale, f64::from(pixmap.height()) / scale);
     let frame = LocateFrame {
@@ -665,7 +672,7 @@ pub fn draw_locate(pixmap: &mut Pixmap, style: i32, center: (f64, f64), scale: f
         t,
         fade: clamp01((LOCATE_SECONDS - t) / LOCATE_FADE),
     };
-    let mut c = canvas(pixmap, scale);
+    let mut c = canvas(pixmap, scale, color);
     render(&mut c, &frame);
 }
 
@@ -674,6 +681,7 @@ mod tests {
     use super::*;
 
     const STYLES: i32 = EDGE_RENDERERS.len() as i32;
+    const YELLOW: [u8; 3] = [0xFF, 0xCC, 0x00];
 
     fn opaque_pixels(pixmap: &Pixmap) -> usize {
         pixmap.pixels().iter().filter(|p| p.alpha() > 0).count()
@@ -682,7 +690,7 @@ mod tests {
     fn drawn(edge: i32, style: i32, direction: i32, shrink: bool, progress: f64) -> Pixmap {
         let mut pixmap = Pixmap::new(1920, 240).unwrap();
         let cursor = if edge == EDGE_BOTTOM { (900.0, 230.0) } else { (900.0, 10.0) };
-        let d = EdgeDraw { edge, style, direction, shrink, cursor, scale: 1.0, t: progress * 2.0, duration: 2.0 };
+        let d = EdgeDraw { edge, style, direction, shrink, cursor, scale: 1.0, t: progress * 2.0, duration: 2.0, color: YELLOW };
         draw_edge(&mut pixmap, &d);
         pixmap
     }
@@ -758,7 +766,7 @@ mod tests {
     fn the_scale_keeps_the_size_in_points() {
         let mut one = Pixmap::new(1920, 240).unwrap();
         let mut two = Pixmap::new(3840, 480).unwrap();
-        let d = EdgeDraw { edge: EDGE_TOP, style: 1, direction: DIR_BOTH, shrink: false, cursor: (900.0, 0.0), scale: 1.0, t: 0.0, duration: 2.0 };
+        let d = EdgeDraw { edge: EDGE_TOP, style: 1, direction: DIR_BOTH, shrink: false, cursor: (900.0, 0.0), scale: 1.0, t: 0.0, duration: 2.0, color: YELLOW };
         draw_edge(&mut one, &d);
         draw_edge(&mut two, &EdgeDraw { cursor: (1800.0, 0.0), scale: 2.0, ..d });
         let ratio = opaque_pixels(&two) as f64 / opaque_pixels(&one) as f64;
@@ -769,10 +777,10 @@ mod tests {
     fn the_locate_effects_paint_then_fade_away() {
         for style in 0..3 {
             let mut midway = Pixmap::new(420, 420).unwrap();
-            draw_locate(&mut midway, style, (210.0, 210.0), 1.0, 0.5);
+            draw_locate(&mut midway, style, (210.0, 210.0), 1.0, 0.5, YELLOW);
             assert!(opaque_pixels(&midway) > 200, "style {style}");
             let mut end = Pixmap::new(420, 420).unwrap();
-            draw_locate(&mut end, style, (210.0, 210.0), 1.0, LOCATE_SECONDS);
+            draw_locate(&mut end, style, (210.0, 210.0), 1.0, LOCATE_SECONDS, YELLOW);
             assert_eq!(opaque_pixels(&end), 0, "style {style}");
         }
     }
@@ -780,10 +788,24 @@ mod tests {
     #[test]
     fn the_spotlight_dims_around_the_cursor_only() {
         let mut pixmap = Pixmap::new(1200, 800).unwrap();
-        draw_locate(&mut pixmap, LOCATE_SPOTLIGHT, (600.0, 400.0), 1.0, 0.6);
+        draw_locate(&mut pixmap, LOCATE_SPOTLIGHT, (600.0, 400.0), 1.0, 0.6, YELLOW);
         let at = |x: usize, y: usize| pixmap.pixels()[y * 1200 + x].alpha();
         assert!(at(5, 5) > 100, "the far corner is darkened");
         assert_eq!(at(600, 400), 0, "the cursor is left in the light");
+    }
+
+    #[test]
+    fn the_effect_is_drawn_in_its_colour() {
+        let blue = [0x0A, 0x84, 0xFF];
+        let mut pixmap = Pixmap::new(1920, 240).unwrap();
+        let d = EdgeDraw { edge: EDGE_TOP, style: 1, direction: DIR_BOTH, shrink: false, cursor: (900.0, 0.0), scale: 1.0, t: 0.0, duration: 2.0, color: blue };
+        draw_edge(&mut pixmap, &d);
+        let solid = pixmap.pixels().iter().find(|p| p.alpha() == 255).expect("an opaque pixel").demultiply();
+        assert_eq!([solid.red(), solid.green(), solid.blue()], blue);
+        let mut pixmap = Pixmap::new(420, 420).unwrap();
+        draw_locate(&mut pixmap, 0, (210.0, 210.0), 1.0, 0.3, blue);
+        let lit = pixmap.pixels().iter().max_by_key(|p| p.alpha()).expect("a pixel").demultiply();
+        assert!(lit.blue() > lit.red(), "not yellow: {lit:?}");
     }
 
     #[test]
