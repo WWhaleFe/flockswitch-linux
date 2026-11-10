@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.8.0 — 2026-11-10
+
+- Shaking to find the cursor no longer goes off at the slightest wobble: the mouse has to be shaken without a pause for the time chosen under **When the mouse is shaken** (0.5, 1, 1.5 or 2 s; 1 s to start with), and it can be set to count only while Ctrl, Alt or Shift is held (`set locate.shake_time 1000`, `set locate.shake_key ctrl`). Settings from before keep working, with 1 s and no key
+- **Settings backup** on the General tab: **Save** writes the settings to `Documents/flockswitch` as `flockswitch-settings-<computer>-<date-time>.toml`, **Load…** lists those files newest first and, once you confirm, replaces every setting with the chosen file's, and **Open folder** shows the folder. The files are the same as the Windows and macOS versions', so they load on any of them (a shortcut Linux cannot use is left empty, an unknown shake key becomes none); a file that is not valid settings is refused with the reason. Channels are set per computer, so check them after loading another computer's settings
+- Keyboard shortcuts: a round ⓘ beside the title of the Shortcuts page and beside the find-the-cursor shortcut explains which combinations work on Linux and which do not (Ctrl and/or Alt with a number or letter, or an F key; not Super, Shift alone or the desktop's own combinations; one another app has taken is refused and the row says so; Esc cancels; Wayland needs the desktop's own shortcuts). The rule under the shortcuts moved into it
+- Updates: **Update now** after **Check now** installs a new version whether or not **Install updates automatically** is on (that switch only covers the installs the daily check makes by itself); a release without a file for this computer opens its page instead of failing. The two explanations under the update switches moved into ⓘ tooltips, as did the one in **To the developer**
+- The settings window and the haptics window keep their size when moved to a monitor with a different scale (or when the scale changes): the size in points is remembered and asked for again if the window comes out larger or smaller
+- The settings window starts at 840×960 so the General tab, with its new card, fits without scrolling; haptics and language swapped columns to balance them
+- **Show log** is gone from the General tab (the log is still written to `~/.config/flockswitch/flockswitch.log`)
+
 ## 0.7.0 — 2026-11-10
 
 - Updates install themselves: when the daily check finds a new version, flockswitch downloads it, checks it against the release's SHA256SUMS.txt, replaces the program (and the app-menu entry and icon `install.sh` made) and restarts into it. **Update now** on the General tab and in the tray menu does the same at once. Switch it off with **Install updates automatically** (`set auto_update false`). A Homebrew copy is left to `brew upgrade flockswitch`, and a program in a folder you cannot write to is only downloaded, as before

@@ -11,7 +11,6 @@ use crate::config::{Edge, Edges, EDGES};
 use crate::device::waveform;
 use crate::overlay;
 use crate::shared::Shared;
-use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -29,10 +28,13 @@ const INSET: f64 = 24.0;
 pub(crate) const HAPTIC_TICK: Duration = Duration::from_millis(150);
 /// A pulse takes a moment to play; Change Host right after would cut it short.
 const FINAL_PULSE: Duration = Duration::from_millis(150);
-/// A shake is this many turns within this long, each after this many points of travel.
-const SHAKE_TURNS: usize = 4;
-const SHAKE_WINDOW: Duration = Duration::from_millis(900);
+/// A turn of a shake: the cursor reverses after this many points of travel one way.
 const SHAKE_MIN_RUN: f64 = 80.0;
+/// A shake goes on while each turn follows the last within this long; a longer pause
+/// ends it, and the time starts again with the next turn.
+const SHAKE_GAP: Duration = Duration::from_millis(400);
+/// However short the time chosen, a shake has at least this many turns.
+const SHAKE_TURNS: usize = 4;
 /// After a shake is noticed, the next one counts only after this long.
 const SHAKE_REST: Duration = Duration::from_secs(2);
 
@@ -109,41 +111,83 @@ pub(crate) fn rising_pulse(progress: f64) -> (Duration, u8) {
     }
 }
 
-/// Notices the cursor being shaken from side to side.
+/// Notices the cursor being shaken from side to side without a pause for a set time
+/// (and, if asked, with a key held all the while).
 #[derive(Default)]
 struct Shake {
     last_x: Option<f64>,
     /// Which way the cursor is going (+1 or -1), and how far it has come that way.
     heading: f64,
     run: f64,
-    turns: VecDeque<Instant>,
+    /// When the cursor last moved: after a pause the next turn does not count.
+    moved: Option<Instant>,
+    /// The shake going on: its first turn, its latest one, and how many so far.
+    first_turn: Option<Instant>,
+    last_turn: Option<Instant>,
+    turns: usize,
     noticed: Option<Instant>,
 }
 
 impl Shake {
-    /// Takes the cursor's x position; true at the moment a shake is noticed.
-    fn update(&mut self, x: f64, now: Instant) -> bool {
-        let Some(last) = self.last_x.replace(x) else { return false };
-        let dx = x - last;
-        if dx == 0.0 {
+    /// Takes the cursor's x position and whether the key that has to be held is down
+    /// (true when no key is needed). True at the moment a shake has gone on for `time`.
+    fn update(&mut self, x: f64, held: bool, time: Duration, now: Instant) -> bool {
+        let last = self.last_x.replace(x);
+        // Without the key nothing counts, and what came before pressing it is forgotten.
+        if !held {
+            self.heading = 0.0;
+            self.run = 0.0;
+            self.end_shake();
             return false;
         }
-        if dx.signum() == self.heading {
-            self.run += dx.abs();
-        } else {
-            if self.run >= SHAKE_MIN_RUN {
-                self.turns.push_back(now);
+        let Some(last) = last else { return false };
+        let dx = x - last;
+        if dx != 0.0 {
+            if self.moved.is_some_and(|t| now.duration_since(t) > SHAKE_GAP) {
+                self.heading = 0.0;
+                self.run = 0.0;
             }
-            self.heading = dx.signum();
-            self.run = dx.abs();
+            self.moved = Some(now);
+            if dx.signum() == self.heading {
+                self.run += dx.abs();
+            } else {
+                if self.run >= SHAKE_MIN_RUN {
+                    self.turn(now);
+                }
+                self.heading = dx.signum();
+                self.run = dx.abs();
+            }
         }
-        self.turns.retain(|t| now.duration_since(*t) <= SHAKE_WINDOW);
-        if self.turns.len() < SHAKE_TURNS || self.noticed.is_some_and(|t| now.duration_since(t) < SHAKE_REST) {
+        if self.last_turn.is_some_and(|t| now.duration_since(t) > SHAKE_GAP) {
+            self.end_shake();
+        }
+        // Shaking on after a highlight needs the whole time again.
+        if self.noticed.is_some_and(|t| now.duration_since(t) < SHAKE_REST) {
+            self.end_shake();
+            return false;
+        }
+        let Some(first) = self.first_turn else { return false };
+        if self.turns < SHAKE_TURNS || now.duration_since(first) < time {
             return false;
         }
         self.noticed = Some(now);
-        self.turns.clear();
+        self.end_shake();
         true
+    }
+
+    fn turn(&mut self, now: Instant) {
+        if self.last_turn.is_none_or(|t| now.duration_since(t) > SHAKE_GAP) {
+            self.first_turn = Some(now);
+            self.turns = 0;
+        }
+        self.turns += 1;
+        self.last_turn = Some(now);
+    }
+
+    fn end_shake(&mut self) {
+        self.first_turn = None;
+        self.last_turn = None;
+        self.turns = 0;
     }
 }
 
@@ -262,7 +306,11 @@ fn watch(shared: Arc<Shared>) {
             overlay::locate(&cfg.locate);
         }
         if cfg.locate.on && cfg.locate.on_shake {
-            if platform::cursor().is_some_and(|(x, _)| shake.update(x, Instant::now())) {
+            let time = Duration::from_millis(cfg.locate.shake_time_ms);
+            let noticed = platform::pointer().is_some_and(|(x, _, mask)| {
+                shake.update(x, platform::key_held(mask, cfg.locate.shake_key), time, Instant::now())
+            });
+            if noticed {
                 overlay::locate(&cfg.locate);
             }
         }
@@ -362,9 +410,10 @@ fn watch(shared: Arc<Shared>) {
 /// position, so there this is not available (XWayland sees it only over X11 windows).
 mod platform {
     use super::Rect;
+    use crate::config::ShakeKey;
     use std::sync::OnceLock;
     use x11_dl::xinerama::Xlib as Xinerama;
-    use x11_dl::xlib::{ControlMask, Display, Xlib};
+    use x11_dl::xlib::{ControlMask, Display, Mod1Mask, ShiftMask, Xlib};
 
     struct X {
         xlib: Xlib,
@@ -407,7 +456,7 @@ mod platform {
     }
 
     /// The cursor position and the modifier keys, as of now.
-    fn pointer() -> Option<(f64, f64, u32)> {
+    pub fn pointer() -> Option<(f64, f64, u32)> {
         let x = x()?;
         let (mut root, mut child) = (0u64, 0u64);
         let (mut rx, mut ry, mut wx, mut wy) = (0i32, 0i32, 0i32, 0i32);
@@ -426,6 +475,17 @@ mod platform {
     /// Whether a Control key is held right now.
     pub fn control_down() -> bool {
         pointer().is_some_and(|(_, _, mask)| mask & ControlMask != 0)
+    }
+
+    /// Whether `key` is down in a modifier `mask` from `pointer` (Alt is Mod1 on every
+    /// common keyboard map). No key asked for counts as held.
+    pub fn key_held(mask: u32, key: ShakeKey) -> bool {
+        match key {
+            ShakeKey::None => true,
+            ShakeKey::Ctrl => mask & ControlMask != 0,
+            ShakeKey::Alt => mask & Mod1Mask != 0,
+            ShakeKey::Shift => mask & ShiftMask != 0,
+        }
     }
 
     pub fn displays() -> Vec<Rect> {
@@ -532,35 +592,97 @@ mod tests {
         assert_eq!(rising_pulse(1.2), (Duration::from_millis(60), waveform::SHARP_COLLISION));
     }
 
-    /// Feeds x positions, one poll apart; returns at which positions a shake was noticed.
-    fn shake_on(xs: &[f64]) -> Vec<usize> {
+    /// Feeds (x position, key held) samples one poll apart; returns at which samples a
+    /// shake was noticed.
+    fn shake_on(samples: &[(f64, bool)], time_ms: u64) -> Vec<usize> {
         let mut s = Shake::default();
         let start = Instant::now();
-        xs.iter()
+        let time = Duration::from_millis(time_ms);
+        samples
+            .iter()
             .enumerate()
-            .filter(|(i, x)| s.update(**x, start + POLL * *i as u32))
+            .filter(|(i, (x, held))| s.update(*x, *held, time, start + POLL * *i as u32))
             .map(|(i, _)| i)
             .collect()
     }
 
+    /// Back and forth by 300 points, three polls each way (a turn every 75 ms), for
+    /// `ms`, with the key held or not.
+    fn shaking(ms: u32, held: bool) -> Vec<(f64, bool)> {
+        (0..ms / 25).map(|i| ([0.0, 100.0, 200.0, 300.0, 200.0, 100.0][i as usize % 6], held)).collect()
+    }
+
+    fn still(ms: u32) -> Vec<(f64, bool)> {
+        (0..ms / 25).map(|_| (0.0, true)).collect()
+    }
+
+    fn polls(ms: u32) -> usize {
+        (ms / 25) as usize
+    }
+
     #[test]
-    fn a_quick_shake_is_noticed_once() {
-        // Back and forth by 300 points, three polls each way.
-        let xs: Vec<f64> = (0..40).map(|i| [0.0, 100.0, 200.0, 300.0, 200.0, 100.0][i % 6]).collect();
-        let noticed = shake_on(&xs);
+    fn shaking_for_the_whole_time_is_noticed_once() {
+        let noticed = shake_on(&shaking(1500, true), 1000);
         assert_eq!(noticed.len(), 1, "{noticed:?}");
+        assert!(noticed[0] >= polls(1000), "noticed after {} ms", noticed[0] * 25);
+        let quick = shake_on(&shaking(1500, true), 500);
+        assert_eq!(quick.len(), 1, "{quick:?}");
+        assert!(quick[0] >= polls(500) && quick[0] < polls(1000), "{quick:?}");
+    }
+
+    #[test]
+    fn a_short_shake_is_not_enough() {
+        let short = [shaking(600, true), still(1000)].concat();
+        assert!(shake_on(&short, 1000).is_empty());
+        assert!(shake_on(&short, 2000).is_empty());
+        assert_eq!(shake_on(&short, 500).len(), 1);
+    }
+
+    #[test]
+    fn a_pause_starts_the_time_again() {
+        let broken = [shaking(600, true), still(500), shaking(600, true), still(500)].concat();
+        assert!(shake_on(&broken, 1000).is_empty());
+        let longer = [shaking(600, true), still(500), shaking(1300, true)].concat();
+        let noticed = shake_on(&longer, 1000);
+        assert_eq!(noticed.len(), 1, "{noticed:?}");
+        assert!(noticed[0] >= polls(600 + 500 + 1000), "{noticed:?}");
+    }
+
+    #[test]
+    fn only_while_the_key_is_held() {
+        assert!(shake_on(&shaking(3000, false), 1000).is_empty());
+        // The key comes down halfway: the time starts then.
+        let late = [shaking(750, false), shaking(750, true)].concat();
+        assert!(shake_on(&late, 1000).is_empty());
+        let later = [shaking(750, false), shaking(1300, true)].concat();
+        let noticed = shake_on(&later, 1000);
+        assert_eq!(noticed.len(), 1, "{noticed:?}");
+        assert!(noticed[0] >= polls(750 + 1000), "{noticed:?}");
+        // Letting go ends it.
+        let let_go = [shaking(700, true), shaking(100, false), shaking(700, true)].concat();
+        assert!(shake_on(&let_go, 1000).is_empty());
+    }
+
+    #[test]
+    fn shaking_on_waits_for_the_rest_and_the_whole_time() {
+        let noticed = shake_on(&shaking(5000, true), 1000);
+        assert_eq!(noticed.len(), 2, "{noticed:?}");
+        assert!(noticed[1] - noticed[0] >= polls(2000 + 1000), "{noticed:?}");
     }
 
     #[test]
     fn ordinary_movement_is_not_a_shake() {
-        let straight: Vec<f64> = (0..60).map(|i| i as f64 * 40.0).collect();
-        assert!(shake_on(&straight).is_empty());
+        let straight: Vec<(f64, bool)> = (0..120).map(|i| (i as f64 * 40.0, true)).collect();
+        assert!(shake_on(&straight, 500).is_empty());
         // Small wobbles never travel far enough to count.
-        let wobble: Vec<f64> = (0..60).map(|i| if i % 2 == 0 { 0.0 } else { 20.0 }).collect();
-        assert!(shake_on(&wobble).is_empty());
-        // Far enough, but so slowly the turns fall out of the window.
-        let slow: Vec<f64> = (0..400).map(|i| [0.0, 5.0, 10.0, 15.0][i % 4] + ((i / 40) % 2) as f64 * 200.0).collect();
-        assert!(shake_on(&slow).len() <= 1);
+        let wobble: Vec<(f64, bool)> = (0..120).map(|i| (if i % 2 == 0 { 0.0 } else { 20.0 }, true)).collect();
+        assert!(shake_on(&wobble, 500).is_empty());
+        // Far enough, but so slowly that each turn comes after a pause.
+        let slow: Vec<(f64, bool)> = (0..400).map(|i| ([0.0, 5.0, 10.0, 15.0][i % 4] + ((i / 40) % 2) as f64 * 200.0, true)).collect();
+        assert!(shake_on(&slow, 500).is_empty());
+        // Moving to a spot and back a couple of times, as when looking for something.
+        let back_and_forth: Vec<(f64, bool)> = (0..80).map(|i| ((i % 20) as f64 * 30.0 * if (i / 20) % 2 == 0 { 1.0 } else { -1.0 }, true)).collect();
+        assert!(shake_on(&back_and_forth, 500).is_empty());
     }
 
     #[test]

@@ -1,6 +1,7 @@
 //! flockswitch — use a spare Logitech mouse button as an Easy-Switch key that moves the
 //! mouse and its companion keyboard to another computer together.
 
+mod backup;
 mod config;
 mod device;
 mod edge;
@@ -15,6 +16,7 @@ mod settings_ui;
 mod shared;
 mod tray;
 mod update;
+mod window_size;
 
 use anyhow::{bail, Result};
 use config::Config;
@@ -74,6 +76,8 @@ USAGE:
                               set locate.hotkey ctrl+alt+l     its shortcut (none = off)
                               set locate.arrival true          when the mouse arrives from another computer
                               set locate.shake true            when the mouse is shaken
+                              set locate.shake_time 1000       for this long (ms) without a pause
+                              set locate.shake_key ctrl        only while this key is held (none, ctrl, alt, shift)
                               set check_updates true           look for a new version at start and daily
                               set auto_update true             install it and restart by itself
     flockswitch help
