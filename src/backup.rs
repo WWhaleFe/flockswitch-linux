@@ -37,21 +37,38 @@ pub fn folder() -> PathBuf {
         .join("flockswitch")
 }
 
-/// Saves `cfg` as a new file in `folder()`; returns its path.
-pub fn export(cfg: &Config) -> Result<PathBuf> {
-    let dir = folder();
-    std::fs::create_dir_all(&dir).with_context(|| format!("cannot create {}", dir.display()))?;
+/// At most this many settings files are kept in the folder; Save writes nothing more
+/// until some are renamed away or deleted under Manage.
+pub const MAX_FILES: usize = 10;
+
+/// What Save did.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Export {
+    Saved(PathBuf),
+    /// The folder already holds `MAX_FILES` settings files; nothing was written.
+    Full,
+}
+
+/// Saves `cfg` as a new file in `folder()`.
+pub fn export(cfg: &Config) -> Result<Export> {
     let (stamp, when) = now();
-    let host = host_name();
-    let path = unused_path(&dir, &file_name(&host, &stamp));
-    std::fs::write(&path, export_text(cfg, &host, &when)?).with_context(|| format!("cannot write {}", path.display()))?;
+    export_to(&folder(), cfg, &host_name(), &stamp, &when)
+}
+
+fn export_to(dir: &Path, cfg: &Config, host: &str, stamp: &str, when: &str) -> Result<Export> {
+    if list(dir).len() >= MAX_FILES {
+        return Ok(Export::Full);
+    }
+    std::fs::create_dir_all(dir).with_context(|| format!("cannot create {}", dir.display()))?;
+    let path = unused_path(dir, &file_name(host, stamp));
+    std::fs::write(&path, export_text(cfg, host, when)?).with_context(|| format!("cannot write {}", path.display()))?;
     log::info!("settings saved to {}", path.display());
-    Ok(path)
+    Ok(Export::Saved(path))
 }
 
 /// The file's content: a header saying where it came from, then the settings.
 pub fn export_text(cfg: &Config, host: &str, when: &str) -> Result<String> {
-    let settings = toml::to_string_pretty(cfg)?;
+    let settings = cfg.to_text()?;
     Ok(format!(
         "# flockswitch settings\n\
          # Saved by flockswitch {} for Linux on {host}, {when}\n\
@@ -137,6 +154,155 @@ pub struct Entry {
     pub path: PathBuf,
     pub name: String,
     pub modified: SystemTime,
+}
+
+impl Entry {
+    /// The name without .toml, as the list shows it.
+    pub fn stem(&self) -> &str {
+        let cut = self.name.len().saturating_sub(".toml".len());
+        if self.name.is_char_boundary(cut) && self.name[cut..].eq_ignore_ascii_case(".toml") { &self.name[..cut] } else { &self.name }
+    }
+}
+
+/// The longest name (without .toml) a file can be given.
+pub const MAX_NAME: usize = 60;
+/// Characters a name cannot have, so it works as a file name on Linux, Windows and macOS.
+pub const BAD_CHARS: [char; 9] = ['/', '\\', ':', '*', '?', '"', '<', '>', '|'];
+
+/// Why a file cannot be given a name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NameError {
+    Empty,
+    TooLong,
+    /// The first character it cannot have (a control character shows as '?').
+    BadChar(char),
+    /// Another file has that name already.
+    Taken,
+    /// The rename itself failed.
+    Failed(String),
+}
+
+/// The file name for a new name typed by the user: trimmed, a typed ".toml" taken off,
+/// and checked; ".toml" is added back.
+pub fn checked_name(typed: &str) -> Result<String, NameError> {
+    let mut name = typed.trim();
+    if name.len() >= 5 && name.is_char_boundary(name.len() - 5) && name[name.len() - 5..].eq_ignore_ascii_case(".toml") {
+        name = name[..name.len() - 5].trim_end();
+    }
+    if name.is_empty() {
+        return Err(NameError::Empty);
+    }
+    if name.chars().count() > MAX_NAME {
+        return Err(NameError::TooLong);
+    }
+    if let Some(c) = name.chars().find(|c| BAD_CHARS.contains(c) || c.is_control()) {
+        return Err(NameError::BadChar(if c.is_control() { '?' } else { c }));
+    }
+    // A name starting with a dot would hide the file (and "." / ".." are no names).
+    if name.starts_with('.') {
+        return Err(NameError::BadChar('.'));
+    }
+    Ok(format!("{name}.toml"))
+}
+
+/// Gives the file at `path` a new name (see `checked_name`) in the same folder, never
+/// replacing another file. Returns the new path.
+pub fn rename(path: &Path, typed: &str) -> Result<PathBuf, NameError> {
+    let name = checked_name(typed)?;
+    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    let target = dir.join(&name);
+    if target == path {
+        return Ok(target);
+    }
+    // Only the case changes where names ignore case: the target is this very file.
+    let same_file = target.exists() && same_inode(path, &target);
+    let clash = list(dir).iter().any(|e| e.path != path && e.name.eq_ignore_ascii_case(&name));
+    if !same_file && (target.exists() || clash) {
+        return Err(NameError::Taken);
+    }
+    if same_file {
+        std::fs::rename(path, &target).map_err(|e| NameError::Failed(e.to_string()))?;
+    } else {
+        // A hard link fails when the name exists, so a file made meanwhile is never replaced.
+        match std::fs::hard_link(path, &target) {
+            Ok(()) => std::fs::remove_file(path).map_err(|e| NameError::Failed(e.to_string()))?,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => return Err(NameError::Taken),
+            // A folder without hard links (FAT, some network drives): checked just above.
+            Err(_) => std::fs::rename(path, &target).map_err(|e| NameError::Failed(e.to_string()))?,
+        }
+    }
+    log::info!("settings file {} renamed to {name}", path.display());
+    Ok(target)
+}
+
+fn same_inode(a: &Path, b: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    match (std::fs::metadata(a), std::fs::metadata(b)) {
+        (Ok(x), Ok(y)) => x.dev() == y.dev() && x.ino() == y.ino(),
+        _ => false,
+    }
+}
+
+/// What Delete did with a file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Deleted {
+    /// Moved to the desktop's Trash, from where it can be put back.
+    Trashed,
+    /// There was no Trash to use: deleted for good.
+    Removed,
+}
+
+/// Moves the file to the Trash (`gio trash`), or deletes it where that does not work.
+pub fn delete(path: &Path) -> Result<Deleted> {
+    delete_with(path, |p| {
+        std::process::Command::new("gio")
+            .arg("trash")
+            .arg("--")
+            .arg(p)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success())
+    })
+}
+
+fn delete_with(path: &Path, trash: impl Fn(&Path) -> bool) -> Result<Deleted> {
+    anyhow::ensure!(path.is_file(), "{} is not there any more", path.display());
+    if trash(path) && !path.exists() {
+        log::info!("settings file {} moved to the trash", path.display());
+        return Ok(Deleted::Trashed);
+    }
+    std::fs::remove_file(path).with_context(|| format!("cannot delete {}", path.display()))?;
+    log::info!("settings file {} deleted", path.display());
+    Ok(Deleted::Removed)
+}
+
+/// The local time zone's offset from UTC in seconds, as `date +%z` says (0 without it).
+pub fn local_offset() -> i64 {
+    let out = std::process::Command::new("date").arg("+%z").output();
+    let text = out.ok().filter(|o| o.status.success()).and_then(|o| String::from_utf8(o.stdout).ok()).unwrap_or_default();
+    parse_offset(text.trim()).unwrap_or(0)
+}
+
+/// "+0900" or "-0530" in seconds.
+fn parse_offset(text: &str) -> Option<i64> {
+    let (sign, digits) = match text.as_bytes().first()? {
+        b'+' => (1, &text[1..]),
+        b'-' => (-1, &text[1..]),
+        _ => return None,
+    };
+    if digits.len() != 4 || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let (h, m): (i64, i64) = (digits[..2].parse().ok()?, digits[2..].parse().ok()?);
+    Some(sign * (h * 3600 + m * 60))
+}
+
+/// When a file was saved, as "2026-11-10 15:30" in local time (`offset` from `local_offset`).
+pub fn format_time(t: SystemTime, offset: i64) -> String {
+    let secs = t.duration_since(SystemTime::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
+    let (_, when) = utc((secs + offset).max(0) as u64);
+    when.trim_end_matches(" UTC").rsplit_once(':').map_or(when.clone(), |(minutes, _)| minutes.to_string())
 }
 
 /// The .toml files in `dir`, newest first.
@@ -246,6 +412,99 @@ mod tests {
         assert!(same(&read(&first).unwrap(), &c));
         assert!(list(&dir.join("missing")).is_empty());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn scratch(what: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("flockswitch-backup-{what}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn at_most_ten_files() {
+        let dir = scratch("limit");
+        let c = Config::default();
+        std::fs::write(dir.join("notes.txt"), "not counted").unwrap();
+        for i in 0..MAX_FILES {
+            let done = export_to(&dir, &c, "desk", &format!("20261110-1530{i:02}"), "now").unwrap();
+            assert!(matches!(done, Export::Saved(_)), "{i}: {done:?}");
+        }
+        assert_eq!(list(&dir).len(), MAX_FILES);
+        // The eleventh writes nothing.
+        assert_eq!(export_to(&dir, &c, "desk", "20261110-160000", "now").unwrap(), Export::Full);
+        assert_eq!(list(&dir).len(), MAX_FILES);
+        // Deleting one makes room again.
+        delete_with(&list(&dir)[0].path, |_| false).unwrap();
+        assert!(matches!(export_to(&dir, &c, "desk", "20261110-160000", "now").unwrap(), Export::Saved(_)));
+        assert_eq!(export_to(&dir, &c, "desk", "20261110-160001", "now").unwrap(), Export::Full);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn names_are_checked() {
+        assert_eq!(checked_name("  office pc  "), Ok("office pc.toml".to_string()));
+        assert_eq!(checked_name("home.TOML"), Ok("home.toml".to_string()));
+        assert_eq!(checked_name("집 컴퓨터"), Ok("집 컴퓨터.toml".to_string()));
+        assert_eq!(checked_name(""), Err(NameError::Empty));
+        assert_eq!(checked_name("   "), Err(NameError::Empty));
+        assert_eq!(checked_name(".toml"), Err(NameError::Empty));
+        assert_eq!(checked_name(&"가".repeat(MAX_NAME)), Ok(format!("{}.toml", "가".repeat(MAX_NAME))));
+        assert_eq!(checked_name(&"a".repeat(MAX_NAME + 1)), Err(NameError::TooLong));
+        for c in BAD_CHARS {
+            assert_eq!(checked_name(&format!("a{c}b")), Err(NameError::BadChar(c)), "{c}");
+        }
+        assert_eq!(checked_name("a\tb"), Err(NameError::BadChar('?')));
+        assert_eq!(checked_name(".hidden"), Err(NameError::BadChar('.')));
+        assert_eq!(checked_name(".."), Err(NameError::BadChar('.')));
+    }
+
+    #[test]
+    fn rename_never_replaces_a_file() {
+        let dir = scratch("rename");
+        let (a, b) = (dir.join("a.toml"), dir.join("b.toml"));
+        std::fs::write(&a, "enabled = true\n# a\n").unwrap();
+        std::fs::write(&b, "enabled = true\n# b\n").unwrap();
+        assert_eq!(rename(&a, "b"), Err(NameError::Taken));
+        assert_eq!(rename(&a, "B.toml"), Err(NameError::Taken), "names differing in case only clash on other systems");
+        assert_eq!(rename(&a, "x/y"), Err(NameError::BadChar('/')));
+        assert!(std::fs::read_to_string(&b).unwrap().contains("# b"));
+        let moved = rename(&a, " office ").unwrap();
+        assert_eq!(moved, dir.join("office.toml"));
+        assert!(!a.exists() && std::fs::read_to_string(&moved).unwrap().contains("# a"));
+        assert_eq!(rename(&moved, "office"), Ok(moved.clone()), "the same name is no change");
+        let entry = list(&dir).into_iter().find(|e| e.path == moved).unwrap();
+        assert_eq!(entry.stem(), "office");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn delete_uses_the_trash_when_it_can() {
+        let dir = scratch("delete");
+        let file = dir.join("old.toml");
+        std::fs::write(&file, "enabled = true\n").unwrap();
+        // A Trash that takes the file.
+        let trash = dir.join("trash");
+        std::fs::create_dir_all(&trash).unwrap();
+        let into_trash = |p: &Path| std::fs::rename(p, trash.join(p.file_name().unwrap())).is_ok();
+        assert_eq!(delete_with(&file, into_trash).unwrap(), Deleted::Trashed);
+        assert!(!file.exists() && trash.join("old.toml").exists());
+        // No Trash (gio missing or failing): deleted for good.
+        std::fs::write(&file, "enabled = true\n").unwrap();
+        assert_eq!(delete_with(&file, |_| false).unwrap(), Deleted::Removed);
+        assert!(!file.exists());
+        assert!(delete_with(&file, |_| false).is_err(), "already gone");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn times_are_shown_in_local_time() {
+        assert_eq!(parse_offset("+0900"), Some(9 * 3600));
+        assert_eq!(parse_offset("-0530"), Some(-(5 * 3600 + 30 * 60)));
+        assert_eq!(parse_offset("KST"), None);
+        let t = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_794_324_612);
+        assert_eq!(format_time(t, 0), "2026-11-10 15:30");
+        assert_eq!(format_time(t, 9 * 3600), "2026-11-11 00:30");
     }
 
     #[test]

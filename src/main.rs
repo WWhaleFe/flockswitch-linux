@@ -58,10 +58,13 @@ USAGE:
                               set edge.cursor true  put the cursor at that edge when the mouse comes back
                               set edge.control true wait only while Ctrl is held
                               set edge.anim ring    none, ring, semicircle, bar, pulse, laser, vortex, scan, liquid, random
-                              set edge.anim_direction both     clockwise, counterclockwise, both
-                              set edge.anim_shrink true        shrink instead of draining (ring, semicircle)
-                              set edge.anim_color #FFCC00      the colour of the countdown
-                              set edge.anim_size 125           its size in percent (50-200)
+                              set edge.ring.color #FFCC00      each effect's own colour (ring, semicircle, bar,
+                                                    pulse, laser, vortex, scan, liquid)
+                              set edge.bar.size 125            its size in percent (50-200)
+                              set edge.ring.direction both     clockwise, counterclockwise, both (ring, semicircle, bar)
+                              set edge.ring.shrink true        shrink instead of draining (ring, semicircle)
+                              set edge.anim_color #FFCC00      also anim_size, anim_direction, anim_shrink: the
+                                                    chosen effect's (every effect's for none or random)
                               set haptics.switch true          a pulse as the mouse leaves (mice with a motor)
                               set haptics.arrive true          a pulse when the mouse is back
                               set haptics.edge true            pulses while waiting at a screen edge

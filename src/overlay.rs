@@ -48,18 +48,21 @@ fn send(command: Command) {
 }
 
 /// Starts the countdown on `edge` of `display`, `elapsed` into the wait of `duration`.
+/// The effect is the chosen one with its own settings, or for Random one drawn now.
 pub fn edge_begin(edges: &Edges, edge: Edge, display: &Rect, elapsed: Duration, duration: Duration, preview: bool) {
+    let countdown = edges.countdown();
+    let e = &countdown.settings;
     send(Command::EdgeBegin {
         display: *display,
         edge: edge as i32,
-        style: edges.anim_style.resolved() as i32,
-        direction: edges.anim_direction as i32,
-        shrink: edges.anim_shrink,
+        style: countdown.style as i32,
+        direction: e.direction as i32,
+        shrink: e.shrink,
         elapsed,
         duration,
         preview,
-        color: components(&edges.anim_color),
-        size: f64::from(edges.anim_size) / 100.0,
+        color: components(&e.color),
+        size: f64::from(e.size) / 100.0,
     });
 }
 

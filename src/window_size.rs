@@ -58,6 +58,13 @@ impl SizeGuard {
         Some(want)
     }
 
+    /// The app itself resized the window (to fit its content): `size` is the size to
+    /// keep from now on, as if the user had made it so.
+    pub fn remember(&mut self, size: [f32; 2]) {
+        self.size = Some(size);
+        self.asked_at = None;
+    }
+
     /// True for a moment after the scale changed (repaint meanwhile to keep watching).
     pub fn settling(&self, now: Instant) -> bool {
         self.settle_until.is_some_and(|t| now < t)
@@ -69,7 +76,7 @@ mod tests {
     use super::*;
 
     const MIN: [f32; 2] = [760.0, 640.0];
-    const MAX: [f32; 2] = [1200.0, 1100.0];
+    const MAX: [f32; 2] = [1200.0, 1300.0];
 
     #[test]
     fn keeps_the_size_across_a_scale_change() {
@@ -104,6 +111,26 @@ mod tests {
         // Starting outside them: clamped.
         let mut g = SizeGuard::default();
         assert_eq!(g.next(1.0, [2000.0, 500.0], MIN, MAX, t), Some([1200.0, 640.0]));
+    }
+
+    #[test]
+    fn a_size_the_app_asked_for_is_kept() {
+        let mut g = SizeGuard::default();
+        let t = Instant::now();
+        assert_eq!(g.next(1.0, [840.0, 980.0], MIN, MAX, t), None);
+        // Grown to fit the page: that is the size to keep, also across a scale change.
+        g.remember([840.0, 1120.0]);
+        assert_eq!(g.next(1.0, [840.0, 1120.0], MIN, MAX, t + Duration::from_millis(50)), None);
+        assert_eq!(g.next(2.0, [1200.0, 1300.0], MIN, MAX, t + Duration::from_secs(1)), Some([840.0, 1120.0]));
+        // While the window manager has not applied it yet, it is asked for again on a scale change.
+        let mut g = SizeGuard::default();
+        assert_eq!(g.next(1.0, [840.0, 980.0], MIN, MAX, t), None);
+        g.remember([840.0, 1120.0]);
+        assert_eq!(g.next(1.5, [840.0, 980.0], MIN, MAX, t + Duration::from_millis(50)), Some([840.0, 1120.0]));
+        // A window manager that refuses it: the size it keeps counts once things settle.
+        let later = t + Duration::from_secs(3);
+        assert_eq!(g.next(1.5, [840.0, 980.0], MIN, MAX, later), None);
+        assert_eq!(g.next(1.0, [900.0, 1100.0], MIN, MAX, later + Duration::from_secs(1)), Some([840.0, 980.0]));
     }
 
     #[test]
