@@ -74,6 +74,8 @@ USAGE:
                               set locate.hotkey ctrl+alt+l     its shortcut (none = off)
                               set locate.arrival true          when the mouse arrives from another computer
                               set locate.shake true            when the mouse is shaken
+                              set check_updates true           look for a new version at start and daily
+                              set auto_update true             install it and restart by itself
     flockswitch help
 
 Set RUST_LOG=debug for more detail.";
@@ -129,7 +131,8 @@ fn main() {
 fn real_main(args: &[String]) -> Result<()> {
     let cmd = args.first().map(String::as_str).unwrap_or("tray");
     match cmd {
-        "tray" => tray::run(Arc::new(Shared::new(load_config()))),
+        // `tray --settings`: started by the settings window after it installed an update.
+        "tray" => tray::run(Arc::new(Shared::new(load_config())), args.get(1).map(String::as_str) == Some("--settings")),
         "run" => run_headless(),
         "settings" => {
             // One settings window at a time. Opening it again knocks on the open
@@ -358,6 +361,11 @@ pub fn main_instance_running() -> bool {
     std::net::TcpListener::bind(("127.0.0.1", INSTANCE_PORT)).is_err()
 }
 
+/// True while a settings window is open (it holds the port after the instance lock).
+pub fn settings_window_open() -> bool {
+    std::net::TcpListener::bind(("127.0.0.1", INSTANCE_PORT + 1)).is_err()
+}
+
 /// Holds a loopback port for the life of the process; a second copy fails to bind.
 fn single_instance() -> Option<std::net::TcpListener> {
     std::net::TcpListener::bind(("127.0.0.1", INSTANCE_PORT)).ok()
@@ -389,6 +397,12 @@ pub fn log_path() -> PathBuf {
     Config::path().with_file_name("flockswitch.log")
 }
 
+/// flockswitch.log → flockswitch.previous.log.
+fn previous_log(path: &std::path::Path) -> PathBuf {
+    let stem = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+    path.with_file_name(format!("{stem}.previous.log"))
+}
+
 /// The tray app has no terminal, so it logs to a file next to the config.
 fn init_logging(file: Option<PathBuf>) {
     let mut builder = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"));
@@ -397,7 +411,9 @@ fn init_logging(file: Option<PathBuf>) {
         if let Some(dir) = path.parent() {
             let _ = std::fs::create_dir_all(dir);
         }
-        // Start a fresh log each launch so it never grows without bound.
+        // Start a fresh log each launch so it never grows without bound. The previous
+        // run's is kept beside it (after an update, that is the one that installed it).
+        let _ = std::fs::rename(&path, previous_log(&path));
         if let Ok(file) = std::fs::File::create(&path) {
             builder.target(env_logger::Target::Pipe(Box::new(file)));
         }

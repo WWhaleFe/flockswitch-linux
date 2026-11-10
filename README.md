@@ -48,7 +48,7 @@ mkdir -p ~/.local/share/applications
 ln -sf "$(brew --prefix)/opt/flockswitch/share/applications/flockswitch.desktop" ~/.local/share/applications/
 ```
 
-`brew upgrade flockswitch` updates it.
+`brew update && brew upgrade flockswitch` updates it (a Homebrew copy does not install updates itself).
 
 Or get `flockswitch-linux-<x86_64|aarch64>-<version>.tar.gz` from [Releases](../../releases), then:
 
@@ -60,6 +60,8 @@ cd flockswitch-linux-x86_64-<version>
 
 `install.sh` puts the program in `~/.local/bin`, adds flockswitch to the app menu, installs the udev rule `/etc/udev/rules.d/70-flockswitch.rules` (sudo asks for your password once) and starts flockswitch. If a receiver was plugged in, replug it once (or reconnect Bluetooth) so the rule applies.
 
+Updates install themselves: when the daily check finds a new version (or you press **Update now**), flockswitch downloads it, checks it against the release's SHA256SUMS.txt, replaces the program in `~/.local/bin` along with its app-menu entry and icon, and restarts. Turn this off in Settings → General (`flockswitch set auto_update false`). It never asks for sudo; if a release changes the udev rule, the log says to run `install.sh` once. A program in a folder you cannot write to (for example `/usr/bin`) is only downloaded.
+
 ## Use
 
 The tray icon's menu shows the status, turns switching on or off, checks for updates, opens a report to the developer, and opens **Settings…** — a window with three tabs where every change applies at once:
@@ -68,7 +70,7 @@ The tray icon's menu shows the status, turns switching on or off, checks for upd
 - **Shortcuts** (on the same tab): on X11, keyboard shortcuts, one per channel (Ctrl+Alt+1 / 2 / 3 until you change them), pressed on any keyboard. **On Wayland** no app can register shortcuts for the whole desktop, so the tab lists commands to bind instead: in your desktop's keyboard settings, add custom shortcuts that run `~/.local/bin/flockswitch switch 1` (and `2`, `3`). The running flockswitch does the switch at once.
 - **Edges** (same tab): rest the cursor against an outer edge of the screen for a moment (0.3 to 2 s, your choice) and the group and the master mouse go to the channel set for that side. No network: each computer watches its own screen, so turn it on on every computer and give each side the channel of the computer that stands there. While it waits an effect in the colour you choose runs down near the cursor, in the size you choose (ring, semicircle, bar, pulse, laser, vortex, scan, liquid or random), and you can require Ctrl to be held. When the mouse comes back, the cursor appears at the edge it left by. The corners do not count, and with several displays an edge that continues onto another display does not switch. On Wayland no app can read the cursor position, so this needs an X11 (Xorg) session.
 - **Devices**: the master mouse, and the devices that move along (Bolt, Unifying and Bluetooth devices can be mixed; devices on another computer are listed too)
-- **General**: haptics on a mouse with a motor, currently the MX Master 4 (a summary and the **Haptics Settings…** window: on/off, strength, a pulse as the mouse leaves and one when it is back, each with its own waveform or random, rising or even pulses at an edge, and **Feel** to try them), find the cursor (a pulse ring, radar, spotlight or random effect in the colour and size you choose, from a shortcut, on arrival from another computer, or by shaking the mouse (X11 session with a compositor)), show the log, reset settings, updates (check for a new version, download it), report to the developer, language (Korean or English), start at login, uninstall
+- **General**: haptics on a mouse with a motor, currently the MX Master 4 (a summary and the **Haptics Settings…** window: on/off, strength, a pulse as the mouse leaves and one when it is back, each with its own waveform or random, rising or even pulses at an edge, and **Test** to try them), find the cursor (a pulse ring, radar, spotlight or random effect in the colour and size you choose, from a shortcut, on arrival from another computer, or by shaking the mouse (X11 session with a compositor)), show the log, reset settings, updates (check for a new version, install it automatically or with **Update now**), report to the developer, language (Korean or English), start at login, uninstall
 
 Linux has no Logi Options+, so no button has to be set aside first. If you use **Solaar**, give the buttons you turn on in flockswitch no Solaar setting or rule; both apps can stay installed otherwise. When flockswitch quits or a button is turned off, the button is put back exactly as it was.
 
@@ -84,7 +86,7 @@ Installed with Homebrew: run `flockswitch uninstall`, then `brew uninstall flock
 
 ## Privacy
 
-flockswitch talks to the Logitech devices connected to this PC. Its only internet connection is to GitHub, to see whether a newer version exists (at start and once a day; turn it off in Settings → General) and to download it when you press the button; nothing about you or your devices is sent. "Report to the developer" opens your own mail app, so you see everything before sending. (A port on `127.0.0.1` is held only to stop a second copy from running; nothing is sent or received on it.)
+flockswitch talks to the Logitech devices connected to this PC. Its only internet connection is to GitHub, to see whether a newer version exists (at start and once a day; turn it off in Settings → General) and to download it, by itself or when you press the button; nothing about you or your devices is sent. "Report to the developer" opens your own mail app, so you see everything before sending. (A port on `127.0.0.1` is held only to stop a second copy from running; nothing is sent or received on it.)
 
 ## If something does not work
 

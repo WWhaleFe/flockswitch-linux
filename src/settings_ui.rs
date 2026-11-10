@@ -46,7 +46,7 @@ pub fn run(lock: std::net::TcpListener, show_update: bool) -> Result<()> {
             // Matches flockswitch.desktop, so the dock shows the app's name and icon.
             .with_app_id("flockswitch")
             .with_icon(icon)
-            .with_inner_size([840.0, 870.0])
+            .with_inner_size([840.0, 900.0])
             .with_min_inner_size([760.0, 640.0])
             .with_max_inner_size([1200.0, 1100.0])
             .with_maximize_button(false)
@@ -362,6 +362,14 @@ enum UpdateUi {
     Failed(String),
     Downloading,
     Downloaded(std::path::PathBuf),
+    /// The download matched its checksum and the new program is being put in place.
+    Installing,
+    InstallFailed(Release, String),
+    /// Installed and the tray app is restarting into it: this window closes, and the
+    /// new version opens it again.
+    Restarting,
+    /// Installed while no tray app runs: the next start is the new version.
+    Installed,
 }
 
 impl SettingsApp {
@@ -439,6 +447,42 @@ impl SettingsApp {
         });
     }
 
+    /// "Update now": downloads, checks and installs the new version, then has the tray
+    /// app restart into it. Where this copy cannot replace itself it downloads instead.
+    fn install_update(&self, ctx: &egui::Context, release: Release) {
+        let update::InstallKind::SelfReplace(exe) = update::install_kind() else {
+            return self.download_update(ctx, release);
+        };
+        let (state, ctx) = (self.update.clone(), ctx.clone());
+        *state.lock().unwrap() = UpdateUi::Downloading;
+        log::info!("update {}: installing over {} (from the settings window)", release.version, exe.display());
+        std::thread::spawn(move || {
+            let phase = |p: update::Phase| {
+                if p == update::Phase::Installing {
+                    *state.lock().unwrap() = UpdateUi::Installing;
+                    ctx.request_repaint();
+                }
+            };
+            let next = match update::install(&release, &exe, &phase) {
+                // The new tray app takes over from the running one and reopens this window.
+                Ok(()) if crate::main_instance_running() => match update::start_new_version(&exe, &["tray", "--settings"]) {
+                    Ok(()) => UpdateUi::Restarting,
+                    Err(e) => {
+                        log::warn!("update {}: installed, but cannot start it: {e:#}", release.version);
+                        UpdateUi::Installed
+                    }
+                },
+                Ok(()) => UpdateUi::Installed,
+                Err(e) => {
+                    log::warn!("update {}: not installed: {e:#}", release.version);
+                    UpdateUi::InstallFailed(release, format!("{e:#}"))
+                }
+            };
+            *state.lock().unwrap() = next;
+            ctx.request_repaint();
+        });
+    }
+
     /// Re-reads settings, the remembered devices and what the engine sees, so the window
     /// also reflects changes made from the tray menu or by switching computers.
     fn refresh(&mut self) {
@@ -509,6 +553,12 @@ impl eframe::App for SettingsApp {
             ctx.request_repaint_after(Duration::from_millis(300));
             egui::CentralPanel::default().frame(panel).show(ui, |ui| self.uninstall_result(ui, t, p));
             return;
+        }
+        // Updated: the new version opens this window again once it has started.
+        if matches!(*self.update.lock().unwrap(), UpdateUi::Restarting) {
+            self.haptics_dialog = None;
+            self.stop_recording();
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
         if self.last_refresh.elapsed() >= REFRESH {
             self.refresh();
@@ -1434,10 +1484,11 @@ impl SettingsApp {
         }
     }
 
-    /// Current version, the new one if any, and the automatic check.
+    /// Current version, the new one if any, and the automatic check and install.
     fn update_section(&mut self, ui: &mut Ui, t: &Texts, p: Palette) {
         let state = self.update.lock().unwrap().clone();
         let ctx = ui.ctx().clone();
+        let kind = update::install_kind();
         section(ui, p, t.section_update, |ui| {
             ui.add_space(10.0);
             let (status, color) = match &state {
@@ -1448,6 +1499,10 @@ impl SettingsApp {
                 UpdateUi::Failed(_) => (t.update_failed.to_string(), p.amber),
                 UpdateUi::Downloading => (t.update_downloading.to_string(), p.muted),
                 UpdateUi::Downloaded(_) => (t.update_downloaded.to_string(), p.green),
+                UpdateUi::Installing => (t.update_installing.to_string(), p.muted),
+                UpdateUi::InstallFailed(..) => (t.update_install_failed.to_string(), p.amber),
+                UpdateUi::Restarting => (t.update_restarting.to_string(), p.green),
+                UpdateUi::Installed => (t.update_installed.to_string(), p.green),
             };
             ui.horizontal(|ui| {
                 ui.label(RichText::new(format!("{} {}", t.update_current, env!("CARGO_PKG_VERSION"))).size(14.0));
@@ -1455,16 +1510,28 @@ impl SettingsApp {
                     ui.label(RichText::new(status).size(13.0).color(color));
                 });
             });
-            if let UpdateUi::Failed(why) = &state {
+            if let UpdateUi::Failed(why) | UpdateUi::InstallFailed(_, why) = &state {
                 hint(ui, p, why);
             }
             ui.add_space(8.0);
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 8.0;
                 match &state {
-                    UpdateUi::Available(r) => {
-                        if button(ui, p, t.update_download, ButtonKind::Primary).clicked() {
-                            self.download_update(&ctx, r.clone());
+                    UpdateUi::Available(r) | UpdateUi::InstallFailed(r, _) => {
+                        // Homebrew updates its own copy; a folder that cannot be written
+                        // gets the file in Downloads.
+                        match kind {
+                            update::InstallKind::SelfReplace(_) => {
+                                if button(ui, p, t.update_now, ButtonKind::Primary).clicked() {
+                                    self.install_update(&ctx, r.clone());
+                                }
+                            }
+                            update::InstallKind::DownloadOnly => {
+                                if button(ui, p, t.update_download, ButtonKind::Primary).clicked() {
+                                    self.download_update(&ctx, r.clone());
+                                }
+                            }
+                            update::InstallKind::Homebrew => {}
                         }
                         if button(ui, p, t.update_page, ButtonKind::Plain).clicked() {
                             update::open_url(&r.page);
@@ -1475,7 +1542,7 @@ impl SettingsApp {
                             update::reveal(path);
                         }
                     }
-                    UpdateUi::Checking | UpdateUi::Downloading => {}
+                    UpdateUi::Checking | UpdateUi::Downloading | UpdateUi::Installing | UpdateUi::Restarting | UpdateUi::Installed => {}
                     _ => {
                         if button(ui, p, t.update_check, ButtonKind::Plain).clicked() {
                             self.check_update(&ctx);
@@ -1493,6 +1560,21 @@ impl SettingsApp {
                 self.apply(|c| c.check_updates = on);
             }
             hint(ui, p, t.update_auto_hint);
+            ui.add_space(6.0);
+            divider(ui, p);
+            let mut on = self.cfg.auto_update;
+            if switch_row(ui, p, t.update_install_auto, None, &mut on) {
+                self.apply(|c| c.auto_update = on);
+            }
+            hint(
+                ui,
+                p,
+                match kind {
+                    update::InstallKind::SelfReplace(_) => t.update_install_hint,
+                    update::InstallKind::Homebrew => t.update_brew,
+                    update::InstallKind::DownloadOnly => t.update_download_only,
+                },
+            );
             ui.add_space(10.0);
         });
     }

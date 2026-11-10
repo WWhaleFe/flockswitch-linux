@@ -21,6 +21,7 @@ enum Action {
     Enabled,
     Settings,
     CheckUpdate,
+    InstallUpdate,
     DownloadUpdate,
     ShowDownload,
     ReleasePage,
@@ -37,7 +38,9 @@ struct Ui {
     shortcuts: Option<crate::hotkey::Shortcuts>,
 }
 
-pub fn run(shared: Arc<Shared>) -> Result<()> {
+/// `open_settings`: started by the settings window after it installed an update, so
+/// the window comes back (in the new version) once the old one has closed.
+pub fn run(shared: Arc<Shared>, open_settings: bool) -> Result<()> {
     // Ctrl+C, logout or shutdown: let the loop below hand the button back and exit.
     let s = shared.clone();
     ctrlc::set_handler(move || s.stop.store(true, std::sync::atomic::Ordering::SeqCst))?;
@@ -60,6 +63,17 @@ pub fn run(shared: Arc<Shared>) -> Result<()> {
     if let Err(e) = ui.create_tray() {
         log::warn!("cannot create the tray icon: {e:#}");
         open_settings_window();
+    } else if open_settings {
+        std::thread::spawn(|| {
+            for _ in 0..100 {
+                if !crate::settings_window_open() {
+                    // On the General tab, where it says this version is up to date.
+                    start_settings(&["settings", "update"]);
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        });
     }
     if crate::hotkey::unsupported_session() {
         log::info!("keyboard shortcuts: not available on Wayland; use the desktop's own shortcuts");
@@ -262,26 +276,40 @@ impl Ui {
             U::Idle => None,
             U::Checking => Some((t.update_checking.to_string(), false)),
             U::UpToDate => Some((format!("✓ {}", t.update_up_to_date), false)),
-            U::Available(r) | U::Downloading(r) | U::DownloadFailed(r) => {
+            U::Available(r) | U::Downloading(r) | U::DownloadFailed(r) | U::Installing(r) => {
                 Some((format!("● {} {}", t.update_available, r.version), false))
             }
+            U::InstallFailed(r) => Some((format!("● {} {} — {}", t.update_available, r.version, t.update_install_failed), false)),
             U::Downloaded(_) => Some((format!("✓ {}", t.update_downloaded), false)),
+            U::Installed(_) => Some((format!("✓ {}", t.update_restarting), false)),
             U::Failed => Some((t.menu_check_failed.to_string(), true)),
         };
         if let Some((text, retry)) = state_line {
             let item = if retry { self.item(text, Action::CheckUpdate) } else { MenuItem::new(text, false, None) };
             let _ = menu.append(&item);
         }
-        let checking = matches!(st.update, U::Checking);
+        let checking = matches!(st.update, U::Checking | U::Downloading(_) | U::Installing(_) | U::Installed(_));
         let check = MenuItem::new(t.menu_check_update, !checking, None);
         self.actions.insert(check.id().clone(), Action::CheckUpdate);
         let _ = menu.append(&check);
         match &st.update {
-            U::Available(_) | U::DownloadFailed(_) => {
-                let _ = menu.append(&self.item(t.menu_download, Action::DownloadUpdate));
-            }
+            // Install where this copy can replace itself; Homebrew updates it itself.
+            U::Available(_) | U::DownloadFailed(_) | U::InstallFailed(_) => match crate::update::install_kind() {
+                crate::update::InstallKind::SelfReplace(_) => {
+                    let _ = menu.append(&self.item(t.update_now, Action::InstallUpdate));
+                }
+                crate::update::InstallKind::Homebrew => {
+                    let _ = menu.append(&MenuItem::new(t.update_brew, false, None));
+                }
+                crate::update::InstallKind::DownloadOnly => {
+                    let _ = menu.append(&self.item(t.menu_download, Action::DownloadUpdate));
+                }
+            },
             U::Downloading(_) => {
                 let _ = menu.append(&MenuItem::new(t.update_downloading, false, None));
+            }
+            U::Installing(_) => {
+                let _ = menu.append(&MenuItem::new(t.update_installing, false, None));
             }
             U::Downloaded(_) => {
                 let _ = menu.append(&self.item(t.menu_show_download, Action::ShowDownload));
@@ -311,6 +339,12 @@ impl Ui {
                     crate::update::check_into(&shared);
                 });
             }
+            Action::InstallUpdate => match self.shared.status().update {
+                crate::update::UpdateState::Available(r)
+                | crate::update::UpdateState::DownloadFailed(r)
+                | crate::update::UpdateState::InstallFailed(r) => crate::update::install_into(self.shared.clone(), r, false),
+                _ => {}
+            },
             Action::DownloadUpdate => match self.shared.status().update {
                 crate::update::UpdateState::Available(r) | crate::update::UpdateState::DownloadFailed(r) => {
                     crate::update::download_into(self.shared.clone(), r)
@@ -324,7 +358,7 @@ impl Ui {
             }
             Action::ReleasePage => {
                 let page = match self.shared.status().update {
-                    crate::update::UpdateState::Available(r) => r.page,
+                    crate::update::UpdateState::Available(r) | crate::update::UpdateState::InstallFailed(r) => r.page,
                     _ => crate::update::RELEASES_PAGE.to_string(),
                 };
                 crate::update::open_url(&page);
@@ -341,7 +375,9 @@ impl Ui {
 }
 
 /// Looks for a new version shortly after start and then once a day, while the
-/// setting is on. The result shows in the menu.
+/// setting is on. The result shows in the menu; with `auto_update` on, a newer version
+/// is installed and started straight away. A failed install is tried again only at the
+/// next daily check.
 fn spawn_update_check(shared: Arc<Shared>) {
     std::thread::spawn(move || {
         let mut wait = Duration::from_secs(20);
@@ -354,13 +390,15 @@ fn spawn_update_check(shared: Arc<Shared>) {
                 std::thread::sleep(Duration::from_secs(1));
             }
             wait = crate::update::CHECK_INTERVAL;
-            // Leave a download in progress or done alone.
-            let busy = matches!(
-                shared.status().update,
-                crate::update::UpdateState::Downloading(_) | crate::update::UpdateState::Downloaded(_)
-            );
+            // Leave a download or install in progress or done alone.
+            use crate::update::UpdateState as U;
+            let busy = matches!(shared.status().update, U::Downloading(_) | U::Downloaded(_) | U::Installing(_) | U::Installed(_));
             if shared.config().check_updates && !busy {
-                crate::update::check_into(&shared);
+                if let U::Available(r) = crate::update::check_into(&shared) {
+                    if shared.config().auto_update {
+                        crate::update::install_into(shared.clone(), r, true);
+                    }
+                }
             }
         }
     });
@@ -368,9 +406,13 @@ fn spawn_update_check(shared: Arc<Shared>) {
 
 /// Starts the settings window as a separate process of this same program.
 pub fn open_settings_window() {
+    start_settings(&["settings"]);
+}
+
+fn start_settings(args: &[&str]) {
     match std::env::current_exe() {
         Ok(exe) => {
-            if let Err(e) = std::process::Command::new(exe).arg("settings").spawn() {
+            if let Err(e) = std::process::Command::new(exe).args(args).spawn() {
                 log::warn!("cannot open the settings window: {e}");
             }
         }

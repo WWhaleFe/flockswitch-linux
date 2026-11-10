@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.7.0 — 2026-11-10
+
+- Updates install themselves: when the daily check finds a new version, flockswitch downloads it, checks it against the release's SHA256SUMS.txt, replaces the program (and the app-menu entry and icon `install.sh` made) and restarts into it. **Update now** on the General tab and in the tray menu does the same at once. Switch it off with **Install updates automatically** (`set auto_update false`). A Homebrew copy is left to `brew upgrade flockswitch`, and a program in a folder you cannot write to is only downloaded, as before
+- The haptics window's **Feel** button is now called **Test**
+- The settings window starts a little taller (840×900) to make room for the new switch on the General tab
+
 ## 0.6.0 — 2026-11-10
 
 - Haptics window: each situation on one line (name, pulse, Feel, switch), and 'use haptics / strength' set apart from the situations with more room between rows
