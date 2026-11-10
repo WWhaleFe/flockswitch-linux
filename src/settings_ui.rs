@@ -30,7 +30,7 @@ const SHORTCUTS_TAB: u16 = 0xFFFF;
 const EDGES_TAB: u16 = 0xFFFE;
 
 /// The settings window's size to start with and its limits, in points.
-const WINDOW_SIZE: [f32; 2] = [840.0, 960.0];
+const WINDOW_SIZE: [f32; 2] = [840.0, 980.0];
 const WINDOW_MIN: [f32; 2] = [760.0, 640.0];
 const WINDOW_MAX: [f32; 2] = [1200.0, 1100.0];
 
@@ -657,10 +657,12 @@ impl eframe::App for SettingsApp {
                         }
                         Tab::General => {
                             two_columns(ui, |left, right| {
+                                // As on the Mac: haptics under finding the cursor, the
+                                // language at the top on the right.
                                 notice(left, p, t);
                                 self.locate_section(left, t, p);
-                                self.preferences_card(left, t, p);
-                                self.haptics_summary(right, t, p);
+                                self.haptics_summary(left, t, p);
+                                self.preferences_card(right, t, p);
                                 self.update_section(right, t, p);
                                 self.report_section(right, t, p);
                                 self.backup_section(right, t, p);
@@ -1280,7 +1282,7 @@ impl SettingsApp {
                 Pos2::new(rect.right() - width, rect.center().y - 15.0),
                 Pos2::new(rect.right(), rect.center().y + 15.0),
             );
-            ui.scope_builder(UiBuilder::new().max_rect(area), |ui| {
+            ui.new_child(UiBuilder::new().max_rect(area)).scope(|ui| {
                 open = button(ui, p, t.haptics_open, ButtonKind::Plain).clicked();
             });
         });
@@ -2011,11 +2013,17 @@ fn info_box(ui: &mut Ui, p: Palette, text: &str) {
         });
 }
 
-/// A thin line between rows, edge to edge inside the card.
+/// A thin line between rows, edge to edge inside the card, with room above and below so
+/// a row's control never sits on it.
 fn divider(ui: &mut Ui, p: Palette) {
+    ui.add_space(DIVIDER_GAP);
     let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 1.0), Sense::hover());
     ui.painter().hline(rect.x_range(), rect.center().y, Stroke::new(1.0, p.border));
+    ui.add_space(DIVIDER_GAP);
 }
+
+/// The room a divider keeps above and below it.
+const DIVIDER_GAP: f32 = 4.0;
 
 fn hint(ui: &mut Ui, p: Palette, text: &str) {
     ui.add_space(2.0);
@@ -2095,7 +2103,9 @@ fn labeled_row(
         Pos2::new(rect.right() - width, rect.center().y - 15.0),
         Pos2::new(rect.right(), rect.center().y + 15.0),
     );
-    ui.scope_builder(UiBuilder::new().max_rect(area), control).inner
+    // A child, not a scope: a scope would pull the cursor back up to the control's
+    // bottom, and the next row or divider would crowd it.
+    ui.new_child(UiBuilder::new().max_rect(area)).scope(control).inner
 }
 
 /// Equal-width buttons in one row. `selected(i)` says which are on; returns the index
@@ -2260,7 +2270,7 @@ fn situation_row(ui: &mut Ui, p: Palette, t: &Texts, label: &str, on: &mut bool,
         Pos2::new(rect.right(), rect.center().y + 15.0),
     );
     let mut pressed = false;
-    ui.scope_builder(UiBuilder::new().max_rect(area), |ui| {
+    ui.new_child(UiBuilder::new().max_rect(area)).scope(|ui| {
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             ui.spacing_mut().item_spacing.x = 8.0;
             toggle(ui, p, label, on);
@@ -2282,7 +2292,7 @@ fn dialog_row(ui: &mut Ui, p: Palette, label: &str, width: f32, control: impl Fn
         Pos2::new(rect.right() - width, rect.center().y - 15.0),
         Pos2::new(rect.right(), rect.center().y + 15.0),
     );
-    ui.scope_builder(UiBuilder::new().max_rect(area), |ui| {
+    ui.new_child(UiBuilder::new().max_rect(area)).scope(|ui| {
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), control);
     });
 }
@@ -2315,7 +2325,7 @@ fn confirm_row(ui: &mut Ui, p: Palette, explain: &str, labels: &[(&str, ButtonKi
         Pos2::new(rect.right(), rect.center().y + 15.0),
     );
     let mut clicked = None;
-    ui.scope_builder(UiBuilder::new().max_rect(area), |ui| {
+    ui.new_child(UiBuilder::new().max_rect(area)).scope(|ui| {
         ui.spacing_mut().item_spacing.x = 8.0;
         ui.horizontal(|ui| {
             for (i, (label, kind)) in labels.iter().enumerate() {

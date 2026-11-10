@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.8.1 — 2026-11-10
+
+- The General tab is laid out as on the Mac: haptics under Find the cursor on the left, language and start at login at the top right
+- More room between rows and the lines between them. Rows with a segment bar or buttons on the right (size, language, shortcut) sat almost on the line below, because the control pulled the row's height in; now the space above and below is even
+- The settings window opens 980 tall to fit the extra room, so the General tab still fits without scrolling
+
 ## 0.8.0 — 2026-11-10
 
 - Shaking to find the cursor no longer goes off at the slightest wobble: the mouse has to be shaken without a pause for the time chosen under **When the mouse is shaken** (0.5, 1, 1.5 or 2 s; 1 s to start with), and it can be set to count only while Ctrl, Alt or Shift is held (`set locate.shake_time 1000`, `set locate.shake_key ctrl`). Settings from before keep working, with 1 s and no key
