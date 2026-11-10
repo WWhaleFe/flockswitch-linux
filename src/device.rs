@@ -37,6 +37,9 @@ pub mod waveform {
     pub const RINGING: u8 = 14;
     pub const WHISPER_COLLISION: u8 = 27;
 
+    /// Not a waveform: a different one each time, among those the mouse offers.
+    pub const RANDOM: u8 = 255;
+
     /// Every waveform above, in the order the settings window lists them.
     pub const ALL: [u8; 16] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 27];
 }

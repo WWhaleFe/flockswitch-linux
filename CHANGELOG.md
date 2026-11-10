@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.6.0 — 2026-11-10
+
+- Haptics window: each situation on one line (name, pulse, Feel, switch), and 'use haptics / strength' set apart from the situations with more room between rows
+- Haptics settings tidied: the pulse as the mouse leaves and the one when it is back are switched on and off on their own, each with its pulse beside it. Waiting at an edge offers **Rising / Even**; the edge waveform, which went unused by default, is folded into that choice (`set haptics.arrive true|false`)
+- **Feel**: the haptics window plays the chosen pulse on the mouse at the chosen strength, leaving the mouse's own strength as it was
+- The window says plainly that only a Logitech mouse with a haptic motor (currently the MX Master 4) vibrates
+- Random pulse: choose **Random** for the leaving or arriving pulse and each one is a different pulse the mouse offers
+- Effect size: the edge countdown and the find-the-cursor highlight each have a size, 75 to 150% (`set edge.anim_size`, `set locate.size`; 50 to 200% on the command line)
+- A more consistent settings window: buttons, drop-downs and segment bars share one height, buttons a minimum width, row labels one weight, and the other-colour button is round like the rest
+
 ## 0.5.0 — 2026-11-09
 
 - Effect colours: the screen-edge countdown and the find-the-cursor highlight each have their own colour (seven ready-made, any other from the picker). `set edge.anim_color #0A84FF`, `set locate.color #34C759`

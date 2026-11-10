@@ -16,9 +16,9 @@ use std::time::{Duration, Instant};
 const FRAME: Duration = Duration::from_micros(16_667);
 
 enum Command {
-    EdgeBegin { display: Rect, edge: i32, style: i32, direction: i32, shrink: bool, elapsed: Duration, duration: Duration, preview: bool, color: [u8; 3] },
+    EdgeBegin { display: Rect, edge: i32, style: i32, direction: i32, shrink: bool, elapsed: Duration, duration: Duration, preview: bool, color: [u8; 3], size: f64 },
     EdgeEnd,
-    Locate(i32, [u8; 3]),
+    Locate(i32, [u8; 3], f64),
 }
 
 static COMMANDS: OnceLock<Sender<Command>> = OnceLock::new();
@@ -59,6 +59,7 @@ pub fn edge_begin(edges: &Edges, edge: Edge, display: &Rect, elapsed: Duration, 
         duration,
         preview,
         color: components(&edges.anim_color),
+        size: f64::from(edges.anim_size) / 100.0,
     });
 }
 
@@ -69,7 +70,7 @@ pub fn edge_end() {
 
 /// Shows where the cursor is, for a moment.
 pub fn locate(locate: &Locate) {
-    send(Command::Locate(locate.style.resolved() as i32, components(&locate.color)));
+    send(Command::Locate(locate.style.resolved() as i32, components(&locate.color), f64::from(locate.size) / 100.0));
 }
 
 struct EdgeEffect {
@@ -82,6 +83,8 @@ struct EdgeEffect {
     started: Instant,
     duration: f64,
     color: [u8; 3],
+    /// The chosen size (1 = 100%).
+    size: f64,
 }
 
 struct LocateEffect {
@@ -90,6 +93,7 @@ struct LocateEffect {
     full_screen: bool,
     started: Instant,
     color: [u8; 3],
+    size: f64,
 }
 
 /// What is being drawn, on the connection made when the first effect was asked for.
@@ -112,17 +116,17 @@ impl Effects {
 
     fn handle(&mut self, command: Command) {
         match command {
-            Command::EdgeBegin { display, edge, style, direction, shrink, elapsed, duration, preview, color } => {
+            Command::EdgeBegin { display, edge, style, direction, shrink, elapsed, duration, preview, color, size } => {
                 self.edge = None;
                 if render::edge_has_effect(style) {
-                    self.edge = self.connection().and_then(|x| begin_edge(x, &display, edge, style, direction, shrink, elapsed, duration, preview, color));
+                    self.edge = self.connection().and_then(|x| begin_edge(x, &display, edge, style, direction, shrink, elapsed, duration, preview, color, size));
                 }
             }
             Command::EdgeEnd => self.edge = None,
-            Command::Locate(style, color) => {
+            Command::Locate(style, color, size) => {
                 self.locate = None;
                 if render::locate_exists(style) {
-                    self.locate = self.connection().and_then(|x| begin_locate(x, style, color));
+                    self.locate = self.connection().and_then(|x| begin_locate(x, style, color, size));
                 }
             }
         }
@@ -179,12 +183,12 @@ fn strip_of(display: &Rect, edge: i32, depth: i32) -> (i32, i32, i32, i32) {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn begin_edge(x: &platform::Connection, display: &Rect, edge: i32, style: i32, direction: i32, shrink: bool, elapsed: Duration, duration: Duration, preview: bool, color: [u8; 3]) -> Option<EdgeEffect> {
+fn begin_edge(x: &platform::Connection, display: &Rect, edge: i32, style: i32, direction: i32, shrink: bool, elapsed: Duration, duration: Duration, preview: bool, color: [u8; 3], size: f64) -> Option<EdgeEffect> {
     let depth = (render::STRIP_DEPTH * x.scale()).round() as i32;
     let (sx, sy, w, h) = strip_of(display, edge, depth);
     let layer = x.layer(sx, sy, w, h)?;
     let started = Instant::now().checked_sub(elapsed).unwrap_or_else(Instant::now);
-    Some(EdgeEffect { layer, edge, style, direction, shrink, preview, started, duration: duration.as_secs_f64().max(0.05), color })
+    Some(EdgeEffect { layer, edge, style, direction, shrink, preview, started, duration: duration.as_secs_f64().max(0.05), color, size })
 }
 
 /// Draws the next frame of the countdown. False when it has finished.
@@ -205,23 +209,24 @@ fn draw_edge(x: &platform::Connection, effect: &mut EdgeEffect) -> bool {
         t,
         duration: effect.duration,
         color: effect.color,
+        size: effect.size,
     };
     effect.layer.draw(x, |pixmap| render::draw_edge(pixmap, &draw));
     true
 }
 
-fn begin_locate(x: &platform::Connection, style: i32, color: [u8; 3]) -> Option<LocateEffect> {
+fn begin_locate(x: &platform::Connection, style: i32, color: [u8; 3], size: f64) -> Option<LocateEffect> {
     let (mx, my) = x.cursor()?;
     // Only the spotlight darkens the whole display; the others follow the cursor.
     let full_screen = style == render::LOCATE_SPOTLIGHT;
     let (lx, ly, w, h) = if full_screen {
         x.display_at(mx, my)
     } else {
-        let side = (render::LOCATE_SIDE * x.scale()).round() as i32;
+        let side = (render::LOCATE_SIDE * x.scale() * size).round() as i32;
         (mx - side / 2, my - side / 2, side, side)
     };
     let layer = x.layer(lx, ly, w, h)?;
-    Some(LocateEffect { layer, style, full_screen, started: Instant::now(), color })
+    Some(LocateEffect { layer, style, full_screen, started: Instant::now(), color, size })
 }
 
 /// Draws the next frame of the highlight. False when it has finished.
@@ -242,8 +247,8 @@ fn draw_locate(x: &platform::Connection, effect: &mut LocateEffect) -> bool {
         }
         (f64::from(w) / 2.0, f64::from(h) / 2.0)
     };
-    let (style, scale, color) = (effect.style, x.scale(), effect.color);
-    effect.layer.draw(x, |pixmap| render::draw_locate(pixmap, style, center, scale, t, color));
+    let (style, scale, color, size) = (effect.style, x.scale(), effect.color, effect.size);
+    effect.layer.draw(x, |pixmap| render::draw_locate(pixmap, style, center, scale, t, color, size));
     true
 }
 

@@ -8,7 +8,8 @@
 //! the table, add the enum variant and its labels.
 //!
 //! Like overlay_macos.m, the effects work in points with y pointing up; `Canvas` turns
-//! that into the buffer's pixels (y down). The shadows of CoreGraphics are emulated with
+//! that into the buffer's pixels (y down), grown or shrunk to the chosen size around the
+//! point at the edge (countdown) or the cursor (highlight). The shadows of CoreGraphics are emulated with
 //! wider, low-alpha strokes.
 
 use tiny_skia::{
@@ -16,8 +17,8 @@ use tiny_skia::{
 };
 
 /// How far into the screen the edge overlay reaches, in points.
-pub const STRIP_DEPTH: f64 = 240.0;
-/// Side of the square drawn around the cursor, in points.
+pub const STRIP_DEPTH: f64 = 360.0;
+/// Side of the square drawn around the cursor, in points at 100%.
 pub const LOCATE_SIDE: f64 = 420.0;
 pub const LOCATE_SECONDS: f64 = 1.3;
 const LOCATE_FADE: f64 = 0.35;
@@ -198,6 +199,8 @@ struct EdgeFrame {
     t: f64,
     direction: i32,
     shrink: bool,
+    /// The chosen size; the drawing is scaled by it around the anchor.
+    zoom: f64,
 }
 
 impl EdgeFrame {
@@ -337,7 +340,8 @@ fn edge_laser(c: &mut Canvas, f: &EdgeFrame) {
     const INSET: f64 = 3.0;
     let here = f.anchor.x * f.along.x + f.anchor.y * f.along.y;
     let total = f.size.x * f.along.x + f.size.y * f.along.y;
-    let ends = [-here, total - here];
+    // The beams start at the display's ends whatever the size.
+    let ends = [-here / f.zoom, (total - here) / f.zoom];
     let closing = f.p * f.p * (3.0 - 2.0 * f.p);
     let fade = 1.0 - smooth(0.95, 1.0, f.p);
     let frame = (f.t * 60.0).floor() as i32;
@@ -518,6 +522,8 @@ const EDGE_RENDERERS: [Option<EdgeRenderer>; 9] = [
 struct LocateFrame {
     size: V,
     center: V,
+    /// The chosen size (1 = 100%), around `center`.
+    zoom: f64,
     /// Seconds since the effect began.
     t: f64,
     /// 1 until the fade-out, then down to 0.
@@ -570,8 +576,11 @@ fn locate_spotlight(c: &mut Canvas, f: &LocateFrame) {
     let radius = 600.0 - 490.0 * closing;
     let dim = 0.5 * clamp01(f.t / 0.2) * f.fade;
     if dim > 0.0 {
+        // The whole display, whatever the size: the dimming must reach every edge.
+        let (o, z) = (f.center, f.zoom);
+        let (x0, y0) = (o.x - o.x / z, o.y - o.y / z);
         let mut pb = PathBuilder::new();
-        if let Some(rect) = Rect::from_xywh(0.0, 0.0, f.size.x as f32, f.size.y as f32) {
+        if let Some(rect) = Rect::from_xywh(x0 as f32, y0 as f32, (f.size.x / z) as f32, (f.size.y / z) as f32) {
             pb.push_rect(rect);
         }
         circle_path(&mut pb, f.center, radius);
@@ -606,11 +615,16 @@ pub fn locate_exists(style: i32) -> bool {
     usize::try_from(style).is_ok_and(|s| s < LOCATE_RENDERERS.len())
 }
 
-fn canvas(pixmap: &mut Pixmap, scale: f64, [r, g, b]: [u8; 3]) -> Canvas<'_> {
+/// A canvas in points (y up) whose drawing is grown by `zoom` around `around`, as the
+/// macOS overlay does with its transformation matrix.
+fn canvas(pixmap: &mut Pixmap, scale: f64, [r, g, b]: [u8; 3], around: V, zoom: f64) -> Canvas<'_> {
     let height = pixmap.height() as f32;
     let scale = scale as f32;
     let accent = [f32::from(r) / 255.0, f32::from(g) / 255.0, f32::from(b) / 255.0];
-    Canvas { pixmap, accent, to_pixels: Transform::from_row(scale, 0.0, 0.0, -scale, 0.0, height), line_width: 1.0, round_cap: false, glow: None }
+    let zoom = if zoom > 0.1 { zoom as f32 } else { 1.0 };
+    let (ax, ay) = (around.x as f32, around.y as f32);
+    let to_pixels = Transform::from_row(scale, 0.0, 0.0, -scale, 0.0, height).pre_translate(ax, ay).pre_scale(zoom, zoom).pre_translate(-ax, -ay);
+    Canvas { pixmap, accent, to_pixels, line_width: 1.0, round_cap: false, glow: None }
 }
 
 /// One frame of an edge countdown.
@@ -632,6 +646,8 @@ pub struct EdgeDraw {
     pub duration: f64,
     /// Red, green and blue of the effect.
     pub color: [u8; 3],
+    /// The chosen size (1 = 100%), around the point at the edge.
+    pub size: f64,
 }
 
 /// Draws one frame of an edge countdown on a cleared `pixmap`, the strip along the edge.
@@ -655,24 +671,22 @@ pub fn draw_edge(pixmap: &mut Pixmap, d: &EdgeDraw) {
         t: d.t,
         direction: d.direction,
         shrink: d.shrink,
+        zoom: d.size,
     };
-    let mut c = canvas(pixmap, d.scale, d.color);
+    let mut c = canvas(pixmap, d.scale, d.color, anchor, d.size);
     render(&mut c, &frame);
 }
 
 /// Draws one frame of the cursor highlight on a cleared `pixmap`. `center` is in the
 /// buffer's pixels (y down), `t` the seconds since the effect began, `color` its red,
-/// green and blue.
-pub fn draw_locate(pixmap: &mut Pixmap, style: i32, center: (f64, f64), scale: f64, t: f64, color: [u8; 3]) {
+/// green and blue, `zoom` the chosen size (1 = 100%) around the centre.
+pub fn draw_locate(pixmap: &mut Pixmap, style: i32, center: (f64, f64), scale: f64, t: f64, color: [u8; 3], zoom: f64) {
     let Some(render) = usize::try_from(style).ok().and_then(|s| LOCATE_RENDERERS.get(s).copied()) else { return };
     let size = v(f64::from(pixmap.width()) / scale, f64::from(pixmap.height()) / scale);
-    let frame = LocateFrame {
-        size,
-        center: v(center.0 / scale, size.y - center.1 / scale),
-        t,
-        fade: clamp01((LOCATE_SECONDS - t) / LOCATE_FADE),
-    };
-    let mut c = canvas(pixmap, scale, color);
+    let center = v(center.0 / scale, size.y - center.1 / scale);
+    let zoom = if zoom > 0.1 { zoom } else { 1.0 };
+    let frame = LocateFrame { size, center, zoom, t, fade: clamp01((LOCATE_SECONDS - t) / LOCATE_FADE) };
+    let mut c = canvas(pixmap, scale, color, center, zoom);
     render(&mut c, &frame);
 }
 
@@ -690,7 +704,7 @@ mod tests {
     fn drawn(edge: i32, style: i32, direction: i32, shrink: bool, progress: f64) -> Pixmap {
         let mut pixmap = Pixmap::new(1920, 240).unwrap();
         let cursor = if edge == EDGE_BOTTOM { (900.0, 230.0) } else { (900.0, 10.0) };
-        let d = EdgeDraw { edge, style, direction, shrink, cursor, scale: 1.0, t: progress * 2.0, duration: 2.0, color: YELLOW };
+        let d = EdgeDraw { edge, style, direction, shrink, cursor, scale: 1.0, t: progress * 2.0, duration: 2.0, color: YELLOW, size: 1.0 };
         draw_edge(&mut pixmap, &d);
         pixmap
     }
@@ -766,7 +780,7 @@ mod tests {
     fn the_scale_keeps_the_size_in_points() {
         let mut one = Pixmap::new(1920, 240).unwrap();
         let mut two = Pixmap::new(3840, 480).unwrap();
-        let d = EdgeDraw { edge: EDGE_TOP, style: 1, direction: DIR_BOTH, shrink: false, cursor: (900.0, 0.0), scale: 1.0, t: 0.0, duration: 2.0, color: YELLOW };
+        let d = EdgeDraw { edge: EDGE_TOP, style: 1, direction: DIR_BOTH, shrink: false, cursor: (900.0, 0.0), scale: 1.0, t: 0.0, duration: 2.0, color: YELLOW, size: 1.0 };
         draw_edge(&mut one, &d);
         draw_edge(&mut two, &EdgeDraw { cursor: (1800.0, 0.0), scale: 2.0, ..d });
         let ratio = opaque_pixels(&two) as f64 / opaque_pixels(&one) as f64;
@@ -777,10 +791,10 @@ mod tests {
     fn the_locate_effects_paint_then_fade_away() {
         for style in 0..3 {
             let mut midway = Pixmap::new(420, 420).unwrap();
-            draw_locate(&mut midway, style, (210.0, 210.0), 1.0, 0.5, YELLOW);
+            draw_locate(&mut midway, style, (210.0, 210.0), 1.0, 0.5, YELLOW, 1.0);
             assert!(opaque_pixels(&midway) > 200, "style {style}");
             let mut end = Pixmap::new(420, 420).unwrap();
-            draw_locate(&mut end, style, (210.0, 210.0), 1.0, LOCATE_SECONDS, YELLOW);
+            draw_locate(&mut end, style, (210.0, 210.0), 1.0, LOCATE_SECONDS, YELLOW, 1.0);
             assert_eq!(opaque_pixels(&end), 0, "style {style}");
         }
     }
@@ -788,7 +802,7 @@ mod tests {
     #[test]
     fn the_spotlight_dims_around_the_cursor_only() {
         let mut pixmap = Pixmap::new(1200, 800).unwrap();
-        draw_locate(&mut pixmap, LOCATE_SPOTLIGHT, (600.0, 400.0), 1.0, 0.6, YELLOW);
+        draw_locate(&mut pixmap, LOCATE_SPOTLIGHT, (600.0, 400.0), 1.0, 0.6, YELLOW, 1.0);
         let at = |x: usize, y: usize| pixmap.pixels()[y * 1200 + x].alpha();
         assert!(at(5, 5) > 100, "the far corner is darkened");
         assert_eq!(at(600, 400), 0, "the cursor is left in the light");
@@ -798,14 +812,73 @@ mod tests {
     fn the_effect_is_drawn_in_its_colour() {
         let blue = [0x0A, 0x84, 0xFF];
         let mut pixmap = Pixmap::new(1920, 240).unwrap();
-        let d = EdgeDraw { edge: EDGE_TOP, style: 1, direction: DIR_BOTH, shrink: false, cursor: (900.0, 0.0), scale: 1.0, t: 0.0, duration: 2.0, color: blue };
+        let d = EdgeDraw { edge: EDGE_TOP, style: 1, direction: DIR_BOTH, shrink: false, cursor: (900.0, 0.0), scale: 1.0, t: 0.0, duration: 2.0, color: blue, size: 1.0 };
         draw_edge(&mut pixmap, &d);
         let solid = pixmap.pixels().iter().find(|p| p.alpha() == 255).expect("an opaque pixel").demultiply();
         assert_eq!([solid.red(), solid.green(), solid.blue()], blue);
         let mut pixmap = Pixmap::new(420, 420).unwrap();
-        draw_locate(&mut pixmap, 0, (210.0, 210.0), 1.0, 0.3, blue);
+        draw_locate(&mut pixmap, 0, (210.0, 210.0), 1.0, 0.3, blue, 1.0);
         let lit = pixmap.pixels().iter().max_by_key(|p| p.alpha()).expect("a pixel").demultiply();
         assert!(lit.blue() > lit.red(), "not yellow: {lit:?}");
+    }
+
+    /// Bounds of the pixels painted at all, as (left, top, right, bottom).
+    fn painted_bounds(pixmap: &Pixmap) -> (u32, u32, u32, u32) {
+        let w = pixmap.width();
+        let (mut l, mut t, mut r, mut b) = (u32::MAX, u32::MAX, 0, 0);
+        for (i, p) in pixmap.pixels().iter().enumerate() {
+            if p.alpha() > 0 {
+                let (x, y) = (i as u32 % w, i as u32 / w);
+                (l, t, r, b) = (l.min(x), t.min(y), r.max(x), b.max(y));
+            }
+        }
+        (l, t, r, b)
+    }
+
+    #[test]
+    fn the_size_grows_the_countdown_from_the_edge() {
+        let draw = |size: f64| {
+            let mut pixmap = Pixmap::new(1920, STRIP_DEPTH as u32).unwrap();
+            let d = EdgeDraw { edge: EDGE_TOP, style: 1, direction: DIR_BOTH, shrink: false, cursor: (900.0, 0.0), scale: 1.0, t: 0.0, duration: 2.0, color: YELLOW, size };
+            draw_edge(&mut pixmap, &d);
+            painted_bounds(&pixmap)
+        };
+        let (normal, large, small) = (draw(1.0), draw(1.5), draw(0.75));
+        // Around the point at the edge: the ring reaches further in, still centred on the cursor.
+        assert!(large.3 > normal.3 && normal.3 > small.3, "{small:?} {normal:?} {large:?}");
+        let middle = |b: (u32, u32, u32, u32)| (b.0 + b.2) / 2;
+        for b in [small, normal, large] {
+            assert!(middle(b).abs_diff(900) <= 2, "{b:?}");
+        }
+        let depth = |b: (u32, u32, u32, u32)| f64::from(b.3);
+        let ratio = depth(large) / depth(normal);
+        assert!((1.4..1.6).contains(&ratio), "{ratio}");
+        assert!(depth(large) < STRIP_DEPTH, "fits the strip at 150%");
+    }
+
+    #[test]
+    fn the_size_grows_the_highlight_around_the_cursor() {
+        let draw = |zoom: f64| {
+            let side = (LOCATE_SIDE * zoom) as u32;
+            let mut pixmap = Pixmap::new(side, side).unwrap();
+            let c = f64::from(side) / 2.0;
+            draw_locate(&mut pixmap, 0, (c, c), 1.0, 0.3, YELLOW, zoom);
+            let b = painted_bounds(&pixmap);
+            (b.2 - b.0, side, b)
+        };
+        let ((normal, ..), (large, side, b)) = (draw(1.0), draw(1.5));
+        let ratio = f64::from(large) / f64::from(normal);
+        assert!((1.4..1.6).contains(&ratio), "{ratio}");
+        assert!(b.0 > 0 && b.2 < side - 1, "inside its window: {b:?}");
+    }
+
+    #[test]
+    fn a_small_spotlight_still_dims_the_whole_display() {
+        let mut pixmap = Pixmap::new(1200, 800).unwrap();
+        draw_locate(&mut pixmap, LOCATE_SPOTLIGHT, (600.0, 400.0), 1.0, 0.6, YELLOW, 0.75);
+        let at = |x: usize, y: usize| pixmap.pixels()[y * 1200 + x].alpha();
+        assert!(at(1, 1) > 100 && at(1198, 798) > 100, "the corners are darkened");
+        assert_eq!(at(600, 400), 0);
     }
 
     #[test]

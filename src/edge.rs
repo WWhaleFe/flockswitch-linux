@@ -26,7 +26,7 @@ const COOLDOWN: Duration = Duration::from_secs(2);
 /// How far in from the edge the cursor is put when the mouse arrives.
 const INSET: f64 = 24.0;
 /// While the cursor waits at an edge, the mouse pulses this often (if it has a motor).
-const HAPTIC_TICK: Duration = Duration::from_millis(150);
+pub(crate) const HAPTIC_TICK: Duration = Duration::from_millis(150);
 /// A pulse takes a moment to play; Change Host right after would cut it short.
 const FINAL_PULSE: Duration = Duration::from_millis(150);
 /// A shake is this many turns within this long, each after this many points of travel.
@@ -99,7 +99,7 @@ fn last_channel(text: &str) -> Option<u8> {
 
 /// How the pulses go at `progress` (0..1) of the wait at an edge: the gap to the next
 /// one and its waveform, quicker and sharper as the switch nears.
-fn rising_pulse(progress: f64) -> (Duration, u8) {
+pub(crate) fn rising_pulse(progress: f64) -> (Duration, u8) {
     if progress < 0.40 {
         (Duration::from_millis(180), waveform::SUBTLE_COLLISION)
     } else if progress < 0.75 {

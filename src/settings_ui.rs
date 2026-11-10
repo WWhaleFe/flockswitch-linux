@@ -4,13 +4,13 @@
 //! stays open, unlike a native menu that closes after each click.
 
 use crate::config::{
-    format_color, parse_color, pick, Config, Edge, EdgeAnimDirection, EdgeAnimStyle, Gesture, Haptics, LocateStyle,
+    format_color, parse_color, pick, Config, EFFECT_SIZES, Edge, EdgeAnimDirection, EdgeAnimStyle, Gesture, Haptics, LocateStyle,
     BUTTON_GESTURE, BUTTON_MIDDLE, BUTTON_WHEEL_MODE, EDGE_ANIM_STYLES,
 };
 use crate::device::waveform;
 use crate::hotkey::LOCATE;
 use crate::i18n::{texts, Texts};
-use crate::shared::{self, DeviceInfo, StatusFile};
+use crate::shared::{self, DeviceInfo, HapticPreview, StatusFile};
 use crate::update::{self, Release};
 use anyhow::{anyhow, Result};
 use auto_launch::AutoLaunch;
@@ -46,7 +46,7 @@ pub fn run(lock: std::net::TcpListener, show_update: bool) -> Result<()> {
             // Matches flockswitch.desktop, so the dock shows the app's name and icon.
             .with_app_id("flockswitch")
             .with_icon(icon)
-            .with_inner_size([840.0, 840.0])
+            .with_inner_size([840.0, 870.0])
             .with_min_inner_size([760.0, 640.0])
             .with_max_inner_size([1200.0, 1100.0])
             .with_maximize_button(false)
@@ -150,6 +150,8 @@ fn install_style(ctx: &egui::Context) {
     ctx.all_styles_mut(|style| {
         style.spacing.item_spacing = Vec2::new(8.0, 6.0);
         style.spacing.scroll.bar_width = 6.0;
+        style.spacing.interact_size.y = CONTROL_HEIGHT;
+        style.spacing.button_padding = Vec2::new(10.0, 4.0);
         for (text_style, size) in [
             (egui::TextStyle::Body, 14.0),
             (egui::TextStyle::Button, 14.0),
@@ -168,6 +170,19 @@ fn install_style(ctx: &egui::Context) {
         visuals.window_fill = p.bg;
         visuals.override_text_color = Some(p.text);
         visuals.selection.bg_fill = p.accent.gamma_multiply(0.35);
+        // Drop-downs and the colour picker: framed like the buttons.
+        for (w, fill) in [
+            (&mut visuals.widgets.inactive, p.card),
+            (&mut visuals.widgets.hovered, p.hover),
+            (&mut visuals.widgets.active, p.hover),
+            (&mut visuals.widgets.open, p.hover),
+        ] {
+            w.bg_fill = fill;
+            w.weak_bg_fill = fill;
+            w.bg_stroke = Stroke::new(1.0, p.track);
+            w.corner_radius = CornerRadius::same(9);
+            w.expansion = 0.0;
+        }
         ctx.set_visuals_of(theme, visuals);
     }
 }
@@ -330,7 +345,7 @@ struct HapticsDialog {
     position: Option<Pos2>,
 }
 
-const HAPTICS_DIALOG_SIZE: [f32; 2] = [470.0, 640.0];
+const HAPTICS_DIALOG_SIZE: [f32; 2] = [620.0, 440.0];
 
 fn haptics_viewport() -> egui::ViewportId {
     egui::ViewportId::from_hash_of("haptics-settings")
@@ -899,6 +914,10 @@ impl SettingsApp {
         }
         if self.cfg.edges.anim_style != EdgeAnimStyle::None {
             self.effect_color_row(ui, t, p, EffectColor::Edge, false);
+            let mut size = self.cfg.edges.anim_size;
+            if size_row(ui, p, t, "edge-size", &mut size) {
+                self.apply(|c| c.edges.anim_size = size);
+            }
         }
     }
 
@@ -928,7 +947,26 @@ impl SettingsApp {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.spacing_mut().item_spacing.x = 5.0;
                 preview = offer_preview && button(ui, p, t.preview, ButtonKind::Plain).clicked();
-                dragged = ui.color_edit_button_srgb(&mut shown).changed();
+                let own = !COLOR_PRESETS.contains(&shown);
+                let mut picked = if own { shown } else { [0x8E, 0x8E, 0x93] };
+                ui.scope(|ui| {
+                    ui.spacing_mut().interact_size = Vec2::splat(18.0);
+                    let widgets = &mut ui.visuals_mut().widgets;
+                    for w in [&mut widgets.inactive, &mut widgets.hovered, &mut widgets.active, &mut widgets.open] {
+                        w.corner_radius = CornerRadius::same(9);
+                    }
+                    let resp = ui.color_edit_button_srgb(&mut picked);
+                    if resp.changed() {
+                        shown = picked;
+                        dragged = true;
+                    }
+                    let c = resp.rect.center();
+                    if own {
+                        ui.painter().circle_stroke(c, 11.0, Stroke::new(1.8, p.text));
+                    } else {
+                        ui.painter().text(c, Align2::CENTER_CENTER, "+", FontId::proportional(15.0), Color32::WHITE);
+                    }
+                });
                 for color in COLOR_PRESETS.iter().rev() {
                     if color_swatch(ui, p, *color, *color == shown).clicked() {
                         preset = Some(*color);
@@ -1189,41 +1227,58 @@ impl SettingsApp {
         let panel = egui::Frame::new().fill(p.bg).inner_margin(Margin::symmetric(18, 14));
         let d = &mut dialog.draft;
         let error = self.error.clone();
+        let mut feel = None;
         egui::CentralPanel::default().frame(panel).show(ui, |ui| {
             egui::ScrollArea::vertical().auto_shrink([false, false]).max_height(ui.available_height() - 46.0).show(ui, |ui| {
+                // What haptics are, then each situation, in two cards with room between rows.
+                let mut on = d.on_switch || d.on_arrive || d.on_edge;
                 card(ui, p, |ui| {
-                    let mut on = d.on_switch || d.on_edge;
-                    if switch_row(ui, p, t.haptics_master, None, &mut on) {
+                    let before = on;
+                    dialog_row(ui, p, t.haptics_master, 48.0, |ui| {
+                        toggle(ui, p, t.haptics_master, &mut on);
+                    });
+                    if on != before {
                         d.on_switch = on;
+                        d.on_arrive = on;
                         d.on_edge = on;
                     }
                     divider(ui, p);
                     ui.add_enabled_ui(on, |ui| {
-                        switch_row(ui, p, t.haptics_switch, None, &mut d.on_switch);
-                        divider(ui, p);
-                        switch_row(ui, p, t.haptics_edge, None, &mut d.on_edge);
-                        divider(ui, p);
-                        switch_row(ui, p, t.haptics_progressive, None, &mut d.progressive);
-                        hint(ui, p, t.haptics_progressive_hint);
-                        ui.add_space(6.0);
-                        divider(ui, p);
                         // 0 = as Logi Options+ sets it; otherwise the strength in percent.
                         let choices: [(u8, &str); 5] = [(0, t.haptics_follow), (25, "25%"), (50, "50%"), (75, "75%"), (100, "100%")];
-                        let width = (ui.available_width() * 0.8).min(340.0);
-                        labeled_row(ui, p, t.haptics_intensity, width, ROW_SMALL, |ui| segmented(ui, p, "haptic-intensity", &mut d.intensity, &choices, SEG_SMALL));
-                        divider(ui, p);
-                        let waves: Vec<(u8, &str)> = waveform::ALL.into_iter().zip(t.waveform_names).collect();
-                        let width = (ui.available_width() * 0.5).min(220.0);
-                        labeled_row(ui, p, t.haptics_wave_switch, width, ROW_SMALL, |ui| combo(ui, "wave-switch", &mut d.switch_waveform, &waves));
-                        labeled_row(ui, p, t.haptics_wave_arrive, width, ROW_SMALL, |ui| combo(ui, "wave-arrive", &mut d.arrive_waveform, &waves));
-                        let even = !d.progressive;
-                        ui.add_enabled_ui(even, |ui| {
-                            labeled_row(ui, p, t.haptics_wave_edge, width, ROW_SMALL, |ui| combo(ui, "wave-edge", &mut d.edge_waveform, &waves));
+                        dialog_row(ui, p, t.haptics_intensity, SITUATION_CONTROLS, |ui| {
+                            segmented(ui, p, "haptic-intensity", &mut d.intensity, &choices, SEG_SMALL);
                         });
                     });
-                    hint(ui, p, t.haptics_hint);
-                    ui.add_space(10.0);
                 });
+                ui.add_space(12.0);
+                card(ui, p, |ui| {
+                    ui.add_enabled_ui(on, |ui| {
+                        let pulses: Vec<(u8, &str)> =
+                            waveform::ALL.into_iter().zip(t.waveform_names).chain([(waveform::RANDOM, t.locate_random)]).collect();
+                        if situation_row(ui, p, t, t.haptics_switch, &mut d.on_switch, |ui| {
+                            combo(ui, "pulse-leave", &mut d.switch_waveform, &pulses);
+                        }) {
+                            feel = Some(HapticPreview::Pulse(d.switch_waveform));
+                        }
+                        divider(ui, p);
+                        if situation_row(ui, p, t, t.haptics_arrive, &mut d.on_arrive, |ui| {
+                            combo(ui, "pulse-arrive", &mut d.arrive_waveform, &pulses);
+                        }) {
+                            feel = Some(HapticPreview::Pulse(d.arrive_waveform));
+                        }
+                        divider(ui, p);
+                        let modes = [(true, t.haptics_rising), (false, t.haptics_even)];
+                        if situation_row(ui, p, t, t.haptics_edge, &mut d.on_edge, |ui| {
+                            segmented(ui, p, "edge-pattern", &mut d.progressive, &modes, SEG_SMALL);
+                        }) {
+                            feel = Some(HapticPreview::Edge { rising: d.progressive });
+                        }
+                    });
+                });
+                ui.add_space(8.0);
+                // Below the cards, wrapping to the window's width.
+                egui::Frame::new().inner_margin(Margin::symmetric(4, 0)).show(ui, |ui| hint(ui, p, t.haptics_hint));
                 if let Some(err) = &error {
                     ui.add_space(8.0);
                     ui.label(RichText::new(err).color(p.red));
@@ -1237,6 +1292,9 @@ impl SettingsApp {
                 apply = button(ui, p, t.apply, ButtonKind::Plain).clicked();
             });
         });
+        if let Some(what) = feel {
+            shared::request_haptic_preview(what, dialog.draft.intensity);
+        }
         if close {
             // Back to how it was when the window opened, undoing an Apply too.
             if self.cfg.haptics != dialog.opened_with {
@@ -1287,6 +1345,10 @@ impl SettingsApp {
             if self.effect_color_row(ui, t, p, EffectColor::Locate, true) {
                 crate::overlay::locate(&self.cfg.locate);
             }
+            let mut size = self.cfg.locate.size;
+            if size_row(ui, p, t, "locate-size", &mut size) {
+                self.apply(|c| c.locate.size = size);
+            }
             divider(ui, p);
             let mut on = self.cfg.locate.on_hotkey;
             if switch_row(ui, p, t.locate_use_hotkey, None, &mut on) {
@@ -1317,7 +1379,7 @@ impl SettingsApp {
             let choices = [("ko", "한국어"), ("en", "English")];
             let width = (ui.available_width() * 0.62).min(250.0);
             let mut chosen = language.as_str();
-            if labeled_row(ui, p, t.language, width, ROW_NORMAL, |ui| segmented(ui, p, "language", &mut chosen, &choices, SEG_NORMAL)) {
+            if labeled_row(ui, p, t.language, width, ROW_SMALL, |ui| segmented(ui, p, "language", &mut chosen, &choices, SEG_SMALL)) {
                 language = chosen.to_string();
                 self.apply(|c| c.language = language);
             }
@@ -1555,10 +1617,10 @@ fn color_swatch(ui: &mut Ui, p: Palette, [r, g, b]: [u8; 3], selected: bool) -> 
     let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
     resp.widget_info(|| WidgetInfo::selected(Role::RadioButton, true, selected, format_color([r, g, b])));
     let painter = ui.painter();
-    painter.circle_filled(rect.center(), 8.0, Color32::from_rgb(r, g, b));
-    painter.circle_stroke(rect.center(), 8.0, Stroke::new(1.0, p.track));
+    painter.circle_filled(rect.center(), 9.0, Color32::from_rgb(r, g, b));
+    painter.circle_stroke(rect.center(), 9.0, Stroke::new(1.0, p.track));
     if selected {
-        painter.circle_stroke(rect.center(), 10.0, Stroke::new(1.8, p.text));
+        painter.circle_stroke(rect.center(), 11.0, Stroke::new(1.8, p.text));
     }
     resp
 }
@@ -1710,8 +1772,8 @@ fn labeled_row(
     control: impl FnOnce(&mut Ui) -> bool,
 ) -> bool {
     let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), height), Sense::hover());
-    let size = if height < ROW_NORMAL { 13.5 } else { 14.0 };
-    ui.painter().text(Pos2::new(rect.left(), rect.center().y), Align2::LEFT_CENTER, label, bold(size), p.text);
+    // The same text as a switch row's label, so the rows of a card read alike.
+    ui.painter().text(Pos2::new(rect.left(), rect.center().y), Align2::LEFT_CENTER, label, FontId::proportional(14.5), p.text);
     let area = Rect::from_min_max(
         Pos2::new(rect.right() - width, rect.center().y - 15.0),
         Pos2::new(rect.right(), rect.center().y + 15.0),
@@ -1730,7 +1792,11 @@ struct SegSize {
     text: f32,
 }
 const SEG_NORMAL: SegSize = SegSize { height: 30.0, text: 14.0 };
-const SEG_SMALL: SegSize = SegSize { height: 26.0, text: 13.0 };
+/// Every button, drop-down and segment bar inside a card is this tall.
+const CONTROL_HEIGHT: f32 = 28.0;
+/// Buttons are at least this wide, so short labels line up with long ones.
+const BUTTON_MIN_WIDTH: f32 = 84.0;
+const SEG_SMALL: SegSize = SegSize { height: CONTROL_HEIGHT, text: 13.0 };
 
 /// A chosen segment's accent, drained of most of its colour and sunk toward the track:
 /// reads as taken, but not available.
@@ -1854,6 +1920,72 @@ fn combo<T: PartialEq + Copy>(ui: &mut Ui, name: &str, value: &mut T, options: &
     changed
 }
 
+/// How large an effect is drawn. True when changed.
+fn size_row(ui: &mut Ui, p: Palette, t: &Texts, name: &str, size: &mut u16) -> bool {
+    let labels: Vec<String> = EFFECT_SIZES.iter().map(|s| format!("{s}%")).collect();
+    let choices: Vec<(u16, &str)> = EFFECT_SIZES.iter().copied().zip(labels.iter().map(String::as_str)).collect();
+    let width = (ui.available_width() * 0.72).min(300.0);
+    labeled_row(ui, p, t.effect_size, width, ROW_SMALL, |ui| segmented(ui, p, name, size, &choices, SEG_SMALL))
+}
+
+/// Width of what sits right of a situation's name in the haptics window.
+const SITUATION_CONTROLS: f32 = 360.0;
+/// The haptics window's rows are taller than a card's usual ones, for air between them.
+const DIALOG_ROW: f32 = 50.0;
+
+/// A situation of the haptics window on one line: its name, the control that shapes its
+/// pulse, a button to feel it, and its switch. True when Feel was pressed.
+fn situation_row(ui: &mut Ui, p: Palette, t: &Texts, label: &str, on: &mut bool, control: impl FnOnce(&mut Ui)) -> bool {
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), DIALOG_ROW), Sense::hover());
+    ui.painter().text(Pos2::new(rect.left(), rect.center().y), Align2::LEFT_CENTER, label, FontId::proportional(14.5), p.text);
+    let area = Rect::from_min_max(
+        Pos2::new(rect.right() - SITUATION_CONTROLS, rect.center().y - 15.0),
+        Pos2::new(rect.right(), rect.center().y + 15.0),
+    );
+    let mut pressed = false;
+    ui.scope_builder(UiBuilder::new().max_rect(area), |ui| {
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ui.spacing_mut().item_spacing.x = 8.0;
+            toggle(ui, p, label, on);
+            let enabled = *on;
+            ui.add_enabled_ui(enabled, |ui| {
+                pressed = button(ui, p, t.haptics_feel, ButtonKind::Plain).clicked();
+                control(ui);
+            });
+        });
+    });
+    pressed
+}
+
+/// A row of the haptics window: its name, and a control `width` wide on the right.
+fn dialog_row(ui: &mut Ui, p: Palette, label: &str, width: f32, control: impl FnOnce(&mut Ui)) {
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), DIALOG_ROW), Sense::hover());
+    ui.painter().text(Pos2::new(rect.left(), rect.center().y), Align2::LEFT_CENTER, label, FontId::proportional(14.5), p.text);
+    let area = Rect::from_min_max(
+        Pos2::new(rect.right() - width, rect.center().y - 15.0),
+        Pos2::new(rect.right(), rect.center().y + 15.0),
+    );
+    ui.scope_builder(UiBuilder::new().max_rect(area), |ui| {
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), control);
+    });
+}
+
+/// The on/off switch of a row, on its own. True when flipped.
+fn toggle(ui: &mut Ui, p: Palette, label: &str, on: &mut bool) -> bool {
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(40.0, 24.0), Sense::click());
+    let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
+    resp.widget_info(|| WidgetInfo::selected(Role::Switch, true, *on, label));
+    if resp.clicked() {
+        *on = !*on;
+    }
+    let how_on = ui.ctx().animate_bool_responsive(resp.id, *on);
+    let painter = ui.painter();
+    painter.rect_filled(rect, 12, p.track.lerp_to_gamma(p.accent, how_on));
+    let x = egui::lerp(rect.left() + 12.0..=rect.right() - 12.0, how_on);
+    painter.circle_filled(Pos2::new(x, rect.center().y), 9.5, Color32::WHITE);
+    resp.clicked()
+}
+
 /// An explanation on the left and buttons on the right. Returns the index clicked.
 fn confirm_row(ui: &mut Ui, p: Palette, explain: &str, labels: &[(&str, ButtonKind)]) -> Option<usize> {
     let buttons: f32 = labels.iter().map(|(l, k)| button_width(ui, l, *k)).sum::<f32>() + 8.0 * (labels.len() - 1) as f32;
@@ -1964,12 +2096,13 @@ fn button_font(kind: ButtonKind) -> FontId {
 }
 
 fn button_width(ui: &Ui, label: &str, kind: ButtonKind) -> f32 {
-    ui.painter().layout_no_wrap(label.to_string(), button_font(kind), Color32::WHITE).size().x + 28.0
+    let text = ui.painter().layout_no_wrap(label.to_string(), button_font(kind), Color32::WHITE).size().x;
+    (text + 28.0).max(BUTTON_MIN_WIDTH)
 }
 
 fn button(ui: &mut Ui, p: Palette, label: &str, kind: ButtonKind) -> Response {
     let font = button_font(kind);
-    let size = Vec2::new(button_width(ui, label, kind), 30.0);
+    let size = Vec2::new(button_width(ui, label, kind), CONTROL_HEIGHT);
     let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
     let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
     resp.widget_info(|| WidgetInfo::labeled(Role::Button, true, label));

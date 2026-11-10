@@ -408,6 +408,15 @@ impl Engine {
     /// Quiet on a mouse without a motor.
     fn buzz(&mut self, waveform: u8) -> bool {
         let (Some(d), Some(mask)) = (self.trigger.clone(), self.trigger_haptics) else { return false };
+        let waveform = if waveform == crate::device::waveform::RANDOM {
+            let offered: Vec<u8> = (0..32).filter(|&w| mask & (1u32 << w) != 0).collect();
+            if offered.is_empty() {
+                return false;
+            }
+            offered[crate::config::random_below(offered.len())]
+        } else {
+            waveform
+        };
         if waveform > 31 || mask & (1u32 << waveform) == 0 {
             log::debug!("haptics: {} has no waveform {waveform}", d.label());
             return false;
@@ -436,8 +445,47 @@ impl Engine {
             return;
         }
         self.away_by_switch = false;
-        if self.cfg.haptics.on_switch {
+        if self.cfg.haptics.on_arrive {
             self.buzz(self.cfg.haptics.arrive_waveform);
+        }
+    }
+
+    /// Plays what the haptics window asks to feel, at the strength chosen there; the
+    /// mouse's own strength is put back afterwards. Quiet without a mouse with a motor.
+    fn feel(&mut self, what: shared::HapticPreview, intensity: u8) {
+        let (Some(d), Some(_)) = (self.trigger.clone(), self.trigger_haptics) else {
+            log::info!("haptics preview: no mouse with a motor on this computer");
+            return;
+        };
+        let before = match self.endpoints.get_mut(d.endpoint) {
+            Some(ep) if intensity != 0 => d.haptic_config(ep).ok().flatten(),
+            _ => None,
+        };
+        if let (Some((flags, _)), Some(ep)) = (before, self.endpoints.get_mut(d.endpoint)) {
+            let _ = d.set_haptic_config(ep, flags | 0x01, intensity);
+        }
+        match what {
+            shared::HapticPreview::Pulse(waveform) => {
+                self.buzz(waveform);
+            }
+            // A second of waiting at an edge, as the edge watcher plays it.
+            shared::HapticPreview::Edge { rising } => {
+                let start = Instant::now();
+                while start.elapsed() < Duration::from_secs(1) {
+                    let progress = start.elapsed().as_secs_f64();
+                    let (gap, waveform) = if rising {
+                        crate::edge::rising_pulse(progress)
+                    } else {
+                        (crate::edge::HAPTIC_TICK, self.cfg.haptics.edge_waveform)
+                    };
+                    self.buzz(waveform);
+                    std::thread::sleep(gap);
+                }
+            }
+        }
+        std::thread::sleep(HAPTIC_SETTLE);
+        if let (Some((flags, old)), Some(ep)) = (before, self.endpoints.get_mut(d.endpoint)) {
+            let _ = d.set_haptic_config(ep, flags, old);
         }
     }
 
@@ -779,6 +827,9 @@ impl Engine {
             if last_config.elapsed() > CONFIG_CHECK {
                 last_config = Instant::now();
                 self.shared.reload_if_edited();
+                if let Some((what, intensity)) = shared::take_haptic_preview() {
+                    self.feel(what, intensity);
+                }
             }
             if let Err(e) = self.reload_config() {
                 log::warn!("applying settings failed: {e:#}");

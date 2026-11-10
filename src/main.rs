@@ -59,15 +59,18 @@ USAGE:
                               set edge.anim_direction both     clockwise, counterclockwise, both
                               set edge.anim_shrink true        shrink instead of draining (ring, semicircle)
                               set edge.anim_color #FFCC00      the colour of the countdown
-                              set haptics.switch true          MX Master 4: a pulse when switching
+                              set edge.anim_size 125           its size in percent (50-200)
+                              set haptics.switch true          a pulse as the mouse leaves (mice with a motor)
+                              set haptics.arrive true          a pulse when the mouse is back
                               set haptics.edge true            pulses while waiting at a screen edge
                               set haptics.progressive true     those pulses get faster and stronger
                               set haptics.intensity 75         strength 1-100% (0 = as Logi Options+ sets it)
-                              set haptics.edge_waveform 4      waveform IDs 0-14, 27 (also switch_waveform,
-                                                    arrive_waveform)
+                              set haptics.switch_waveform 7    pulse 0-14, 27 or random (also arrive_waveform;
+                                                    edge_waveform is the even pattern at an edge)
                               set locate true       show where the cursor is
                               set locate.style ring            ring, radar, spotlight, random
                               set locate.color #FFCC00         the colour of the highlight
+                              set locate.size 125              its size in percent (50-200)
                               set locate.hotkey ctrl+alt+l     its shortcut (none = off)
                               set locate.arrival true          when the mouse arrives from another computer
                               set locate.shake true            when the mouse is shaken

@@ -206,6 +206,14 @@ pub fn parse_color(text: &str) -> Option<[u8; 3]> {
     Some([byte(0)?, byte(2)?, byte(4)?])
 }
 
+/// The sizes the settings window offers, in percent; the command line takes 50-200.
+pub const EFFECT_SIZES: [u16; 4] = [75, 100, 125, 150];
+
+/// "125" or "125%".
+fn percent(text: &str) -> Option<u16> {
+    text.trim().trim_end_matches('%').parse().ok()
+}
+
 /// A colour as the settings write it.
 pub fn format_color([r, g, b]: [u8; 3]) -> String {
     format!("#{r:02X}{g:02X}{b:02X}")
@@ -244,7 +252,7 @@ pub const EDGE_ANIM_STYLES: [EdgeAnimStyle; 10] = [
 ];
 
 /// A number below `n`, different from run to run. Good enough to choose an effect.
-fn random_below(n: usize) -> usize {
+pub(crate) fn random_below(n: usize) -> usize {
     use std::hash::{BuildHasher, Hasher};
     std::collections::hash_map::RandomState::new().build_hasher().finish() as usize % n
 }
@@ -338,6 +346,8 @@ pub struct Locate {
     pub style: LocateStyle,
     /// "#RRGGBB".
     pub color: String,
+    /// Size of the highlight in percent.
+    pub size: u16,
 }
 
 impl Default for Locate {
@@ -350,6 +360,7 @@ impl Default for Locate {
             on_shake: false,
             style: LocateStyle::default(),
             color: DEFAULT_EFFECT_COLOR.into(),
+            size: 100,
         }
     }
 }
@@ -380,6 +391,8 @@ pub struct Edges {
     pub anim_shrink: bool,
     /// "#RRGGBB".
     pub anim_color: String,
+    /// Size of the countdown in percent.
+    pub anim_size: u16,
 }
 
 impl Default for Edges {
@@ -398,6 +411,7 @@ impl Default for Edges {
             anim_direction: EdgeAnimDirection::default(),
             anim_shrink: false,
             anim_color: DEFAULT_EFFECT_COLOR.into(),
+            anim_size: 100,
         }
     }
 }
@@ -438,8 +452,11 @@ impl Edges {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Haptics {
-    /// A pulse as the mouse leaves, and one when it is back.
+    /// A pulse as the mouse is switched away.
     pub on_switch: bool,
+    /// A pulse when the mouse is back. Settings from before 0.9.0 had this under
+    /// `on_switch`; `Config::parse` carries it over.
+    pub on_arrive: bool,
     /// Pulses while the cursor rests at a screen edge, waiting to switch.
     pub on_edge: bool,
     pub switch_waveform: u8,
@@ -457,6 +474,7 @@ impl Default for Haptics {
     fn default() -> Self {
         Haptics {
             on_switch: true,
+            on_arrive: true,
             on_edge: true,
             switch_waveform: crate::device::waveform::COMPLETED,
             arrive_waveform: crate::device::waveform::DAMP_COLLISION,
@@ -635,6 +653,13 @@ impl Config {
                 }
             }
         }
+        // Before 0.9.0 one switch covered the pulse on leaving and the one on arriving.
+        if let Some(toml::Value::Table(h)) = table.get_mut("haptics") {
+            if !h.contains_key("on_arrive") {
+                let leaving = h.get("on_switch").and_then(|v| v.as_bool()).unwrap_or(true);
+                h.insert("on_arrive".into(), toml::Value::Boolean(leaving));
+            }
+        }
         let mut cfg: Config = toml::Value::Table(table.clone()).try_into()?;
         if !table.contains_key("buttons") {
             let old: Legacy = toml::Value::Table(table).try_into()?;
@@ -733,13 +758,20 @@ impl Config {
         }
         if let Some(what) = key.strip_prefix("haptics.").or((key == "haptics").then_some("on")) {
             let flag = || value.parse::<bool>().with_context(|| format!("{key} must be true or false"));
-            let wave = || value.trim().parse::<u8>().with_context(|| format!("{key} must be a waveform number (0-31)"));
+            let wave = || {
+                if value.trim().eq_ignore_ascii_case("random") {
+                    return Ok(crate::device::waveform::RANDOM);
+                }
+                value.trim().parse::<u8>().with_context(|| format!("{key} must be a waveform number (0-31) or random"))
+            };
             match what {
                 "on" => {
                     self.haptics.on_switch = flag()?;
+                    self.haptics.on_arrive = self.haptics.on_switch;
                     self.haptics.on_edge = self.haptics.on_switch;
                 }
                 "switch" => self.haptics.on_switch = flag()?,
+                "arrive" => self.haptics.on_arrive = flag()?,
                 "edge" => self.haptics.on_edge = flag()?,
                 "switch_waveform" => self.haptics.switch_waveform = wave()?,
                 "arrive_waveform" => self.haptics.arrive_waveform = wave()?,
@@ -753,7 +785,7 @@ impl Config {
                         v.parse::<u8>().context("haptics.intensity must be 0 (as Options+ sets it) or 1-100 percent")?
                     };
                 }
-                _ => anyhow::bail!("unknown setting '{key}' (haptics.switch, haptics.edge, haptics.progressive, haptics.intensity, haptics.switch_waveform, haptics.arrive_waveform, haptics.edge_waveform)"),
+                _ => anyhow::bail!("unknown setting '{key}' (haptics.switch, haptics.arrive, haptics.edge, haptics.progressive, haptics.intensity, haptics.switch_waveform, haptics.arrive_waveform, haptics.edge_waveform)"),
             }
             return Ok(());
         }
@@ -765,6 +797,7 @@ impl Config {
                 "shake" => self.locate.on_shake = flag()?,
                 "shortcut" => self.locate.on_hotkey = flag()?,
                 "color" => self.locate.color = value.trim().to_uppercase(),
+                "size" => self.locate.size = percent(value).context("locate.size must be a percentage, e.g. 125")?,
                 "hotkey" => {
                     let value = if value.eq_ignore_ascii_case("none") { "" } else { value };
                     self.locate.hotkey = value.trim().to_lowercase();
@@ -778,7 +811,7 @@ impl Config {
                         _ => anyhow::bail!("locate.style must be ring, radar, spotlight or random"),
                     };
                 }
-                _ => anyhow::bail!("unknown setting '{key}' (locate, locate.style, locate.color, locate.hotkey, locate.shortcut, locate.arrival, locate.shake)"),
+                _ => anyhow::bail!("unknown setting '{key}' (locate, locate.style, locate.color, locate.size, locate.hotkey, locate.shortcut, locate.arrival, locate.shake)"),
             }
             return Ok(());
         }
@@ -806,6 +839,7 @@ impl Config {
                 }
                 "anim_shrink" => self.edges.anim_shrink = value.parse().context("edge.anim_shrink must be true or false")?,
                 "anim_color" => self.edges.anim_color = value.trim().to_uppercase(),
+                "anim_size" => self.edges.anim_size = percent(value).context("edge.anim_size must be a percentage, e.g. 125")?,
                 side => {
                     let edge = Edge::from_name(side).with_context(|| format!("unknown edge '{side}' (left, right, top, bottom)"))?;
                     let channel = if value.eq_ignore_ascii_case("none") || value.eq_ignore_ascii_case("off") {
@@ -890,8 +924,11 @@ impl Config {
         anyhow::ensure!(self.edges.corner_margin <= 1000, "edge.corner must be at most 1000 pixels");
         anyhow::ensure!(parse_color(&self.edges.anim_color).is_some(), "edge.anim_color must be a colour like #FFCC00");
         anyhow::ensure!(parse_color(&self.locate.color).is_some(), "locate.color must be a colour like #FFCC00");
+        for (key, size) in [("edge.anim_size", self.edges.anim_size), ("locate.size", self.locate.size)] {
+            anyhow::ensure!(EFFECT_SIZES.contains(&size) || (50..=200).contains(&size), "{key} must be between 50 and 200 percent");
+        }
         for w in [self.haptics.switch_waveform, self.haptics.arrive_waveform, self.haptics.edge_waveform] {
-            anyhow::ensure!(w <= 31, "haptics: waveforms are numbered 0 to 31");
+            anyhow::ensure!(w <= 31 || w == crate::device::waveform::RANDOM, "haptics: waveforms are numbered 0 to 31, or random");
         }
         anyhow::ensure!(self.haptics.intensity <= 100, "haptics.intensity must be 0 (as Options+ sets it) or 1-100 percent");
         anyhow::ensure!(self.hotkeys.keys.len() <= 3, "hotkeys: one shortcut per channel (1-3)");
@@ -1188,8 +1225,16 @@ mod tests {
         assert!(c.haptics.progressive);
         c.set("haptics.progressive", "false").unwrap();
         assert!(!c.haptics.progressive);
+        c.set("haptics.arrive_waveform", "random").unwrap();
+        assert_eq!(c.haptics.arrive_waveform, crate::device::waveform::RANDOM);
+        c.set("haptics.arrive", "false").unwrap();
+        assert!(c.haptics.on_switch && !c.haptics.on_arrive);
         c.set("haptics", "false").unwrap();
-        assert!(!c.haptics.on_switch && !c.haptics.on_edge);
+        assert!(!c.haptics.on_switch && !c.haptics.on_arrive && !c.haptics.on_edge);
+        // Older settings: the arrival pulse followed the switch pulse.
+        let old = Config::parse("[haptics]\non_switch = false\non_edge = true\n").unwrap();
+        assert!(!old.haptics.on_arrive && old.haptics.on_edge);
+        assert!(Config::parse("[haptics]\non_edge = true\n").unwrap().haptics.on_arrive);
         let back = Config::parse(&toml::to_string_pretty(&c).unwrap()).unwrap();
         assert_eq!(back.haptics, c.haptics);
         assert_eq!(Config::parse("enabled = true").unwrap().haptics, Haptics::default());
@@ -1249,6 +1294,10 @@ mod tests {
         c.set("locate.style", "random").unwrap();
         assert!((0..100).all(|_| c.locate.style.resolved() != LocateStyle::Random));
         c.set("locate.style", "spotlight").unwrap();
+        c.set("locate.size", "150%").unwrap();
+        c.set("edge.anim_size", "75").unwrap();
+        assert_eq!((c.locate.size, c.edges.anim_size), (150, 75));
+        assert!(c.set("locate.size", "300").is_err());
         c.set("locate.color", "#34c759").unwrap();
         assert_eq!(c.locate.color, "#34C759");
         assert!(c.set("locate.color", "green").is_err());

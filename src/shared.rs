@@ -115,6 +115,50 @@ pub fn take_switch_file() -> Option<u8> {
     text.trim().parse().ok().filter(|n| (1..=3).contains(n))
 }
 
+/// What the haptics window asks to feel on the mouse.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HapticPreview {
+    /// One pulse of this waveform.
+    Pulse(u8),
+    /// A second of waiting at an edge: rising pulses, or even ones.
+    Edge { rising: bool },
+}
+
+/// The settings window (a separate process) leaves the haptics preview here for the
+/// running app, which has the mouse: "pulse 7 75" or "edge rising 0", the last number
+/// the strength (0 = as the mouse is set).
+fn haptic_preview_path() -> std::path::PathBuf {
+    Config::path().with_file_name("haptics.preview")
+}
+
+pub fn request_haptic_preview(what: HapticPreview, intensity: u8) {
+    let text = match what {
+        HapticPreview::Pulse(w) => format!("pulse {w} {intensity}"),
+        HapticPreview::Edge { rising } => format!("edge {} {intensity}", if rising { "rising" } else { "even" }),
+    };
+    let _ = std::fs::write(haptic_preview_path(), text);
+}
+
+/// The preview asked for, if any; asked once.
+pub fn take_haptic_preview() -> Option<(HapticPreview, u8)> {
+    let path = haptic_preview_path();
+    let text = std::fs::read_to_string(&path).ok()?;
+    let _ = std::fs::remove_file(&path);
+    parse_haptic_preview(&text)
+}
+
+fn parse_haptic_preview(text: &str) -> Option<(HapticPreview, u8)> {
+    let parts: Vec<&str> = text.split_whitespace().collect();
+    let intensity = parts.get(2)?.parse::<u8>().ok().filter(|&i| i <= 100)?;
+    let what = match (parts.first()?, parts.get(1)?) {
+        (&"pulse", w) => HapticPreview::Pulse(w.parse().ok().filter(|&w: &u8| w <= 31 || w == crate::device::waveform::RANDOM)?),
+        (&"edge", &"rising") => HapticPreview::Edge { rising: true },
+        (&"edge", &"even") => HapticPreview::Edge { rising: false },
+        _ => return None,
+    };
+    Some((what, intensity))
+}
+
 fn config_mtime() -> Option<std::time::SystemTime> {
     std::fs::metadata(Config::path()).and_then(|m| m.modified()).ok()
 }
@@ -354,5 +398,21 @@ impl Shared {
 
     pub fn stopped(&self) -> bool {
         self.stop.load(Ordering::SeqCst)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn haptic_preview_requests() {
+        assert_eq!(parse_haptic_preview("pulse 7 75"), Some((HapticPreview::Pulse(7), 75)));
+        assert_eq!(parse_haptic_preview("pulse 255 0"), Some((HapticPreview::Pulse(crate::device::waveform::RANDOM), 0)));
+        assert_eq!(parse_haptic_preview("edge rising 0"), Some((HapticPreview::Edge { rising: true }, 0)));
+        assert_eq!(parse_haptic_preview("edge even 50\n"), Some((HapticPreview::Edge { rising: false }, 50)));
+        for bad in ["", "pulse 7", "pulse 40 50", "pulse 7 120", "edge up 0", "buzz 1 1"] {
+            assert_eq!(parse_haptic_preview(bad), None, "{bad}");
+        }
     }
 }
