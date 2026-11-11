@@ -35,7 +35,7 @@ flockswitch는 **MX Master 3**와 **MX Master 4**를 바탕으로 만들고 시�
 [Homebrew](https://brew.sh)를 쓰면:
 
 ```sh
-brew install wwhalefe/tap/flockswitch
+brew install --formula wwhalefe/tap/flockswitch
 
 # 최초 1회: udev 규칙 설치(sudo) 및 앱 메뉴 추가
 sudo install -m 644 "$(brew --prefix)/opt/flockswitch/share/flockswitch/70-flockswitch.rules" /etc/udev/rules.d/
@@ -45,7 +45,9 @@ mkdir -p ~/.local/share/applications
 ln -sf "$(brew --prefix)/opt/flockswitch/share/applications/flockswitch.desktop" ~/.local/share/applications/
 ```
 
-업데이트는 `brew update && brew upgrade flockswitch`입니다 (Homebrew로 설치한 flockswitch는 스스로 업데이트를 설치하지 않습니다).
+업데이트는 `brew update && brew upgrade --formula wwhalefe/tap/flockswitch`입니다 (Homebrew로 설치한 flockswitch는 스스로 업데이트를 설치하지 않습니다). 이 탭에는 같은 이름의 macOS용 cask가 함께 있어서, `--formula`와 `wwhalefe/tap/`을 빼면 Homebrew가 cask까지 읽으려다 멈춥니다.
+
+Homebrew 6 이상에서 `Refusing to load … from untrusted tap wwhalefe/tap` 오류가 나면(그 전 버전에서 설치한 경우), 한 번만 실행하세요: `brew trust --formula wwhalefe/tap/flockswitch`
 
 또는 [Releases](../../releases)에서 `flockswitch-linux-<x86_64|aarch64>-<버전>.tar.gz`를 받은 뒤:
 
@@ -109,7 +111,7 @@ Wayland에서는 마우스가 돌아와도 커서를 보냈던 쪽 가장자리�
 
 받은 폴더에서 `./uninstall.sh`를 실행합니다. 버튼을 원래대로 돌려놓고, 자동 실행과 설정을 지운 뒤, 프로그램과 앱 메뉴 항목, udev 규칙을 지웁니다.
 
-Homebrew로 설치했다면 `flockswitch uninstall`을 실행한 다음 `brew uninstall flockswitch`를 실행하고, udev 규칙과 메뉴 항목은 `brew info flockswitch`에 나오는 대로 지웁니다.
+Homebrew로 설치했다면 `flockswitch uninstall`을 실행한 다음 `brew uninstall --formula wwhalefe/tap/flockswitch`를 실행하고, udev 규칙과 메뉴 항목은 `brew info --formula wwhalefe/tap/flockswitch`에 나오는 대로 지웁니다.
 
 ## 개인정보
 
@@ -123,7 +125,7 @@ flockswitch는 이 PC에 연결된 Logitech 장치와 통신합니다. 인터넷
 - 배포판, 데스크톱(GNOME, KDE 등)과 세션(X11 / Wayland), 연결 방식(Bolt / Unifying / 블루투스)
 - `~/.config/flockswitch/flockswitch.log`
 
-설정 창에 "장치에 접근할 권한이 없습니다"가 보이면 udev 규칙이 없는 것입니다. `./install.sh`를 다시 실행하고(Homebrew로 설치했다면 `brew info flockswitch`에 나오는 udev 명령) 수신기를 뺐다 꽂아 주세요.
+설정 창에 "장치에 접근할 권한이 없습니다"가 보이면 udev 규칙이 없는 것입니다. `./install.sh`를 다시 실행하고(Homebrew로 설치했다면 `brew info --formula wwhalefe/tap/flockswitch`에 나오는 udev 명령) 수신기를 뺐다 꽂아 주세요.
 
 ## 시험 현황
 

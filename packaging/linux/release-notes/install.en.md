@@ -68,7 +68,7 @@ sudo dnf install -y libxkbcommon mesa-libGL mesa-libEGL       # Fedora
 
 ```sh
 # Install
-brew install wwhalefe/tap/flockswitch
+brew install --formula wwhalefe/tap/flockswitch
 
 # First-time setup (udev rule and app menu entry)
 sudo install -m 644 "$(brew --prefix)/opt/flockswitch/share/flockswitch/70-flockswitch.rules" /etc/udev/rules.d/
@@ -77,9 +77,12 @@ sudo udevadm trigger --subsystem-match=hidraw
 mkdir -p ~/.local/share/applications
 ln -sf "$(brew --prefix)/opt/flockswitch/share/applications/flockswitch.desktop" ~/.local/share/applications/
 
+# Homebrew 6+: if you get an 'untrusted tap' error (installed with an older Homebrew), once
+brew trust --formula wwhalefe/tap/flockswitch
+
 # Upgrade / Uninstall
-brew update && brew upgrade flockswitch
-flockswitch uninstall && brew uninstall flockswitch
+brew update && brew upgrade --formula wwhalefe/tap/flockswitch
+flockswitch uninstall && brew uninstall --formula wwhalefe/tap/flockswitch
 ```
 
 After installing: replug the receiver once (or reconnect Bluetooth) and start flockswitch from the app menu. When `flockswitch list` shows your mouse and keyboard, you're set.

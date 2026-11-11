@@ -1,5 +1,10 @@
 # 변경 기록
 
+## 0.10.2 — 2026-11-11
+
+- Homebrew 업그레이드 안내를 고쳤습니다. 이 탭에는 같은 이름의 macOS용 cask가 함께 있어서, Homebrew 6 이상에서 `brew upgrade flockswitch`가 cask까지 읽으려다 `Refusing to load cask … from untrusted tap` 오류로 멈췄습니다. 설정 창·트레이 메뉴·로그의 안내와 README, 릴리스 노트, `brew info`를 모두 `brew upgrade --formula wwhalefe/tap/flockswitch`로 바꾸고, 예전에 설치했다면 한 번만 `brew trust --formula wwhalefe/tap/flockswitch`를 실행하라고 적었습니다
+- 설치 명령도 `brew install --formula wwhalefe/tap/flockswitch`로 바꿨습니다
+
 ## 0.10.1 — 2026-11-11
 
 - GNOME의 Wayland 세션에서 설정 창 제목줄의 한글이 네모로 보이던 문제를 고쳤습니다. 그곳의 제목줄은 한글이 없는 글꼴 하나로 그려져서, 제목을 "flockswitch"로 둡니다

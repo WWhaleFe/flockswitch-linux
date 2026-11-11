@@ -137,14 +137,14 @@ pub fn install_into(shared: std::sync::Arc<crate::shared::Shared>, release: Rele
 pub enum InstallKind {
     /// Replace this program file (the path, resolved) in place.
     SelfReplace(PathBuf),
-    /// Installed by Homebrew, which owns the file: `brew upgrade flockswitch`.
+    /// Installed by Homebrew, which owns the file: `brew upgrade --formula wwhalefe/tap/flockswitch`.
     Homebrew,
     /// The folder cannot be written (or the program's path is unknown): download only.
     DownloadOnly,
 }
 
 /// What a Homebrew install is updated with.
-pub const BREW_UPGRADE: &str = "brew update && brew upgrade flockswitch";
+pub const BREW_UPGRADE: &str = "brew update && brew upgrade --formula wwhalefe/tap/flockswitch";
 
 /// How the running copy can be updated. Worked out once, before anything is replaced
 /// (afterwards Linux reports the running program as "<path> (deleted)").

@@ -40,7 +40,7 @@ Install flockswitch on **every** computer you switch between, and pair each devi
 With [Homebrew](https://brew.sh):
 
 ```sh
-brew install wwhalefe/tap/flockswitch
+brew install --formula wwhalefe/tap/flockswitch
 
 # First-time setup: udev rule (once, with sudo) and app menu entry
 sudo install -m 644 "$(brew --prefix)/opt/flockswitch/share/flockswitch/70-flockswitch.rules" /etc/udev/rules.d/
@@ -50,7 +50,9 @@ mkdir -p ~/.local/share/applications
 ln -sf "$(brew --prefix)/opt/flockswitch/share/applications/flockswitch.desktop" ~/.local/share/applications/
 ```
 
-`brew update && brew upgrade flockswitch` updates it (a Homebrew copy does not install updates itself).
+`brew update && brew upgrade --formula wwhalefe/tap/flockswitch` updates it (a Homebrew copy does not install updates itself). The tap also has a macOS cask of the same name, so without `--formula` and `wwhalefe/tap/` Homebrew tries to load the cask too and stops.
+
+On Homebrew 6 or newer, if you see `Refusing to load … from untrusted tap wwhalefe/tap` (installed with an older Homebrew), run once: `brew trust --formula wwhalefe/tap/flockswitch`
 
 Or get `flockswitch-linux-<x86_64|aarch64>-<version>.tar.gz` from [Releases](../../releases), then:
 
@@ -99,7 +101,7 @@ On Wayland the cursor is not put back at the edge it left by (no app may move it
 
 Run `./uninstall.sh` from the downloaded folder. It puts the buttons back to normal, removes start-at-login and the settings, then the program, the app menu entry and the udev rule.
 
-Installed with Homebrew: run `flockswitch uninstall`, then `brew uninstall flockswitch`, and remove the udev rule and menu entry as `brew info flockswitch` shows.
+Installed with Homebrew: run `flockswitch uninstall`, then `brew uninstall --formula wwhalefe/tap/flockswitch`, and remove the udev rule and menu entry as `brew info --formula wwhalefe/tap/flockswitch` shows.
 
 ## Privacy
 
@@ -113,7 +115,7 @@ Open a [problem report](../../issues/new/choose) with:
 - your distribution, desktop (GNOME, KDE, …) and session (X11 or Wayland), and how the devices connect (Bolt / Unifying / Bluetooth)
 - `~/.config/flockswitch/flockswitch.log`
 
-"No permission to use the devices" in the settings window means the udev rule is missing: run `./install.sh` again (installed with Homebrew: the udev commands `brew info flockswitch` shows), then replug the receiver.
+"No permission to use the devices" in the settings window means the udev rule is missing: run `./install.sh` again (installed with Homebrew: the udev commands `brew info --formula wwhalefe/tap/flockswitch` shows), then replug the receiver.
 
 ## Status
 

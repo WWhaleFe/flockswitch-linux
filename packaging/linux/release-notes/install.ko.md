@@ -68,7 +68,7 @@ sudo dnf install -y libxkbcommon mesa-libGL mesa-libEGL       # Fedora
 
 ```sh
 # 설치
-brew install wwhalefe/tap/flockswitch
+brew install --formula wwhalefe/tap/flockswitch
 
 # 초기 설정 (최초 1회 — udev 규칙 및 앱 메뉴 등록)
 sudo install -m 644 "$(brew --prefix)/opt/flockswitch/share/flockswitch/70-flockswitch.rules" /etc/udev/rules.d/
@@ -77,9 +77,12 @@ sudo udevadm trigger --subsystem-match=hidraw
 mkdir -p ~/.local/share/applications
 ln -sf "$(brew --prefix)/opt/flockswitch/share/applications/flockswitch.desktop" ~/.local/share/applications/
 
+# Homebrew 6 이상에서 'untrusted tap' 오류가 나면 한 번만 (예전에 설치한 경우)
+brew trust --formula wwhalefe/tap/flockswitch
+
 # 업데이트 / 제거
-brew update && brew upgrade flockswitch
-flockswitch uninstall && brew uninstall flockswitch
+brew update && brew upgrade --formula wwhalefe/tap/flockswitch
+flockswitch uninstall && brew uninstall --formula wwhalefe/tap/flockswitch
 ```
 
 설치 후: 수신기를 한 번 뺐다 꽂고(블루투스는 다시 연결) 앱 메뉴에서 flockswitch를 실행하세요. `flockswitch list`에 마우스·키보드가 보이면 준비가 끝난 것입니다.

@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.10.2 — 2026-11-11
+
+- Fixed the Homebrew upgrade instructions. The tap also has a macOS cask of the same name, so on Homebrew 6 or newer `brew upgrade flockswitch` tried to load the cask too and stopped with `Refusing to load cask … from untrusted tap`. The settings window, tray menu, log, README, release notes and `brew info` now say `brew upgrade --formula wwhalefe/tap/flockswitch`, and tell anyone who installed earlier to run `brew trust --formula wwhalefe/tap/flockswitch` once
+- The install command is now `brew install --formula wwhalefe/tap/flockswitch`
+
 ## 0.10.1 — 2026-11-11
 
 - On GNOME's Wayland session the settings window's title bar showed Korean as boxes: winit draws that title bar with one font that has no Hangul, so the title there is "flockswitch"
