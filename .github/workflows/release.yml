@@ -68,6 +68,7 @@ jobs:
           sparse-checkout: |
             CHANGELOG.md
             CHANGELOG.ko.md
+            packaging/linux/release-notes/
           sparse-checkout-cone-mode: false
       - name: Release notes from CHANGELOG.ko.md and CHANGELOG.md
         run: |
