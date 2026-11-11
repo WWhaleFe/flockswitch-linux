@@ -4,11 +4,18 @@
 //! puts them on the screen in click-through X11 windows, updated at about 60 Hz by one
 //! thread of its own, with its own X connection. X libraries are loaded at run time;
 //! without them, without a 32-bit visual or a compositor it logs once and draws nothing.
-//! Wayland lets no app place such windows, so nothing is drawn there either.
+//!
+//! On Wayland the countdown goes to a click-through layer-shell surface where the
+//! compositor has wlr-layer-shell (overlay_wayland.rs: KDE, sway, Hyprland), and on GNOME
+//! to an X11 window through XWayland when its coordinates line up with the desktop's
+//! (edge_portal.rs checks that and allows it). The cursor highlight needs the cursor
+//! position, which Wayland gives no app, so it stays X11 only.
 
 use crate::config::{parse_color, Edge, Edges, Locate, DEFAULT_EFFECT_COLOR};
 use crate::edge::Rect;
 use crate::overlay_render as render;
+use crate::overlay_wayland as wayland;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::mpsc::{channel, Receiver, RecvTimeoutError, Sender};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
@@ -16,9 +23,47 @@ use std::time::{Duration, Instant};
 const FRAME: Duration = Duration::from_micros(16_667);
 
 enum Command {
-    EdgeBegin { display: Rect, edge: i32, style: i32, direction: i32, shrink: bool, elapsed: Duration, duration: Duration, preview: bool, color: [u8; 3], size: f64 },
+    /// `display` None: wherever the platform likes (a preview on Wayland, where the
+    /// cursor is unknown). `cursor` None: read it from the X server.
+    EdgeBegin {
+        display: Option<Rect>,
+        cursor: Option<(f64, f64)>,
+        edge: i32,
+        style: i32,
+        direction: i32,
+        shrink: bool,
+        elapsed: Duration,
+        duration: Duration,
+        preview: bool,
+        color: [u8; 3],
+        size: f64,
+    },
+    /// Where the cursor is now, for a countdown begun with a cursor.
+    EdgeCursor((f64, f64)),
     EdgeEnd,
     Locate(i32, [u8; 3], f64),
+}
+
+/// Where effects are drawn outside an X11 session.
+const OUTSIDE_X11_NOTHING: u8 = 0;
+const OUTSIDE_X11_XWAYLAND: u8 = 1;
+const OUTSIDE_X11_LAYER_SHELL: u8 = 2;
+static OUTSIDE_X11: AtomicU8 = AtomicU8::new(OUTSIDE_X11_NOTHING);
+
+/// In a Wayland session, draw through XWayland (GNOME, whose coordinates were checked
+/// to line up). Takes effect for the first effect drawn.
+pub fn use_xwayland() {
+    OUTSIDE_X11.store(OUTSIDE_X11_XWAYLAND, Ordering::Relaxed);
+}
+
+/// In a Wayland session, draw on layer-shell surfaces.
+pub fn use_layer_shell() {
+    OUTSIDE_X11.store(OUTSIDE_X11_LAYER_SHELL, Ordering::Relaxed);
+}
+
+/// Whether X11 windows may be used for drawing in this (Wayland) session.
+pub(crate) fn xwayland_allowed() -> bool {
+    OUTSIDE_X11.load(Ordering::Relaxed) == OUTSIDE_X11_XWAYLAND
 }
 
 static COMMANDS: OnceLock<Sender<Command>> = OnceLock::new();
@@ -50,10 +95,17 @@ fn send(command: Command) {
 /// Starts the countdown on `edge` of `display`, `elapsed` into the wait of `duration`.
 /// The effect is the chosen one with its own settings, or for Random one drawn now.
 pub fn edge_begin(edges: &Edges, edge: Edge, display: &Rect, elapsed: Duration, duration: Duration, preview: bool) {
+    edge_begin_at(edges, edge, Some(display), None, elapsed, duration, preview);
+}
+
+/// `edge_begin` with the cursor given (Wayland: where the edge watcher saw it, in the
+/// display's coordinates), or no display at all (a Wayland preview: the platform picks).
+pub fn edge_begin_at(edges: &Edges, edge: Edge, display: Option<&Rect>, cursor: Option<(f64, f64)>, elapsed: Duration, duration: Duration, preview: bool) {
     let countdown = edges.countdown();
     let e = &countdown.settings;
     send(Command::EdgeBegin {
-        display: *display,
+        display: display.copied(),
+        cursor,
         edge: edge as i32,
         style: countdown.style as i32,
         direction: e.direction as i32,
@@ -64,6 +116,11 @@ pub fn edge_begin(edges: &Edges, edge: Edge, display: &Rect, elapsed: Duration, 
         color: components(&e.color),
         size: f64::from(e.size) / 100.0,
     });
+}
+
+/// The cursor moved while a countdown begun with `edge_begin_at(.., Some(cursor), ..)` runs.
+pub fn edge_cursor(x: f64, y: f64) {
+    send(Command::EdgeCursor((x, y)));
 }
 
 /// Takes the countdown away at once.
@@ -78,6 +135,8 @@ pub fn locate(locate: &Locate) {
 
 struct EdgeEffect {
     layer: platform::Layer,
+    /// Given by the edge watcher; None: read from the X server.
+    cursor: Option<(f64, f64)>,
     edge: i32,
     style: i32,
     direction: i32,
@@ -102,30 +161,71 @@ struct LocateEffect {
 /// What is being drawn, on the connection made when the first effect was asked for.
 struct Effects {
     x: Option<platform::Connection>,
+    /// The layer-shell painter, when that is where this session draws.
+    wl: Option<wayland::Painter>,
     /// Trying to connect once is enough; the reason is logged when it fails.
     tried: bool,
     edge: Option<EdgeEffect>,
+    wl_edge: Option<wayland::EdgeEffect>,
     locate: Option<LocateEffect>,
 }
 
 impl Effects {
-    fn connection(&mut self) -> Option<&platform::Connection> {
+    fn open(&mut self) {
         if !self.tried {
             self.tried = true;
-            self.x = platform::Connection::open();
+            if !crate::edge::available() && OUTSIDE_X11.load(Ordering::Relaxed) == OUTSIDE_X11_LAYER_SHELL {
+                self.wl = wayland::Painter::open();
+            } else {
+                self.x = platform::Connection::open();
+            }
         }
+    }
+
+    fn connection(&mut self) -> Option<&platform::Connection> {
+        self.open();
         self.x.as_ref().filter(|x| x.has_compositor())
     }
 
     fn handle(&mut self, command: Command) {
         match command {
-            Command::EdgeBegin { display, edge, style, direction, shrink, elapsed, duration, preview, color, size } => {
+            Command::EdgeBegin { display, cursor, edge, style, direction, shrink, elapsed, duration, preview, color, size } => {
                 self.edge = None;
-                if render::edge_has_effect(style) {
-                    self.edge = self.connection().and_then(|x| begin_edge(x, &display, edge, style, direction, shrink, elapsed, duration, preview, color, size));
+                if self.wl_edge.take().is_some() {
+                    if let Some(wl) = &self.wl {
+                        wl.flush();
+                    }
+                }
+                if !render::edge_has_effect(style) {
+                    return;
+                }
+                self.open();
+                let look = wayland::Look { edge, style, direction, shrink, preview, color, size };
+                if let Some(wl) = self.wl.as_mut() {
+                    self.wl_edge = wl.begin_edge(display, cursor, look, elapsed, duration);
+                    return;
+                }
+                self.edge = self.connection().and_then(|x| {
+                    let display = display.unwrap_or_else(|| x.display_for_preview());
+                    begin_edge(x, &display, cursor, edge, style, direction, shrink, elapsed, duration, preview, color, size)
+                });
+            }
+            Command::EdgeCursor(at) => {
+                if let Some(e) = self.edge.as_mut().filter(|e| e.cursor.is_some()) {
+                    e.cursor = Some(at);
+                }
+                if let Some(e) = self.wl_edge.as_mut() {
+                    e.cursor = Some(at);
                 }
             }
-            Command::EdgeEnd => self.edge = None,
+            Command::EdgeEnd => {
+                self.edge = None;
+                if self.wl_edge.take().is_some() {
+                    if let Some(wl) = &self.wl {
+                        wl.flush();
+                    }
+                }
+            }
             Command::Locate(style, color, size) => {
                 self.locate = None;
                 if render::locate_exists(style) {
@@ -136,10 +236,16 @@ impl Effects {
     }
 
     fn animating(&self) -> bool {
-        self.edge.is_some() || self.locate.is_some()
+        self.edge.is_some() || self.wl_edge.is_some() || self.locate.is_some()
     }
 
     fn tick(&mut self) {
+        if let Some(wl) = self.wl.as_mut() {
+            if self.wl_edge.as_mut().is_some_and(|e| !wl.draw_edge(e)) {
+                self.wl_edge = None;
+                wl.flush();
+            }
+        }
         let Some(x) = self.x.as_ref() else { return };
         if self.edge.as_mut().is_some_and(|e| !draw_edge(x, e)) {
             self.edge = None;
@@ -151,7 +257,7 @@ impl Effects {
 }
 
 fn run(commands: Receiver<Command>) {
-    let mut effects = Effects { x: None, tried: false, edge: None, locate: None };
+    let mut effects = Effects { x: None, wl: None, tried: false, edge: None, wl_edge: None, locate: None };
     let mut next_frame = Instant::now();
     loop {
         let received = if effects.animating() {
@@ -186,12 +292,27 @@ fn strip_of(display: &Rect, edge: i32, depth: i32) -> (i32, i32, i32, i32) {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn begin_edge(x: &platform::Connection, display: &Rect, edge: i32, style: i32, direction: i32, shrink: bool, elapsed: Duration, duration: Duration, preview: bool, color: [u8; 3], size: f64) -> Option<EdgeEffect> {
+fn begin_edge(
+    x: &platform::Connection,
+    display: &Rect,
+    cursor: Option<(f64, f64)>,
+    edge: i32,
+    style: i32,
+    direction: i32,
+    shrink: bool,
+    elapsed: Duration,
+    duration: Duration,
+    preview: bool,
+    color: [u8; 3],
+    size: f64,
+) -> Option<EdgeEffect> {
     let depth = (render::STRIP_DEPTH * x.scale()).round() as i32;
     let (sx, sy, w, h) = strip_of(display, edge, depth);
     let layer = x.layer(sx, sy, w, h)?;
     let started = Instant::now().checked_sub(elapsed).unwrap_or_else(Instant::now);
-    Some(EdgeEffect { layer, edge, style, direction, shrink, preview, started, duration: duration.as_secs_f64().max(0.05), color, size })
+    // A preview where the cursor is unknown (Wayland): the middle of the edge.
+    let cursor = cursor.or_else(|| (!crate::edge::available()).then(|| (display.x + display.w / 2.0, display.y + display.h / 2.0)));
+    Some(EdgeEffect { layer, cursor, edge, style, direction, shrink, preview, started, duration: duration.as_secs_f64().max(0.05), color, size })
 }
 
 /// Draws the next frame of the countdown. False when it has finished.
@@ -201,7 +322,10 @@ fn draw_edge(x: &platform::Connection, effect: &mut EdgeEffect) -> bool {
         return false;
     }
     let (lx, ly) = effect.layer.position();
-    let (mx, my) = x.cursor().unwrap_or((lx, ly));
+    let (mx, my) = match effect.cursor {
+        Some((cx, cy)) => (cx.round() as i32, cy.round() as i32),
+        None => x.cursor().unwrap_or((lx, ly)),
+    };
     let draw = render::EdgeDraw {
         edge: effect.edge,
         style: effect.style,
@@ -313,7 +437,7 @@ mod platform {
     impl Connection {
         /// Connects, or logs once why nothing can be drawn.
         pub fn open() -> Option<Connection> {
-            if !crate::edge::available() {
+            if !crate::edge::available() && !super::xwayland_allowed() {
                 if once() {
                     log::info!("overlay: not drawn in this session (X11 only)");
                 }
@@ -357,6 +481,10 @@ mod platform {
         /// Whether a compositor is running now (it may be started or stopped at any
         /// time); without one the windows would come out as black rectangles.
         pub fn has_compositor(&self) -> bool {
+            // XWayland: the Wayland compositor composites every X11 window.
+            if super::xwayland_allowed() {
+                return true;
+            }
             // Safety: reading a selection owner on our own open display.
             let owner = unsafe { (self.xlib.XGetSelectionOwner)(self.display, self.compositor) };
             if owner == 0 && once() {
@@ -403,6 +531,13 @@ mod platform {
                 (self.xlib.XFree)(info.cast());
                 found.unwrap_or((0, 0, whole.0, whole.1))
             }
+        }
+
+        /// The display the cursor is on (or the first), for a preview that was given none.
+        pub fn display_for_preview(&self) -> super::Rect {
+            let (px, py) = self.cursor().unwrap_or((0, 0));
+            let (x, y, w, h) = self.display_at(px, py);
+            super::Rect { x: f64::from(x), y: f64::from(y), w: f64::from(w), h: f64::from(h) }
         }
 
         /// A click-through window, or None when one cannot be made.

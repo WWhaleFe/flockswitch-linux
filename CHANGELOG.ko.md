@@ -1,5 +1,14 @@
 # 변경 기록
 
+## 0.10.0 — 2026-11-11
+
+- 화면 모서리 전환이 Wayland에서도 동작합니다. 데스크톱이 제공하는 방법을 골라 로그에 남기며(`edge backend: …`), **GNOME 45 이상**에서는 데스크톱 포털의 입력 캡처(채널을 정한 가장자리마다 감지선을 두고, 커서가 거기 닿으면 시스템이 커서를 flockswitch에 넘겨 머무는 시간이 지나면 전환하고, 안쪽으로 움직이거나 클릭·키를 누르면 바로 돌려줌), **KDE Plasma, sway, Hyprland** 등 wlroots 계열에서는 그 가장자리를 따라 1픽셀 너비의 투명한 띠(wlr-layer-shell)를 씁니다. 네 귀퉁이와 다른 모니터로 이어지는 가장자리는 X11처럼 제외하고, 진동도 같게 울리며, 모니터 구성이 바뀌면 감지선이나 띠를 다시 둡니다. X11 세션은 전과 똑같이 동작합니다
+- GNOME은 flockswitch의 입력 캡처를 허락할지 한 번 묻습니다. GNOME 51은 답을 기억하고(복원 토큰을 `~/.config/flockswitch/input-capture.token`에 보관), GNOME 45~50은 flockswitch를 시작할 때마다, 45~48은 채널을 정한 가장자리나 모니터 구성이 바뀔 때도 다시 묻습니다. 허락하지 않으면 모서리 페이지에 알려 주며, 가장자리 설정을 바꾸면 다시 묻습니다
+- 대기 효과를 Wayland에서도 그립니다: KDE·sway·Hyprland에서는 클릭이 통과하는 layer-shell 화면에, GNOME에서는 XWayland의 화면 배치가 데스크톱과 같을 때 XWayland로. 설정 창의 미리 보기도 그곳에서 (가장자리 가운데에) 보입니다
+- Wayland에서 'Ctrl 키를 누른 동안에만 전환': GNOME에서는 커서가 가장자리에 닿은 뒤에 Ctrl을 누르세요. KDE·sway·Hyprland에서는 커서가 띠 위에 있는 동안 Ctrl을 확인하려고 키보드를 잠시 넘겨받습니다(Ctrl 없이 최대 1.5초, 다른 키를 누르면 바로 돌려줌)
+- Wayland에서는 커서를 보냈던 쪽 가장자리로 되돌려 놓지 못하며, 마우스 찾기는 X11에서만 동작합니다. 설정 창은 "X11이 필요합니다" 대신 이 데스크톱에서 무엇이 되는지 알려 주고, 쓸 수 없는 곳(GNOME 44 이하, 둘 다 없는 컴포지터)에서는 그 이유를 빨간 글씨로 보여 줍니다
+- 시험용으로 `FLOCKSWITCH_EDGE_BACKEND=layer-shell|input-capture|none`으로 방법을 정할 수 있습니다
+
 ## 0.9.0 — 2026-11-10
 
 - 모서리 대기 효과: 링·반원·막대·펄스·레이저·보텍스·사이버 스캔·리퀴드가 효과마다 색상과 크기를, 링·반원·막대는 줄어드는 방향도(링·반원은 '크기가 작아지며 사라지기'도) 따로 기억합니다. 링에서 양방향을 골라도 막대는 그대로이며, 효과를 바꾸면 그 효과의 설정이 보이고 미리 보기도 그 설정으로 그립니다. 설정 파일에는 Windows판·macOS판과 같은 `[edges.effects.<효과>]`(`color`, `size`, `direction`, `shrink`)로 저장하고, 이전 설정은 하나였던 색상·크기·방향·작아지기를 모든 효과에 그대로 이어 받으며, 이전 키도 고른 효과의 값으로 계속 씁니다. 명령줄: `set edge.ring.color #0A84FF`, `set edge.bar.direction both`, `set edge.semicircle.shrink true`, `set edge.pulse.size 125`. 예전의 `set edge.anim_color …`(`anim_size`, `anim_direction`, `anim_shrink`)는 고른 효과에, 없음이나 랜덤일 때는 모든 효과에 적용됩니다

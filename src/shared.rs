@@ -44,6 +44,12 @@ pub struct Status {
     pub hid_denied: bool,
     /// New-version check and download, shown in the menu.
     pub update: crate::update::UpdateState,
+    /// How the screen edges are watched: "x11", "input-capture", "layer-shell" or
+    /// "none" (empty until decided).
+    pub edge_backend: String,
+    /// Its state for the settings window: "ready", "off", "asking:1", "denied", a
+    /// reason code for "none", … (see edge_wayland.rs and edge_portal.rs).
+    pub edge_note: String,
 }
 
 /// What the engine sees right now, written for the settings window (a separate
@@ -70,6 +76,11 @@ pub struct StatusFile {
     /// No permission to open a Logitech device: the settings window says how to fix it.
     #[serde(default)]
     pub hid_denied: bool,
+    /// How the screen edges are watched, and how that is going (empty before 0.10.0).
+    #[serde(default)]
+    pub edge_backend: String,
+    #[serde(default)]
+    pub edge_note: String,
 }
 
 fn status_path() -> std::path::PathBuf {
@@ -358,6 +369,8 @@ impl Shared {
             hotkeys_failed: st.hotkeys_failed.clone(),
             channel: st.channel,
             hid_denied: st.hid_denied,
+            edge_backend: st.edge_backend.clone(),
+            edge_note: st.edge_note.clone(),
             version: env!("CARGO_PKG_VERSION").into(),
         };
         drop(st);

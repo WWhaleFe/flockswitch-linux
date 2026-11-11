@@ -68,7 +68,7 @@ The tray icon's menu shows the status, turns switching on or off, checks for upd
 
 - **Switching**: on/off, and per button (wheel mode-shift, gesture, wheel click — several can be on): the channel it goes to — one channel, chosen on each computer since settings are kept per computer; this PC's own channel is shown but cannot be chosen. The gesture button can also switch by holding it and moving the mouse up, down, left or right, each direction with its own channel.
 - **Shortcuts** (on the same tab): on X11, keyboard shortcuts, one per channel (Ctrl+Alt+1 / 2 / 3 until you change them), pressed on any keyboard. The ⓘ beside the title (and beside the find-the-cursor shortcut) lists which combinations work: Ctrl and/or Alt with a number or letter (Shift may be added), or an F key; the desktop's own combinations and ones another app has taken cannot be used, and the row says so. **On Wayland** no app can register shortcuts for the whole desktop, so the tab lists commands to bind instead: in your desktop's keyboard settings, add custom shortcuts that run `~/.local/bin/flockswitch switch 1` (and `2`, `3`). The running flockswitch does the switch at once.
-- **Edges** (same tab): rest the cursor against an outer edge of the screen for a moment (0.3 to 2 s, your choice) and the group and the master mouse go to the channel set for that side. No network: each computer watches its own screen, so turn it on on every computer and give each side the channel of the computer that stands there. While it waits an effect runs down near the cursor (ring, semicircle, bar, pulse, laser, vortex, scan, liquid or random). Each effect keeps its own colour and size, and the ring, semicircle and bar their own direction (the ring and semicircle can also shrink away instead); **Random** picks an effect each time, in that effect's colour and size, with a random direction and shrink-away where it has them. You can require Ctrl to be held. When the mouse comes back, the cursor appears at the edge it left by. The corners do not count, and with several displays an edge that continues onto another display does not switch. On Wayland no app can read the cursor position, so this needs an X11 (Xorg) session.
+- **Edges** (same tab): rest the cursor against an outer edge of the screen for a moment (0.3 to 2 s, your choice) and the group and the master mouse go to the channel set for that side. No network: each computer watches its own screen, so turn it on on every computer and give each side the channel of the computer that stands there. While it waits an effect runs down near the cursor (ring, semicircle, bar, pulse, laser, vortex, scan, liquid or random). Each effect keeps its own colour and size, and the ring, semicircle and bar their own direction (the ring and semicircle can also shrink away instead); **Random** picks an effect each time, in that effect's colour and size, with a random direction and shrink-away where it has them. You can require Ctrl to be held. When the mouse comes back, the cursor appears at the edge it left by (X11). The corners do not count, and with several displays an edge that continues onto another display does not switch. Works on X11 and, in its own way, on Wayland: see [Screen edges on Wayland](#screen-edges-on-wayland).
 - **Devices**: the master mouse, and the devices that move along (Bolt, Unifying and Bluetooth devices can be mixed; devices on another computer are listed too)
 - **General**: haptics on a mouse with a motor, currently the MX Master 4 (a summary and the **Haptics Settings…** window: on/off, strength, a pulse as the mouse leaves and one when it is back, each with its own waveform or random, rising or even pulses at an edge, and **Test** to try them), find the cursor (a pulse ring, radar, spotlight or random effect in the colour and size you choose, from a shortcut, on arrival from another computer, or by shaking the mouse for 0.5 to 2 s without a pause, optionally only while Ctrl, Alt or Shift is held (X11 session with a compositor)), language (Korean or English), start at login, updates (check for a new version, install it automatically or with **Update now**), report to the developer, settings backup (below), reset settings, uninstall. The settings window opens tall enough for the whole General tab, and grows (as far as the screen allows) when a page needs more room
 
@@ -79,6 +79,19 @@ Command line: `flockswitch help` (`list`, `switch <N>`, `set <key> <value>`, `ru
 Settings live in `~/.config/flockswitch/`.
 
 **Settings backup** (General tab): **Save** writes the current settings to `~/Documents/flockswitch/flockswitch-settings-<computer>-<date-time>.toml` (the Documents folder is `$XDG_DOCUMENTS_DIR` where set), **Load…** lists the files there, newest first, and after you confirm replaces every setting with the chosen file's, **Manage…** lists them with **Rename** and **Delete** (to the Trash with `gio trash`, or deleted for good where there is none), and **Open folder** shows the folder. The folder holds up to 10 files (the card shows how many, e.g. 3/10); with 10, Save writes nothing and says so until some are renamed away or deleted. The file is the same TOML the Windows and macOS versions write, so a file from either loads here: settings Linux does not have are skipped, missing ones keep their defaults, and a file that is not valid settings is refused with the reason. Channels are set per computer, so check them after loading another computer's settings.
+
+### Screen edges on Wayland
+
+No app may read the cursor on Wayland, so flockswitch picks what the desktop offers when it starts, logs it (`edge backend: …` in `~/.config/flockswitch/flockswitch.log`) and shows it on the edges page:
+
+| Session | How the edges are watched | What you do once |
+|---|---|---|
+| X11 (Xorg), any desktop | reads the cursor, as before | nothing |
+| KDE Plasma, sway, Hyprland and other wlroots desktops (Wayland) | a transparent strip one pixel wide along each edge that has a channel (wlr-layer-shell) | nothing |
+| GNOME 45 or newer (Wayland) | the desktop portal's input capture: a barrier on each edge that has a channel; when the cursor pushes against it the system hands the cursor to flockswitch until it switches or you move back in | allow input capture when the system asks. GNOME 51 remembers the answer; GNOME 45 to 50 ask each time flockswitch starts (45 to 48 also when the edges with a channel or the displays change) |
+| GNOME 44 or older, or a compositor with neither (e.g. Weston) | not available: the edges page says why | choose an X11 session on the login screen |
+
+On Wayland the cursor is not put back at the edge it left by (no app may move it). The countdown is drawn on KDE, sway and Hyprland, and on GNOME through XWayland when its screen layout matches the desktop's (otherwise the wait runs without it; the haptic pulses work everywhere). The strips take the clicks on the outermost row of pixels of those edges. With "only while Ctrl is held": on GNOME press Ctrl once the cursor is at the edge (the system does not report keys pressed before); on the layer-shell desktops a strip briefly takes the keyboard while the cursor rests on it to see Ctrl (for at most 1.5 s without Ctrl, and never while you type). Find the cursor needs the cursor position and stays X11 only. `FLOCKSWITCH_EDGE_BACKEND=layer-shell`, `input-capture` or `none` forces a way, for testing.
 
 ## Uninstall
 
@@ -107,6 +120,7 @@ Open a [problem report](../../issues/new/choose) with:
 | Logi Bolt receiver | implemented, not tried on Linux yet |
 | Unifying receiver | implemented, not tried on Linux yet |
 | Bluetooth | implemented, not tried on Linux yet |
+| Screen edges on Wayland (GNOME input capture, KDE/wlroots layer shell) | implemented, not tried yet |
 
 ## Build
 
@@ -115,7 +129,7 @@ sudo apt install libudev-dev pkg-config   # Fedora: systemd-devel pkgconf
 cargo build --release                      # target/release/flockswitch
 ```
 
-Everything else (Wayland, X11, OpenGL, D-Bus) is loaded at run time, so no other development packages are needed.
+Everything else (Wayland, X11, OpenGL, D-Bus, libei) is loaded at run time or talked to in pure Rust, so no other development packages are needed.
 
 ## License
 

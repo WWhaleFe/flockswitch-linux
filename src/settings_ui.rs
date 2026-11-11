@@ -977,10 +977,19 @@ impl SettingsApp {
     /// each side goes on the left, how the wait looks and feels on the right.
     fn edge_rows(&mut self, ui: &mut Ui, t: &Texts, p: Palette) {
         if !crate::edge::available() {
+            // Wayland: what the running flockswitch found it can use here.
+            let (text, problem) = edge_backend_text(t, &self.status.edge_backend, &self.status.edge_note, self.cfg.edges.require_control);
             ui.add_space(8.0);
-            info_box(ui, p, t.edges_wayland);
-            ui.add_space(10.0);
-            return;
+            if problem {
+                error_box(ui, p, &text);
+            } else {
+                info_box(ui, p, &text);
+            }
+            if self.status.edge_backend == "none" {
+                ui.add_space(10.0);
+                return;
+            }
+            ui.add_space(4.0);
         }
         // No on/off switch: an edge is on when it has a channel, off on "Off".
         title_row(ui, p, t.edges_title, None);
@@ -1069,7 +1078,11 @@ impl SettingsApp {
             self.apply(|c| c.edges.anim_style = style);
         }
         if preview {
-            crate::edge::preview(&self.cfg.edges);
+            if crate::edge::available() {
+                crate::edge::preview(&self.cfg.edges);
+            } else {
+                crate::edge_wayland::preview(&self.cfg.edges);
+            }
         }
         // Random draws an effect with that effect's own settings; it has none to set.
         if self.cfg.edges.anim_style == EdgeAnimStyle::Random {
@@ -2310,6 +2323,69 @@ fn warning(ui: &mut Ui, p: Palette, title: &str, text: &str) {
             ui.spacing_mut().item_spacing.y = 4.0;
             ui.label(RichText::new(format!("⚠  {title}")).font(bold(14.0)).color(p.amber));
             ui.label(RichText::new(text).size(12.5).color(p.text));
+        });
+}
+
+/// The desktop's name for the Wayland notes ("ubuntu:GNOME" → "GNOME").
+fn desktop_name() -> String {
+    let desktop = std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_default();
+    desktop.rsplit(':').next().map(str::trim).filter(|d| !d.is_empty()).unwrap_or("Wayland").to_string()
+}
+
+/// What the running flockswitch says about watching the edges in this Wayland session
+/// (from the status file): the text to show, and whether it is a problem.
+fn edge_backend_text(t: &Texts, backend: &str, note: &str, require_control: bool) -> (String, bool) {
+    let desktop = desktop_name();
+    let fill = |text: &str| text.replace("{desktop}", &desktop);
+    let (code, arg) = note.split_once(':').unwrap_or((note, ""));
+    match backend {
+        "input-capture" => match code {
+            "asking" => (fill(t.edges_capture_asking), false),
+            "ready" => {
+                let mut text = fill(t.edges_capture_ready);
+                text.push(' ');
+                text.push_str(if arg == "1" { t.edges_capture_every } else { t.edges_capture_once });
+                if require_control {
+                    text.push(' ');
+                    text.push_str(t.edges_capture_ctrl);
+                }
+                (text, false)
+            }
+            "denied" => (t.edges_capture_denied.to_string(), true),
+            "closed" => (t.edges_capture_closed.to_string(), true),
+            "no-barriers" => (t.edges_capture_no_barriers.to_string(), true),
+            "error" => (t.edges_capture_error.to_string(), true),
+            _ => (fill(t.edges_capture_off), false),
+        },
+        "layer-shell" => {
+            let mut text = fill(t.edges_layer_ready);
+            if require_control {
+                text.push(' ');
+                text.push_str(t.edges_layer_ctrl);
+            }
+            (text, false)
+        }
+        "none" => match code {
+            "gnome-old" => (t.edges_none_gnome.replace("{version}", arg), true),
+            "no-wayland" => (t.edges_none_wayland.to_string(), true),
+            "no-display" => (t.edges_none_display.to_string(), true),
+            "forced" => (t.edges_none_forced.replace("{name}", arg), true),
+            _ => (fill(t.edges_none_support), true),
+        },
+        _ => (t.edges_unknown.to_string(), false),
+    }
+}
+
+/// A box of text about something that does not work, in red.
+fn error_box(ui: &mut Ui, p: Palette, text: &str) {
+    egui::Frame::new()
+        .fill(p.red.gamma_multiply(0.12))
+        .stroke(Stroke::new(1.0, p.red.gamma_multiply(0.6)))
+        .corner_radius(10)
+        .inner_margin(Margin::symmetric(14, 10))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.label(RichText::new(text).size(12.5).color(p.red));
         });
 }
 

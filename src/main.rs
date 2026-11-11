@@ -5,6 +5,10 @@ mod backup;
 mod config;
 mod device;
 mod edge;
+mod edge_layer;
+mod edge_logic;
+mod edge_portal;
+mod edge_wayland;
 mod engine;
 mod hidpp;
 mod hotkey;
@@ -12,11 +16,13 @@ mod i18n;
 mod icon;
 mod overlay;
 mod overlay_render;
+mod overlay_wayland;
 mod settings_ui;
 mod shared;
 mod tray;
 mod update;
 mod window_size;
+mod wl;
 
 use anyhow::{bail, Result};
 use config::Config;
@@ -223,7 +229,7 @@ fn run_headless() -> Result<()> {
     let shared = Arc::new(Shared::new(cfg));
     let s = shared.clone();
     ctrlc::set_handler(move || s.stop.store(true, Ordering::SeqCst))?;
-    edge::spawn(shared.clone());
+    edge_wayland::spawn(shared.clone());
     Engine::new(shared)?.run()
 }
 

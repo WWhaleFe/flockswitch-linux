@@ -47,7 +47,7 @@ pub fn run(shared: Arc<Shared>, open_settings: bool) -> Result<()> {
     let mut engine = Some(spawn_engine(shared.clone()));
     spawn_update_check(shared.clone());
     crate::overlay::set_ready();
-    crate::edge::spawn(shared.clone());
+    crate::edge_wayland::spawn(shared.clone());
 
     let mut ui = Ui {
         shared: shared.clone(),
