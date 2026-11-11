@@ -1,7 +1,8 @@
-//! A small Wayland client for what edge switching puts on the screen there: the
-//! 1-pixel strips along the edges that notice the pointer (edge_layer.rs) and the
-//! click-through countdown (overlay_wayland.rs), both wlr-layer-shell surfaces. Each
-//! user opens its own connection on its own thread. libwayland-client is loaded at run
+//! A small Wayland client for what flockswitch puts on the screen there: the 1-pixel
+//! strips along the edges that notice the pointer (edge_layer.rs), the click-through
+//! countdown, and for finding the cursor the surfaces over each output that learn where
+//! the pointer is and the highlight itself (overlay_wayland.rs), all wlr-layer-shell
+//! surfaces. Each user opens its own connection on its own thread. libwayland-client is loaded at run
 //! time (wayland-dlopen), so on a computer without it `connect` just fails.
 
 use crate::edge_logic::Zone;
@@ -290,6 +291,12 @@ impl Layer {
 
     pub fn closed(&self) -> bool {
         self.state.lock().unwrap().closed
+    }
+
+    /// Moves the surface from its anchored edges (logical pixels); applied with the next
+    /// frame drawn.
+    pub fn set_margin(&self, top: i32, right: i32, bottom: i32, left: i32) {
+        self.layer.set_margin(top, right, bottom, left);
     }
 
     /// Takes the keyboard (exclusive) or leaves it to the windows (none).

@@ -112,8 +112,9 @@ where
     Ok(stream.filter_map(|m| std::future::ready(m.body().deserialize::<T>().ok())).boxed_local())
 }
 
-/// The screens XWayland reports (its coordinates), to draw the countdown there.
-fn xwayland_screens() -> Vec<Zone> {
+/// The screens XWayland reports (its coordinates), to draw the countdown (and the cursor
+/// highlight, locate_wayland.rs) there.
+pub(crate) fn xwayland_screens() -> Vec<Zone> {
     use x11_dl::xinerama::Xlib as Xinerama;
     use x11_dl::xlib::Xlib;
     if std::env::var_os("DISPLAY").is_none() {

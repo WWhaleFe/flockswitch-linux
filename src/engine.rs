@@ -844,6 +844,11 @@ impl Engine {
             if let Some(channel) = self.shared.take_switch_request().or_else(shared::take_switch_file) {
                 self.on_shortcut(channel);
             }
+            // `flockswitch locate`: the screen watcher (edge.rs on X11, locate_wayland.rs
+            // on Wayland) shows the cursor.
+            if shared::take_locate_file() {
+                self.shared.request_locate(shared::LocateSource::Command);
+            }
             if let Some(waveform) = self.shared.take_haptic_request() {
                 self.buzz(waveform);
             }

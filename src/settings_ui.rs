@@ -11,6 +11,7 @@ use crate::config::{
 use crate::device::waveform;
 use crate::hotkey::LOCATE;
 use crate::i18n::{texts, Texts};
+use crate::locate_logic::{self as logic, LocatePath, NoLocate, PortalState};
 use crate::setup;
 use crate::setup_logic::{self, After, Item, ItemId, State as SetupState, Why};
 use crate::shared::{self, DeviceInfo, HapticPreview, StatusFile};
@@ -994,14 +995,10 @@ impl SettingsApp {
         }
         label_info(ui, p, row, 40.0, t.hotkeys_title, t.hotkey_help);
         hint(ui, p, t.hotkeys_hint);
-        if crate::hotkey::unsupported_session() {
-            // Wayland: the desktop's own shortcut settings run the command instead.
-            let exe = crate::tray::launch_path().map(|p| p.display().to_string()).unwrap_or_else(|| "flockswitch".into());
-            let commands: Vec<String> = (1..=3).map(|n| format!("{exe} switch {n}")).collect();
+        if crate::hotkey::unsupported_session() && self.cfg.hotkeys.on {
+            // Wayland: registered through the system's shortcut service; how that stands.
             ui.add_space(8.0);
-            info_box(ui, p, &format!("{}\n\n{}", t.hotkeys_wayland, commands.join("\n")));
-            ui.add_space(10.0);
-            return;
+            self.portal_box(ui, t, p, false);
         }
         if !self.cfg.hotkeys.on {
             ui.add_space(10.0);
@@ -1051,6 +1048,9 @@ impl SettingsApp {
         if failed {
             hint(ui, p, t.hotkey_taken);
         }
+        if crate::hotkey::unsupported_session() && !recording && !key.is_empty() {
+            self.portal_trigger_hint(ui, t, p, n, &key);
+        }
         if start {
             self.recording = Some(n);
             self.error = None;
@@ -1058,6 +1058,65 @@ impl SettingsApp {
         }
         if clear {
             self.apply(|c| c.set_shortcut(n, ""));
+        }
+    }
+
+    /// Wayland: how the shortcuts through the system's shortcut service stand, as the
+    /// running flockswitch wrote it. `compact`: only what needs the user (a question,
+    /// a refusal, no service), not the note on a successful registration.
+    fn portal_box(&mut self, ui: &mut Ui, t: &Texts, p: Palette, compact: bool) {
+        let exe = crate::tray::launch_path().map(|p| p.display().to_string()).unwrap_or_else(|| "flockswitch".into());
+        let with_commands = |text: &str| format!("{text}\n\n{}", logic::fallback_commands(&exe).join("\n"));
+        match PortalState::parse(&self.status.shortcuts_portal) {
+            Some(PortalState::Bound(version)) => {
+                if compact {
+                    return;
+                }
+                info_box(ui, p, &t.portal_bound.replace("{desktop}", &desktop_name()));
+                if version >= 2 {
+                    ui.add_space(6.0);
+                    if button(ui, p, t.portal_change, ButtonKind::Plain).clicked() {
+                        shared::request_configure_shortcuts();
+                    }
+                }
+            }
+            Some(PortalState::Asking) => info_box(ui, p, t.portal_asking),
+            Some(PortalState::Denied) => error_box(ui, p, &with_commands(t.portal_denied)),
+            Some(PortalState::Missing) => info_box(ui, p, &with_commands(t.portal_missing)),
+            Some(PortalState::NoAppId) => {
+                error_box(ui, p, &with_commands(t.portal_no_app_id));
+                if self.setup_item(ItemId::MenuEntry).is_some_and(|i| i.actionable()) {
+                    ui.add_space(6.0);
+                    if button(ui, p, t.setup_open, ButtonKind::Primary).clicked() {
+                        self.tab = Tab::General;
+                        self.stop_recording();
+                    }
+                }
+            }
+            Some(PortalState::Error) => error_box(ui, p, &with_commands(t.portal_error)),
+            // Nothing to register yet (just turned on: the running app follows within a second).
+            Some(PortalState::Off) => {}
+            // No running flockswitch of this version has said anything yet.
+            None => {
+                if !compact {
+                    info_box(ui, p, t.portal_waiting);
+                }
+            }
+        }
+        ui.add_space(4.0);
+    }
+
+    /// Wayland: under a shortcut's row, the key the system bound it to, in amber when
+    /// that is not the one chosen here (the system keeps the user's own choice).
+    fn portal_trigger_hint(&self, ui: &mut Ui, t: &Texts, p: Palette, n: u8, key: &str) {
+        if !matches!(PortalState::parse(&self.status.shortcuts_portal), Some(PortalState::Bound(_))) {
+            return;
+        }
+        match self.status.shortcuts_bound.iter().find(|b| b.slot == n) {
+            None => hint(ui, p, t.portal_not_bound),
+            Some(b) if b.trigger.trim().is_empty() => amber_hint(ui, p, t.portal_trigger_none),
+            Some(b) if logic::trigger_matches(key, &b.trigger) => hint(ui, p, &t.portal_trigger_same.replace("{trigger}", &logic::pretty_trigger(&b.trigger))),
+            Some(b) => amber_hint(ui, p, &t.portal_trigger_other.replace("{trigger}", &logic::pretty_trigger(&b.trigger))),
         }
     }
 
@@ -1626,11 +1685,25 @@ impl SettingsApp {
     /// Highlighting the cursor: on/off, the effect, and what brings it up.
     fn locate_section(&mut self, ui: &mut Ui, t: &Texts, p: Palette) {
         section(ui, p, t.section_locate, |ui| {
-            if !crate::edge::available() {
+            // Wayland: what brings the highlight up here, and whether it can be drawn.
+            let wayland = !crate::edge::available();
+            if wayland {
                 ui.add_space(8.0);
-                info_box(ui, p, t.locate_wayland);
-                ui.add_space(10.0);
-                return;
+                let exe = crate::tray::launch_path().map(|p| p.display().to_string()).unwrap_or_else(|| "flockswitch".into());
+                let how = t.locate_wayland_how.replace("{desktop}", &desktop_name()).replace("{command}", &format!("{exe} locate"));
+                info_box(ui, p, &how);
+                match wayland_locate_path() {
+                    LocatePath::None(NoLocate::Misaligned) => {
+                        ui.add_space(6.0);
+                        error_box(ui, p, t.locate_none_misaligned);
+                    }
+                    LocatePath::None(_) => {
+                        ui.add_space(6.0);
+                        error_box(ui, p, t.locate_none_nothing);
+                    }
+                    _ => {}
+                }
+                ui.add_space(4.0);
             }
             let mut on = self.cfg.locate.on;
             if switch_row(ui, p, t.locate_on, None, &mut on) {
@@ -1667,6 +1740,10 @@ impl SettingsApp {
             }
             if self.cfg.locate.on_hotkey {
                 self.shortcut_row(ui, t, p, LOCATE, t.locate_key, Some(t.hotkey_help));
+                if wayland {
+                    ui.add_space(6.0);
+                    self.portal_box(ui, t, p, true);
+                }
             }
             divider(ui, p);
             let mut on = self.cfg.locate.on_arrival;
@@ -1674,6 +1751,13 @@ impl SettingsApp {
                 self.apply(|c| c.locate.on_arrival = on);
             }
             divider(ui, p);
+            if wayland {
+                // Shaking needs the cursor all the time, which Wayland gives no app.
+                ui.add_space(6.0);
+                hint(ui, p, t.locate_shake_x11);
+                ui.add_space(10.0);
+                return;
+            }
             let mut on = self.cfg.locate.on_shake;
             if switch_row(ui, p, t.locate_shake, None, &mut on) {
                 self.apply(|c| c.locate.on_shake = on);
@@ -2990,6 +3074,23 @@ const DIVIDER_GAP: f32 = 4.0;
 fn hint(ui: &mut Ui, p: Palette, text: &str) {
     ui.add_space(2.0);
     ui.label(RichText::new(text).size(12.5).color(p.muted));
+}
+
+/// A hint about something to look at, in amber.
+fn amber_hint(ui: &mut Ui, p: Palette, text: &str) {
+    ui.add_space(2.0);
+    ui.label(RichText::new(text).size(12.5).color(p.amber));
+}
+
+/// How this Wayland session can draw the cursor highlight, found once per window (the
+/// settings window's own Preview draws the same way as the running app).
+fn wayland_locate_path() -> LocatePath {
+    static PATH: std::sync::OnceLock<LocatePath> = std::sync::OnceLock::new();
+    *PATH.get_or_init(|| {
+        let (path, detail) = crate::locate_wayland::path();
+        log::info!("locate: {path:?} ({detail})");
+        path
+    })
 }
 
 fn empty(ui: &mut Ui, p: Palette, text: &str) {

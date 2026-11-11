@@ -14,6 +14,8 @@ mod hidpp;
 mod hotkey;
 mod i18n;
 mod icon;
+mod locate_logic;
+mod locate_wayland;
 mod overlay;
 mod overlay_render;
 mod overlay_wayland;
@@ -21,6 +23,7 @@ mod settings_ui;
 mod setup;
 mod setup_logic;
 mod shared;
+mod shortcuts_portal;
 mod tray;
 mod update;
 mod window_size;
@@ -44,7 +47,9 @@ USAGE:
     flockswitch list         show devices, channels and the trigger button
     flockswitch switch <N>   move all following devices to channel N (1-3) now; asks the
                             running flockswitch if there is one (bind this to a desktop
-                            shortcut on Wayland)
+                            shortcut where Wayland has no shortcut service)
+    flockswitch locate       ask the running flockswitch to show where the cursor is (for a
+                            custom desktop shortcut on Wayland; finding the cursor must be on)
     flockswitch config       print the config file path (created on first use)
     flockswitch quit         ask the running flockswitch to give the button back and quit
     flockswitch uninstall    remove start-at-login and all settings (also quits the running
@@ -190,11 +195,21 @@ fn real_main(args: &[String]) -> Result<()> {
                 bail!("usage: flockswitch switch <1|2|3>");
             };
             if main_instance_running() {
-                return ask_running_copy_to_switch(n);
+                return leave_request(&shared::switch_request_path(), &n.to_string());
             }
             let mut engine = Engine::new(Arc::new(Shared::new(Config::load_or_create()?)))?;
             engine.scan()?;
             engine.switch_to(n)
+        }
+        "locate" => {
+            // Only the running app can draw over the desktop (and knows the session).
+            if !main_instance_running() {
+                bail!("flockswitch is not running; start it first (the running flockswitch shows the cursor)");
+            }
+            if Config::load_or_create().is_ok_and(|c| !c.locate.on) {
+                eprintln!("note: finding the cursor is off (Settings → General, or `flockswitch set locate true`), so nothing will show");
+            }
+            leave_request(&shared::locate_request_path(), "")
         }
         "quit" => {
             if main_instance_running() {
@@ -346,24 +361,24 @@ pub fn show_message(text: &str) {
     }
 }
 
-/// `flockswitch switch <N>` while flockswitch runs: the running copy already has the
-/// devices open and moves them at once, instead of this one scanning them all again.
-fn ask_running_copy_to_switch(channel: u8) -> Result<()> {
-    let request = shared::switch_request_path();
+/// `flockswitch switch <N>` or `flockswitch locate` while flockswitch runs: the running
+/// copy already has the devices open (and draws over the desktop) and acts at once,
+/// instead of this one scanning them all again. Waits until it has taken the request.
+fn leave_request(request: &std::path::Path, contents: &str) -> Result<()> {
     if let Some(dir) = request.parent() {
         std::fs::create_dir_all(dir)?;
     }
     // Written whole, then renamed, so the running copy never reads half a file.
     let tmp = request.with_extension("tmp");
-    std::fs::write(&tmp, channel.to_string())?;
-    std::fs::rename(&tmp, &request)?;
+    std::fs::write(&tmp, contents)?;
+    std::fs::rename(&tmp, request)?;
     for _ in 0..30 {
         std::thread::sleep(std::time::Duration::from_millis(100));
         if !request.exists() {
             return Ok(());
         }
     }
-    let _ = std::fs::remove_file(&request);
+    let _ = std::fs::remove_file(request);
     bail!("the running flockswitch did not answer; quit it and try again")
 }
 

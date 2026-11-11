@@ -8,11 +8,21 @@
 //! On Wayland the countdown goes to a click-through layer-shell surface where the
 //! compositor has wlr-layer-shell (overlay_wayland.rs: KDE, sway, Hyprland), and on GNOME
 //! to an X11 window through XWayland when its coordinates line up with the desktop's
-//! (edge_portal.rs checks that and allows it). The cursor highlight needs the cursor
-//! position, which Wayland gives no app, so it stays X11 only.
+//! (edge_portal.rs checks that and allows it).
+//!
+//! The cursor highlight needs the cursor position, which Wayland gives an app only while
+//! the pointer is over one of its surfaces. So for the moment the highlight shows,
+//! flockswitch puts a transparent surface that takes the pointer over every screen: on
+//! GNOME an override-redirect XWayland window (`platform::Catcher`; XQueryPointer then
+//! reads the position, and goes on reading it as the pointer moves), on the layer-shell
+//! desktops one overlay-layer surface per output (overlay_wayland.rs). The compositor
+//! hands the resting pointer to a surface that appears under it. The first click while
+//! the highlight shows lands on that surface and only ends the highlight; the keyboard
+//! stays with the window that has it. An X11 session reads the cursor as always.
 
 use crate::config::{parse_color, Edge, Edges, Locate, DEFAULT_EFFECT_COLOR};
 use crate::edge::Rect;
+use crate::locate_logic::{LocatePath, CATCH_MAX, CATCH_WAIT};
 use crate::overlay_render as render;
 use crate::overlay_wayland as wayland;
 use std::sync::atomic::{AtomicU8, Ordering};
@@ -156,6 +166,18 @@ struct LocateEffect {
     started: Instant,
     color: [u8; 3],
     size: f64,
+    /// GNOME on Wayland: the window over the screens that lets XWayland follow the
+    /// pointer; it goes with the highlight.
+    catcher: Option<platform::Catcher>,
+}
+
+/// GNOME on Wayland: the catcher is on the screen, waiting for the pointer to come over it.
+struct Catching {
+    catcher: platform::Catcher,
+    since: Instant,
+    style: i32,
+    color: [u8; 3],
+    size: f64,
 }
 
 /// What is being drawn, on the connection made when the first effect was asked for.
@@ -163,22 +185,30 @@ struct Effects {
     x: Option<platform::Connection>,
     /// The layer-shell painter, when that is where this session draws.
     wl: Option<wayland::Painter>,
-    /// Trying to connect once is enough; the reason is logged when it fails.
-    tried: bool,
+    /// The drawing target (`OUTSIDE_X11`) a connection was last tried for: once per
+    /// target is enough, and the reason is logged when it fails. A Wayland session may
+    /// learn its target only later (edge_portal.rs, or the first highlight).
+    tried: Option<u8>,
     edge: Option<EdgeEffect>,
     wl_edge: Option<wayland::EdgeEffect>,
     locate: Option<LocateEffect>,
+    catching: Option<Catching>,
+    wl_locate: Option<wayland::LocateEffect>,
 }
 
 impl Effects {
     fn open(&mut self) {
-        if !self.tried {
-            self.tried = true;
-            if !crate::edge::available() && OUTSIDE_X11.load(Ordering::Relaxed) == OUTSIDE_X11_LAYER_SHELL {
+        let target = OUTSIDE_X11.load(Ordering::Relaxed);
+        if self.tried == Some(target) {
+            return;
+        }
+        self.tried = Some(target);
+        if !crate::edge::available() && target == OUTSIDE_X11_LAYER_SHELL {
+            if self.wl.is_none() {
                 self.wl = wayland::Painter::open();
-            } else {
-                self.x = platform::Connection::open();
             }
+        } else if self.x.is_none() {
+            self.x = platform::Connection::open();
         }
     }
 
@@ -227,16 +257,66 @@ impl Effects {
                 }
             }
             Command::Locate(style, color, size) => {
-                self.locate = None;
-                if render::locate_exists(style) {
-                    self.locate = self.connection().and_then(|x| begin_locate(x, style, color, size));
+                self.end_locate();
+                if !render::locate_exists(style) {
+                    return;
+                }
+                if crate::edge::available() {
+                    // An X11 session, as always.
+                    self.locate = self.connection().and_then(|x| begin_locate(x, style, color, size, None, None));
+                } else {
+                    self.locate_on_wayland(style, color, size);
                 }
             }
         }
     }
 
+    fn end_locate(&mut self) {
+        self.locate = None;
+        self.catching = None;
+        if self.wl_locate.take().is_some() {
+            if let Some(wl) = &self.wl {
+                wl.flush();
+            }
+        }
+    }
+
+    /// The highlight in a Wayland session: the pointer is caught for a moment by
+    /// surfaces over every screen (see the top of this file).
+    fn locate_on_wayland(&mut self, style: i32, color: [u8; 3], size: f64) {
+        let (path, detail) = crate::locate_wayland::path();
+        match path {
+            LocatePath::XWayland(k) => {
+                use_xwayland();
+                let catcher = self.connection().and_then(|x| x.catcher());
+                let Some(catcher) = catcher else {
+                    log::info!("locate: no XWayland window could be put over the screens ({detail}); not shown");
+                    return;
+                };
+                let (w, h) = catcher.size();
+                log::info!(
+                    "locate: through XWayland ({detail}; × {k}): a transparent {w}x{h} window over every screen takes the pointer; waiting up to {} ms for it",
+                    CATCH_WAIT.as_millis()
+                );
+                self.catching = Some(Catching { catcher, since: Instant::now(), style, color, size });
+            }
+            LocatePath::LayerShell => {
+                use_layer_shell();
+                self.open();
+                let look = wayland::LocateLook { style, color, size };
+                match self.wl.as_mut() {
+                    Some(wl) => self.wl_locate = wl.begin_locate(look),
+                    None => log::info!("locate: cannot draw on layer-shell surfaces ({detail}); not shown"),
+                }
+            }
+            // A Wayland session never chooses X11, but should it: as always.
+            LocatePath::X11 => self.locate = self.connection().and_then(|x| begin_locate(x, style, color, size, None, None)),
+            LocatePath::None(why) => log::info!("locate: not shown: {} ({detail})", why.explain()),
+        }
+    }
+
     fn animating(&self) -> bool {
-        self.edge.is_some() || self.wl_edge.is_some() || self.locate.is_some()
+        self.edge.is_some() || self.wl_edge.is_some() || self.locate.is_some() || self.catching.is_some() || self.wl_locate.is_some()
     }
 
     fn tick(&mut self) {
@@ -245,10 +325,44 @@ impl Effects {
                 self.wl_edge = None;
                 wl.flush();
             }
+            if self.wl_locate.as_mut().is_some_and(|l| !wl.draw_locate(l)) {
+                self.wl_locate = None;
+                wl.flush();
+            }
         }
         let Some(x) = self.x.as_ref() else { return };
         if self.edge.as_mut().is_some_and(|e| !draw_edge(x, e)) {
             self.edge = None;
+        }
+        if let Some(c) = self.catching.as_ref() {
+            let seen = c.catcher.events(x);
+            let waited = c.since.elapsed();
+            if let Some(at) = seen.at {
+                let c = self.catching.take().expect("checked above");
+                // The pointer is over an XWayland window now, so the X server knows where.
+                let (pos, how) = match x.cursor() {
+                    Some(p) => (p, "XQueryPointer"),
+                    None => (at, "the X event"),
+                };
+                log::info!(
+                    "locate: position {pos:?} (XWayland pixels, drawn at scale {}) from {how}, {} ms after the window appeared",
+                    x.scale(),
+                    waited.as_millis()
+                );
+                self.locate = begin_locate(x, c.style, c.color, c.size, Some(pos), Some(c.catcher));
+                if self.locate.is_none() {
+                    log::info!("locate: the highlight could not be drawn; the window over the screens is gone");
+                }
+            } else if seen.pressed {
+                log::info!("locate: a click came before the pointer was seen; nothing shown");
+                self.catching = None;
+            } else if waited >= CATCH_WAIT {
+                log::info!(
+                    "locate: the pointer did not come over the window within {} ms (the compositor did not hand it over); not shown",
+                    CATCH_WAIT.as_millis()
+                );
+                self.catching = None;
+            }
         }
         if self.locate.as_mut().is_some_and(|l| !draw_locate(x, l)) {
             self.locate = None;
@@ -257,7 +371,7 @@ impl Effects {
 }
 
 fn run(commands: Receiver<Command>) {
-    let mut effects = Effects { x: None, wl: None, tried: false, edge: None, wl_edge: None, locate: None };
+    let mut effects = Effects { x: None, wl: None, tried: None, edge: None, wl_edge: None, locate: None, catching: None, wl_locate: None };
     let mut next_frame = Instant::now();
     loop {
         let received = if effects.animating() {
@@ -342,8 +456,20 @@ fn draw_edge(x: &platform::Connection, effect: &mut EdgeEffect) -> bool {
     true
 }
 
-fn begin_locate(x: &platform::Connection, style: i32, color: [u8; 3], size: f64) -> Option<LocateEffect> {
-    let (mx, my) = x.cursor()?;
+/// Starts the highlight at the cursor, read now or given as `at` (with the window that
+/// lets XWayland follow the pointer, on GNOME's Wayland session).
+fn begin_locate(
+    x: &platform::Connection,
+    style: i32,
+    color: [u8; 3],
+    size: f64,
+    at: Option<(i32, i32)>,
+    catcher: Option<platform::Catcher>,
+) -> Option<LocateEffect> {
+    let (mx, my) = match at {
+        Some(p) => p,
+        None => x.cursor()?,
+    };
     // Only the spotlight darkens the whole display; the others follow the cursor.
     let full_screen = style == render::LOCATE_SPOTLIGHT;
     let (lx, ly, w, h) = if full_screen {
@@ -353,12 +479,23 @@ fn begin_locate(x: &platform::Connection, style: i32, color: [u8; 3], size: f64)
         (mx - side / 2, my - side / 2, side, side)
     };
     let layer = x.layer(lx, ly, w, h)?;
-    Some(LocateEffect { layer, style, full_screen, started: Instant::now(), color, size })
+    Some(LocateEffect { layer, style, full_screen, started: Instant::now(), color, size, catcher })
 }
 
 /// Draws the next frame of the highlight. False when it has finished.
 fn draw_locate(x: &platform::Connection, effect: &mut LocateEffect) -> bool {
     let t = effect.started.elapsed().as_secs_f64();
+    if let Some(c) = &effect.catcher {
+        if t >= render::LOCATE_SECONDS.min(CATCH_MAX) {
+            log::info!("locate: done after {} ms; the window over the screens is gone", (t * 1000.0).round());
+            return false;
+        }
+        // The click lands on the window over the screens: it only ends the highlight.
+        if c.events(x).pressed {
+            log::info!("locate: a click ended it after {} ms (that click goes no further)", (t * 1000.0).round());
+            return false;
+        }
+    }
     if t >= render::LOCATE_SECONDS {
         return false;
     }
@@ -386,12 +523,17 @@ mod platform {
     use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
     use std::sync::OnceLock;
     use tiny_skia::{Color, Pixmap};
+    use x11_dl::xcursor::Xcursor;
     use x11_dl::xfixes::Xlib as XFixes;
     use x11_dl::xinerama::Xlib as Xinerama;
     use x11_dl::xlib::{
-        AllocNone, CWBackPixel, CWBorderPixel, CWColormap, CWOverrideRedirect, Display, InputOutput, LSBFirst, TrueColor,
-        Visual, XErrorEvent, XImage, XSetWindowAttributes, XVisualInfo, Xlib, ZPixmap, GC,
+        AllocNone, ButtonPress, ButtonPressMask, CWBackPixel, CWBorderPixel, CWColormap, CWCursor, CWEventMask, CWOverrideRedirect,
+        Display, EnterNotify, EnterWindowMask, InputOutput, LSBFirst, MotionNotify, PointerMotionMask, TrueColor, Visual, XErrorEvent,
+        XEvent, XImage, XSetWindowAttributes, XVisualInfo, Xlib, ZPixmap, GC,
     };
+
+    /// What the catcher listens to: the pointer coming over it or moving there, a click.
+    const CATCHER_EVENTS: std::ffi::c_long = EnterWindowMask | PointerMotionMask | ButtonPressMask;
 
     /// ShapeInput from X11/extensions/shape.h: the part of a window that takes input.
     const SHAPE_INPUT: c_int = 2;
@@ -427,6 +569,8 @@ mod platform {
         scale: f64,
         /// `_NET_WM_CM_S<screen>`: owned by the running compositor.
         compositor: u64,
+        /// libXcursor, for the ordinary arrow over the catcher (None: the root window's).
+        xcursor: Option<Xcursor>,
     }
 
     fn once() -> bool {
@@ -439,7 +583,7 @@ mod platform {
         pub fn open() -> Option<Connection> {
             if !crate::edge::available() && !super::xwayland_allowed() {
                 if once() {
-                    log::info!("overlay: not drawn in this session (X11 only)");
+                    log::info!("overlay: no way to draw found in this Wayland session yet (layer shell, or XWayland lined up with the outputs)");
                 }
                 return None;
             }
@@ -474,7 +618,8 @@ mod platform {
                 let compositor = (xlib.XInternAtom)(display, name.as_ptr(), 0);
                 let scale = dpi_scale(&xlib, display);
                 let xinerama = Xinerama::open().ok();
-                Some(Connection { xlib, xfixes, xinerama, display, root, screen, visual: vinfo.visual, colormap, scale, compositor })
+                let xcursor = Xcursor::open().ok();
+                Some(Connection { xlib, xfixes, xinerama, display, root, screen, visual: vinfo.visual, colormap, scale, compositor, xcursor })
             }
         }
 
@@ -572,6 +717,135 @@ mod platform {
                 layer.gone = Some((self.xlib.XDestroyWindow, self.xlib.XFreeGC, self.xlib.XFlush, self.display));
                 layer.init_image(self);
                 Some(layer)
+            }
+        }
+    }
+
+    impl Connection {
+        /// A transparent window over the whole X screen that takes the pointer, mapped
+        /// at once (GNOME's Wayland session, through XWayland). XWayland knows where the
+        /// pointer is only while it is over one of its windows; the compositor hands the
+        /// resting pointer to a window that appears under it. Clicks land on it; keys do
+        /// not (it never takes the keyboard).
+        pub fn catcher(&self) -> Option<Catcher> {
+            // Safety: plain queries and a window made here, destroyed in `Catcher::drop`
+            // before this connection ends.
+            unsafe {
+                let (w, h) = ((self.xlib.XDisplayWidth)(self.display, self.screen), (self.xlib.XDisplayHeight)(self.display, self.screen));
+                if w <= 0 || h <= 0 {
+                    return None;
+                }
+                let mut attributes: XSetWindowAttributes = zeroed();
+                attributes.override_redirect = 1;
+                attributes.colormap = self.colormap;
+                attributes.border_pixel = 0;
+                attributes.background_pixel = 0;
+                attributes.event_mask = CATCHER_EVENTS;
+                let mut mask = CWOverrideRedirect | CWColormap | CWBorderPixel | CWBackPixel | CWEventMask;
+                let cursor = self.arrow();
+                if cursor != 0 {
+                    attributes.cursor = cursor;
+                    mask |= CWCursor;
+                }
+                let window = (self.xlib.XCreateWindow)(
+                    self.display, self.root, 0, 0, w as u32, h as u32, 0, 32, InputOutput as u32, self.visual, mask as c_ulong, &mut attributes,
+                );
+                if window == 0 {
+                    log::warn!("overlay: cannot create the window that reads the pointer");
+                    if cursor != 0 {
+                        (self.xlib.XFreeCursor)(self.display, cursor);
+                    }
+                    return None;
+                }
+                (self.xlib.XMapRaised)(self.display, window);
+                (self.xlib.XFlush)(self.display);
+                Some(Catcher {
+                    window,
+                    cursor,
+                    size: (w, h),
+                    check: self.xlib.XCheckWindowEvent,
+                    gone: Some((self.xlib.XDestroyWindow, self.xlib.XFreeCursor, self.xlib.XFlush, self.display)),
+                })
+            }
+        }
+
+        /// The theme's ordinary arrow, or 0 (then the window shows the root window's).
+        fn arrow(&self) -> c_ulong {
+            let Some(xc) = &self.xcursor else { return 0 };
+            for name in [c"default", c"left_ptr"] {
+                // Safety: a cursor loaded on our own open display, freed with the catcher.
+                let cursor = unsafe { (xc.XcursorLibraryLoadCursor)(self.display, name.as_ptr()) };
+                if cursor != 0 {
+                    return cursor;
+                }
+            }
+            0
+        }
+    }
+
+    /// What the catcher saw since it was last asked.
+    #[derive(Debug, Default)]
+    pub struct Seen {
+        /// Where the pointer came over it or moved to last (root-window pixels).
+        pub at: Option<(i32, i32)>,
+        pub pressed: bool,
+    }
+
+    /// Calls that take the catcher down, kept with it so `Drop` needs no connection.
+    type CatcherTeardown = (
+        unsafe extern "C" fn(*mut Display, u64) -> c_int,
+        unsafe extern "C" fn(*mut Display, c_ulong) -> c_int,
+        unsafe extern "C" fn(*mut Display) -> c_int,
+        *mut Display,
+    );
+
+    /// The window over the screens that takes the pointer for a moment (see `catcher`).
+    pub struct Catcher {
+        window: u64,
+        cursor: c_ulong,
+        size: (i32, i32),
+        check: unsafe extern "C" fn(*mut Display, c_ulong, std::ffi::c_long, *mut XEvent) -> c_int,
+        gone: Option<CatcherTeardown>,
+    }
+
+    impl Catcher {
+        pub fn size(&self) -> (i32, i32) {
+            self.size
+        }
+
+        /// Takes the window's events that arrived (only its own; the other windows of
+        /// this connection select none).
+        pub fn events(&self, x: &Connection) -> Seen {
+            let mut seen = Seen::default();
+            // Safety: our window on our own connection; the event is a plain out-value.
+            unsafe {
+                let mut event: XEvent = zeroed();
+                while (self.check)(x.display, self.window, CATCHER_EVENTS, &mut event) != 0 {
+                    let kind = event.get_type();
+                    if kind == EnterNotify {
+                        seen.at = Some((event.crossing.x_root, event.crossing.y_root));
+                    } else if kind == MotionNotify {
+                        seen.at = Some((event.motion.x_root, event.motion.y_root));
+                    } else if kind == ButtonPress {
+                        seen.pressed = true;
+                    }
+                }
+            }
+            seen
+        }
+    }
+
+    impl Drop for Catcher {
+        fn drop(&mut self) {
+            if let Some((destroy, free_cursor, flush, display)) = self.gone.take() {
+                // Safety: made by `Connection::catcher` on this connection, which outlives it.
+                unsafe {
+                    destroy(display, self.window);
+                    if self.cursor != 0 {
+                        free_cursor(display, self.cursor);
+                    }
+                    flush(display);
+                }
             }
         }
     }

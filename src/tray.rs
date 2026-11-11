@@ -81,7 +81,11 @@ pub fn run(shared: Arc<Shared>, open_settings: bool) -> Result<()> {
         });
     }
     if crate::hotkey::unsupported_session() {
-        log::info!("keyboard shortcuts: not available on Wayland; use the desktop's own shortcuts");
+        // Wayland: the shortcuts go through the system's shortcut service, and finding
+        // the cursor has a watcher of its own (on X11 both are hotkey.rs and edge.rs).
+        log::info!("keyboard shortcuts: Wayland session: through the system's shortcut service (GlobalShortcuts portal)");
+        crate::shortcuts_portal::spawn(shared.clone());
+        crate::locate_wayland::spawn(shared.clone());
     } else {
         match crate::hotkey::Shortcuts::new(shared.clone()) {
             Ok(s) => ui.shortcuts = Some(s),

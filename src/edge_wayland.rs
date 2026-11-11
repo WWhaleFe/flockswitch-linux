@@ -263,7 +263,6 @@ pub struct Watch {
     last_switch_text: Option<String>,
     landing_channel: Option<u8>,
     told_place: bool,
-    told_locate: bool,
 }
 
 impl Watch {
@@ -280,7 +279,6 @@ impl Watch {
             last_switch_text: None,
             landing_channel: None,
             told_place: false,
-            told_locate: false,
         }
     }
 
@@ -367,21 +365,11 @@ impl Watch {
                     log::info!("mouse is back: Wayland lets no app move the cursor, so it is not put at the {} edge", edge.name());
                 }
             }
-            if arrived && self.cfg.locate.on && self.cfg.locate.on_arrival {
-                self.tell_locate();
-            }
+            // Finding the cursor on arrival and on request is locate_wayland.rs's, which
+            // runs whether or not the edges are watched.
             self.sit.mouse_here = now_here;
         }
-        if self.shared.take_locate_request() && self.cfg.locate.on {
-            self.tell_locate();
-        }
         changed
-    }
-
-    fn tell_locate(&mut self) {
-        if !std::mem::replace(&mut self.told_locate, true) {
-            log::info!("find the cursor: not available on Wayland (no app may read the cursor position)");
-        }
     }
 
     /// Carries out what a step of the wait asked for. `place` gives, for a side, the

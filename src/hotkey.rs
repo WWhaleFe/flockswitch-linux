@@ -1,7 +1,8 @@
 //! Keyboard shortcuts that send the group to a channel. They are grabbed from the X
 //! server, so they work from any keyboard, need no extra permission, and flockswitch
 //! sees only its own shortcuts. Wayland lets no app grab keys for the whole desktop:
-//! there the desktop's own shortcut settings run `flockswitch switch <N>` instead.
+//! there they go through the system's shortcut service (shortcuts_portal.rs), and
+//! without one the desktop's own shortcut settings run `flockswitch switch <N>` instead.
 
 use crate::config::Config;
 use crate::shared::Shared;
@@ -43,7 +44,7 @@ pub fn display(text: &str) -> String {
 }
 
 /// A Wayland session: global key grabs only see keys typed into X11 windows there, so
-/// flockswitch does not register any (the settings window explains the alternative).
+/// flockswitch registers none with X and asks the system's shortcut service instead.
 pub fn unsupported_session() -> bool {
     let var = |name: &str| std::env::var(name).unwrap_or_default();
     var("XDG_SESSION_TYPE").eq_ignore_ascii_case("wayland") || !var("WAYLAND_DISPLAY").is_empty()
@@ -64,7 +65,7 @@ pub fn end_pause() {
 }
 
 /// A pause left behind by a settings window that closed mid-recording runs out.
-fn paused() -> bool {
+pub fn paused() -> bool {
     std::fs::metadata(pause_path())
         .and_then(|m| m.modified())
         .is_ok_and(|t| t.elapsed().unwrap_or_default() < Duration::from_secs(3))
@@ -88,7 +89,7 @@ impl Shortcuts {
         GlobalHotKeyEvent::set_event_handler(Some(move |ev: GlobalHotKeyEvent| {
             if ev.state == HotKeyState::Pressed {
                 match map.lock().unwrap().get(&ev.id) {
-                    Some(&LOCATE) => shared.request_locate(),
+                    Some(&LOCATE) => shared.request_locate(crate::shared::LocateSource::Shortcut),
                     Some(&channel) => shared.request_switch(channel),
                     None => {}
                 }

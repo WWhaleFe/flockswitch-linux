@@ -302,7 +302,7 @@ fn watch(shared: Arc<Shared>) {
             }
             mouse_here = now_here;
         }
-        if shared.take_locate_request() && cfg.locate.on {
+        if shared.take_locate_request().is_some() && cfg.locate.on {
             overlay::locate(&cfg.locate);
         }
         if cfg.locate.on && cfg.locate.on_shake {

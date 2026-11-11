@@ -54,6 +54,20 @@ pub struct Status {
     pub setup_pending: usize,
     /// Korean has no font yet: the menu's setup entry is in English.
     pub setup_english: bool,
+    /// The keyboard shortcuts through the system on Wayland: a `locate_logic::PortalState`
+    /// code ("bound:2", "asking", "denied", …); empty in an X11 session.
+    pub shortcuts_portal: String,
+    /// What the system bound them to, as it describes the keys.
+    pub shortcuts_bound: Vec<BoundShortcut>,
+}
+
+/// A shortcut the system registered for flockswitch (Wayland), for the settings window.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BoundShortcut {
+    /// 0 = find the cursor, 1-3 = a channel.
+    pub slot: u8,
+    /// How the system says it is triggered ("Press Ctrl+Alt+L"); empty when it has no key.
+    pub trigger: String,
 }
 
 /// What the engine sees right now, written for the settings window (a separate
@@ -85,6 +99,11 @@ pub struct StatusFile {
     pub edge_backend: String,
     #[serde(default)]
     pub edge_note: String,
+    /// The shortcuts through the system on Wayland (empty before 0.12.0, and on X11).
+    #[serde(default)]
+    pub shortcuts_portal: String,
+    #[serde(default)]
+    pub shortcuts_bound: Vec<BoundShortcut>,
 }
 
 fn status_path() -> std::path::PathBuf {
@@ -120,6 +139,31 @@ pub fn quit_request_path() -> std::path::PathBuf {
 /// move everything by writing the channel here.
 pub fn switch_request_path() -> std::path::PathBuf {
     Config::path().with_file_name("switch.request")
+}
+
+/// `flockswitch locate` (a desktop shortcut, on Wayland) asks the running copy to show
+/// where the cursor is by creating this file.
+pub fn locate_request_path() -> std::path::PathBuf {
+    Config::path().with_file_name("locate.request")
+}
+
+/// Whether `flockswitch locate` asked; the file is removed.
+pub fn take_locate_file() -> bool {
+    std::fs::remove_file(locate_request_path()).is_ok()
+}
+
+/// The settings window asks the running app to open the system's own settings for its
+/// shortcuts (GlobalShortcuts portal version 2, Wayland).
+fn configure_shortcuts_path() -> std::path::PathBuf {
+    Config::path().with_file_name("shortcuts.configure")
+}
+
+pub fn request_configure_shortcuts() {
+    let _ = std::fs::write(configure_shortcuts_path(), b"");
+}
+
+pub fn take_configure_shortcuts() -> bool {
+    std::fs::remove_file(configure_shortcuts_path()).is_ok()
 }
 
 /// The settings window ran a fix of the setup check or set an item aside: the tray app
@@ -311,8 +355,26 @@ pub struct Shared {
     switch_request: AtomicU8,
     /// Haptic waveform the edge watcher asks the engine to play on the mouse (+1; 0 = none).
     haptic_request: AtomicU8,
-    /// The locate-the-cursor shortcut was pressed.
-    locate_request: AtomicBool,
+    /// Showing where the cursor is was asked for: a `LocateSource` + 1 (0 = not asked).
+    locate_request: AtomicU8,
+}
+
+/// What asked to show where the cursor is (for the log).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LocateSource {
+    /// A shortcut flockswitch registered (X11, or the system's shortcut service on Wayland).
+    Shortcut,
+    /// `flockswitch locate`, e.g. from a custom shortcut of the desktop.
+    Command,
+}
+
+impl LocateSource {
+    pub fn name(self) -> &'static str {
+        match self {
+            LocateSource::Shortcut => "the shortcut",
+            LocateSource::Command => "`flockswitch locate`",
+        }
+    }
 }
 
 impl Shared {
@@ -327,7 +389,7 @@ impl Shared {
             stop: AtomicBool::new(false),
             switch_request: AtomicU8::new(0),
             haptic_request: AtomicU8::new(0),
-            locate_request: AtomicBool::new(false),
+            locate_request: AtomicU8::new(0),
         }
     }
 
@@ -402,6 +464,8 @@ impl Shared {
             hid_denied: st.hid_denied,
             edge_backend: st.edge_backend.clone(),
             edge_note: st.edge_note.clone(),
+            shortcuts_portal: st.shortcuts_portal.clone(),
+            shortcuts_bound: st.shortcuts_bound.clone(),
             version: env!("CARGO_PKG_VERSION").into(),
         };
         drop(st);
@@ -431,13 +495,22 @@ impl Shared {
         Some(self.haptic_request.swap(0, Ordering::SeqCst)).filter(|&w| w > 0).map(|w| w - 1)
     }
 
-    /// The locate shortcut was pressed: the screen watcher shows the cursor.
-    pub fn request_locate(&self) {
-        self.locate_request.store(true, Ordering::SeqCst);
+    /// The locate shortcut was pressed (or `flockswitch locate` ran): the screen watcher
+    /// shows the cursor.
+    pub fn request_locate(&self, source: LocateSource) {
+        let code = match source {
+            LocateSource::Shortcut => 1,
+            LocateSource::Command => 2,
+        };
+        self.locate_request.store(code, Ordering::SeqCst);
     }
 
-    pub fn take_locate_request(&self) -> bool {
-        self.locate_request.swap(false, Ordering::SeqCst)
+    pub fn take_locate_request(&self) -> Option<LocateSource> {
+        match self.locate_request.swap(0, Ordering::SeqCst) {
+            1 => Some(LocateSource::Shortcut),
+            2 => Some(LocateSource::Command),
+            _ => None,
+        }
     }
 
     pub fn stopped(&self) -> bool {
