@@ -1,4 +1,20 @@
+> [!IMPORTANT]
+> **If Homebrew can't upgrade flockswitch (Homebrew 6 or newer)**
+>
+> If `brew upgrade flockswitch` stops with `Error: Refusing to load cask wwhalefe/tap/flockswitch from untrusted tap wwhalefe/tap.`, it's because this tap's macOS cask has the same name as the Linux formula. Run once in a terminal:
+>
+> ```bash
+> brew trust --formula wwhalefe/tap/flockswitch
+> brew update && brew upgrade --formula wwhalefe/tap/flockswitch
+> brew list --versions flockswitch     # shows the new version
+> flockswitch quit                     # then start flockswitch again from the app menu
+> ```
+>
+> From 0.11.0 on, when a new version is out the app asks first (tray menu "Update available", Settings → General **Update now**) and, once you approve, runs these commands and restarts. Moving to 0.11.0 itself needs the commands above once.
+
 ### Before you install
+
+**flockswitch finds what is missing and offers to install it.** After it starts, a notification and the tray menu (**Setup needed: N…**) point to Settings → General → **Setup check**: each missing item (udev rule, Korean font, tray icon extension, desktop portal, Homebrew's app menu entry and updates) with **Install** and **Later**. Install shows the exact commands first and runs nothing until you press **Run**; your desktop asks for your password where administrator rights are needed. The commands below are the same ones, to run by hand if you prefer (or if there is no password dialog).
 
 | What | When | Install |
 |---|---|---|
@@ -6,7 +22,7 @@
 | Korean font | Only to show Korean in the settings window | `sudo apt-get install -y fonts-noto-cjk` (Fedora: `google-noto-sans-cjk-fonts`) |
 | Tray icon extension | Stock GNOME on Fedora or Debian (not Ubuntu or KDE) | `gnome-shell-extension-appindicator` (3 below) |
 | Desktop portal | Screen-edge switching on GNOME Wayland | `xdg-desktop-portal`, `xdg-desktop-portal-gnome` (usually already there, 4 below) |
-| udev rule | Always (permission to open the devices) | Part of the install commands |
+| udev rule | Always (permission to open the devices) | Part of the install commands (or the setup check) |
 
 **1. Homebrew** (skip if you have it)
 
@@ -70,7 +86,7 @@ sudo dnf install -y libxkbcommon mesa-libGL mesa-libEGL       # Fedora
 # Install
 brew install --formula wwhalefe/tap/flockswitch
 
-# First-time setup (udev rule and app menu entry)
+# First-time setup (udev rule and app menu entry); the setup check can do this for you
 sudo install -m 644 "$(brew --prefix)/opt/flockswitch/share/flockswitch/70-flockswitch.rules" /etc/udev/rules.d/
 sudo udevadm control --reload-rules
 sudo udevadm trigger --subsystem-match=hidraw
@@ -80,7 +96,7 @@ ln -sf "$(brew --prefix)/opt/flockswitch/share/applications/flockswitch.desktop"
 # Homebrew 6+: if you get an 'untrusted tap' error (installed with an older Homebrew), once
 brew trust --formula wwhalefe/tap/flockswitch
 
-# Upgrade / Uninstall
+# Upgrade (or Settings → General → Update now, which runs this after you approve) / Uninstall
 brew update && brew upgrade --formula wwhalefe/tap/flockswitch
 flockswitch uninstall && brew uninstall --formula wwhalefe/tap/flockswitch
 ```
@@ -99,6 +115,6 @@ cd flockswitch-linux-x86_64-@VERSION@
 
 ### If you see this after installing
 
-- **"Looking for devices…" at the top**: the mouse and keyboard aren't connected to this computer right now. Switch them to this computer's channel (Bluetooth takes a few seconds to connect). If it stays, check `flockswitch list`; if the General tab says "No permission to use the devices", run the udev commands above and replug the receiver.
+- **"Looking for devices…" at the top**: the mouse and keyboard aren't connected to this computer right now. Switch them to this computer's channel (Bluetooth takes a few seconds to connect). If it stays, check `flockswitch list`; if it says "No permission to use the devices", install the udev rule from the setup check on the General tab (or run the udev commands above) and replug the receiver.
 - **A red box on the Edges page**: follow the table in 4.
 - **Find the cursor says "On Wayland…"**: finding the cursor needs the cursor position, so it works in an X11 session only.

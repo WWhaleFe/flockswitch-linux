@@ -210,8 +210,8 @@ fn probe(forced: Option<String>) -> (Probe, String) {
 }
 
 /// `gnome-shell --version` ("GNOME Shell 46.0" → 46), where the D-Bus property is not
-/// readable.
-fn gnome_shell_version_command() -> Option<u32> {
+/// readable (also used by the setup check).
+pub fn gnome_shell_version_command() -> Option<u32> {
     let out = std::process::Command::new("gnome-shell").arg("--version").stderr(std::process::Stdio::null()).output().ok()?;
     let text = String::from_utf8_lossy(&out.stdout);
     let version = text.split_whitespace().find(|w| w.chars().next().is_some_and(|c| c.is_ascii_digit()))?;

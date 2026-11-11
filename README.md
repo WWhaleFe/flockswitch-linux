@@ -35,6 +35,19 @@ Install flockswitch on **every** computer you switch between, and pair each devi
 - **Screen-edge switching on Wayland**: nothing extra on KDE Plasma, sway or Hyprland. GNOME needs version 45 or newer and a desktop portal with input capture (`xdg-desktop-portal` 1.17+, `xdg-desktop-portal-gnome` 45+, usually already installed). Check: `busctl --user get-property org.freedesktop.portal.Desktop /org/freedesktop/portal/desktop org.freedesktop.portal.InputCapture version` prints a number. On GNOME 44 or older use an X11 (Xorg) session
 - Step-by-step install commands are under "Before you install" on the [release](../../releases/latest) page
 
+flockswitch looks for these itself. When something is missing it sends one notification after it starts (useful on stock GNOME, where the tray icon may be what's missing), the tray menu shows **Setup needed: N…**, and Settings → General starts with a **Setup check** card: one row per missing item with why it's needed, **Install** and **Later**. Install first shows exactly the commands that will run; nothing runs until you press **Run**. Commands that need administrator rights run through `pkexec`, so your desktop asks for your password; if that isn't possible (no pkexec, or you cancelled), the card shows the same commands with `sudo` and a **Copy commands** button for a terminal. What it can do:
+
+| Item | When it's offered | What runs |
+|---|---|---|
+| udev rule | `/etc/udev/rules.d/70-flockswitch.rules` is missing or differs from this version's, or a device couldn't be opened | writes the rule, `udevadm control --reload-rules`, `udevadm trigger --subsystem-match=hidraw` (password); then replug the receiver or reconnect Bluetooth |
+| Desktop portal | GNOME 45+ on Wayland without input capture, `xdg-desktop-portal` / `xdg-desktop-portal-gnome` missing or too old | `apt-get` / `dnf` / `zypper` / `pacman` installs them (password); then log out and in. GNOME 44 or older is told to use an X11 session instead |
+| Korean font | the window is in Korean and no font has Hangul (`fc-list :lang=ko`) | `fonts-noto-cjk` / `google-noto-sans-cjk-fonts` / `noto-sans-cjk-fonts` / `noto-fonts-cjk` (password); the window uses it at once. Until then this card is in English |
+| Tray icon | GNOME without a StatusNotifierItem host (not Ubuntu, which has one) | `gnome-shell-extension-appindicator` (password), then `gnome-extensions enable appindicatorsupport@rgcjonas.gmail.com`; log out and in |
+| App menu entry | installed with Homebrew, no menu entry yet | a link in `~/.local/share/applications` (no password) |
+| New version | installed with Homebrew and a newer release is out | `brew trust --formula wwhalefe/tap/flockswitch` (Homebrew 6+), `brew update`, `brew upgrade --formula wwhalefe/tap/flockswitch`, then flockswitch restarts into it (no password) |
+
+**Later** hides an item on this computer (kept in `config.toml` as `[setup] snoozed`, not in settings backups); **Show again** brings them back. Everything printed goes to the log. Detecting reads files and asks the session bus, `fc-list` and `dpkg-query` / `rpm -q` / `pacman -Q`; it never needs a password or the network. The manual commands below still work as before.
+
 ## Install
 
 With [Homebrew](https://brew.sh):
@@ -42,7 +55,8 @@ With [Homebrew](https://brew.sh):
 ```sh
 brew install --formula wwhalefe/tap/flockswitch
 
-# First-time setup: udev rule (once, with sudo) and app menu entry
+# First-time setup: udev rule (once, with sudo) and app menu entry. The settings
+# window's Setup check offers to do both for you.
 sudo install -m 644 "$(brew --prefix)/opt/flockswitch/share/flockswitch/70-flockswitch.rules" /etc/udev/rules.d/
 sudo udevadm control --reload-rules
 sudo udevadm trigger --subsystem-match=hidraw
@@ -50,7 +64,7 @@ mkdir -p ~/.local/share/applications
 ln -sf "$(brew --prefix)/opt/flockswitch/share/applications/flockswitch.desktop" ~/.local/share/applications/
 ```
 
-`brew update && brew upgrade --formula wwhalefe/tap/flockswitch` updates it (a Homebrew copy does not install updates itself). The tap also has a macOS cask of the same name, so without `--formula` and `wwhalefe/tap/` Homebrew tries to load the cask too and stops.
+`brew update && brew upgrade --formula wwhalefe/tap/flockswitch` updates it. A Homebrew copy never updates without asking: when a new version is out, the tray menu shows **Update available (x.y.z)…** and Settings → General offers **Update now**, which shows these commands and runs them once you press Run (with **Install updates automatically** on, a notification asks). The tap also has a macOS cask of the same name, so without `--formula` and `wwhalefe/tap/` Homebrew tries to load the cask too and stops.
 
 On Homebrew 6 or newer, if you see `Refusing to load … from untrusted tap wwhalefe/tap` (installed with an older Homebrew), run once: `brew trust --formula wwhalefe/tap/flockswitch`
 
@@ -64,7 +78,7 @@ cd flockswitch-linux-x86_64-<version>
 
 `install.sh` puts the program in `~/.local/bin`, adds flockswitch to the app menu, installs the udev rule `/etc/udev/rules.d/70-flockswitch.rules` (sudo asks for your password once) and starts flockswitch. If a receiver was plugged in, replug it once (or reconnect Bluetooth) so the rule applies.
 
-Updates install themselves: when the daily check finds a new version (or you press **Update now**), flockswitch downloads it, checks it against the release's SHA256SUMS.txt, replaces the program in `~/.local/bin` along with its app-menu entry and icon, and restarts. Turn this off in Settings → General (`flockswitch set auto_update false`); **Check now** followed by **Update now** still installs a new version whenever you ask. It never asks for sudo; if a release changes the udev rule, the log says to run `install.sh` once. A program in a folder you cannot write to (for example `/usr/bin`) is only downloaded.
+Updates install themselves: when the daily check finds a new version (or you press **Update now**), flockswitch downloads it, checks it against the release's SHA256SUMS.txt, replaces the program in `~/.local/bin` along with its app-menu entry and icon, and restarts. Turn this off in Settings → General (`flockswitch set auto_update false`); **Check now** followed by **Update now** still installs a new version whenever you ask. It never asks for a password; if a release changes the udev rule, the setup check offers the new one. A program in a folder you cannot write to (for example `/usr/bin`) is only downloaded.
 
 ## Use
 
@@ -74,7 +88,7 @@ The tray icon's menu shows the status, turns switching on or off, checks for upd
 - **Shortcuts** (on the same tab): on X11, keyboard shortcuts, one per channel (Ctrl+Alt+1 / 2 / 3 until you change them), pressed on any keyboard. The ⓘ beside the title (and beside the find-the-cursor shortcut) lists which combinations work: Ctrl and/or Alt with a number or letter (Shift may be added), or an F key; the desktop's own combinations and ones another app has taken cannot be used, and the row says so. **On Wayland** no app can register shortcuts for the whole desktop, so the tab lists commands to bind instead: in your desktop's keyboard settings, add custom shortcuts that run `~/.local/bin/flockswitch switch 1` (and `2`, `3`). The running flockswitch does the switch at once.
 - **Edges** (same tab): rest the cursor against an outer edge of the screen for a moment (0.3 to 2 s, your choice) and the group and the master mouse go to the channel set for that side. No network: each computer watches its own screen, so turn it on on every computer and give each side the channel of the computer that stands there. While it waits an effect runs down near the cursor (ring, semicircle, bar, pulse, laser, vortex, scan, liquid or random). Each effect keeps its own colour and size, and the ring, semicircle and bar their own direction (the ring and semicircle can also shrink away instead); **Random** picks an effect each time, in that effect's colour and size, with a random direction and shrink-away where it has them. You can require Ctrl to be held. When the mouse comes back, the cursor appears at the edge it left by (X11). The corners do not count, and with several displays an edge that continues onto another display does not switch. Works on X11 and, in its own way, on Wayland: see [Screen edges on Wayland](#screen-edges-on-wayland).
 - **Devices**: the master mouse, and the devices that move along (Bolt, Unifying and Bluetooth devices can be mixed; devices on another computer are listed too)
-- **General**: haptics on a mouse with a motor, currently the MX Master 4 (a summary and the **Haptics Settings…** window: on/off, strength, a pulse as the mouse leaves and one when it is back, each with its own waveform or random, rising or even pulses at an edge, and **Test** to try them), find the cursor (a pulse ring, radar, spotlight or random effect in the colour and size you choose, from a shortcut, on arrival from another computer, or by shaking the mouse for 0.5 to 2 s without a pause, optionally only while Ctrl, Alt or Shift is held (X11 session with a compositor)), language (Korean or English), start at login, updates (check for a new version, install it automatically or with **Update now**), report to the developer, settings backup (below), reset settings, uninstall. The settings window opens tall enough for the whole General tab, and grows (as far as the screen allows) when a page needs more room
+- **General**: haptics on a mouse with a motor, currently the MX Master 4 (a summary and the **Haptics Settings…** window: on/off, strength, a pulse as the mouse leaves and one when it is back, each with its own waveform or random, rising or even pulses at an edge, and **Test** to try them), find the cursor (a pulse ring, radar, spotlight or random effect in the colour and size you choose, from a shortcut, on arrival from another computer, or by shaking the mouse for 0.5 to 2 s without a pause, optionally only while Ctrl, Alt or Shift is held (X11 session with a compositor)), language (Korean or English), start at login, updates (check for a new version, install it automatically or with **Update now**), report to the developer, settings backup (below), reset settings, uninstall, and at the top the setup check when something is missing (above). The settings window opens tall enough for the whole General tab, and grows (as far as the screen allows) when a page needs more room
 
 Linux has no Logi Options+, so no button has to be set aside first. If you use **Solaar**, give the buttons you turn on in flockswitch no Solaar setting or rule; both apps can stay installed otherwise. When flockswitch quits or a button is turned off, the button is put back exactly as it was.
 
@@ -115,7 +129,7 @@ Open a [problem report](../../issues/new/choose) with:
 - your distribution, desktop (GNOME, KDE, …) and session (X11 or Wayland), and how the devices connect (Bolt / Unifying / Bluetooth)
 - `~/.config/flockswitch/flockswitch.log`
 
-"No permission to use the devices" in the settings window means the udev rule is missing: run `./install.sh` again (installed with Homebrew: the udev commands `brew info --formula wwhalefe/tap/flockswitch` shows), then replug the receiver.
+"No permission to use the devices" in the settings window means the udev rule is missing: install it from the setup check on the General tab (or run `./install.sh` again; installed with Homebrew: the udev commands `brew info --formula wwhalefe/tap/flockswitch` shows), then replug the receiver.
 
 ## Status
 

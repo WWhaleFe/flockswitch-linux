@@ -9,8 +9,10 @@
 //! `auto_update` is on) unpacks the release next to the running program, checks that
 //! the new program runs, renames it over the old one (Linux lets a running program's
 //! file be replaced that way), refreshes the menu entry install.sh made, and starts the
-//! new version, which takes over from this one. A Homebrew install is left to
-//! `brew upgrade`, and a program in a folder this user cannot write is only downloaded.
+//! new version, which takes over from this one. A Homebrew install is updated by
+//! `brew upgrade` once the user approved it in the settings window (setup.rs; the
+//! automatic install only asks, with a notification), and a program in a folder this
+//! user cannot write is only downloaded.
 
 use anyhow::{anyhow, bail, Context, Result};
 use serde::Deserialize;
@@ -91,7 +93,7 @@ pub fn install_into(shared: std::sync::Arc<crate::shared::Shared>, release: Rele
     let exe = match install_kind() {
         InstallKind::SelfReplace(exe) => exe,
         InstallKind::Homebrew => {
-            log::info!("update {}: installed with Homebrew; update with `{BREW_UPGRADE}`", release.version);
+            log::info!("update {}: installed with Homebrew; brew installs it once approved in the settings window (`{BREW_UPGRADE}`)", release.version);
             return;
         }
         InstallKind::DownloadOnly if automatic => {
@@ -387,12 +389,13 @@ fn write_atomic(path: &Path, bytes: &[u8], mode: u32) -> Result<()> {
     std::fs::rename(&tmp, path).with_context(|| format!("cannot replace {}", path.display()))
 }
 
-/// The udev rule needs sudo, which an update never asks for: say so when it changed.
+/// The udev rule needs root, which an update never asks for: say so when it changed.
+/// The new version's setup check offers it (with the password dialog) once it runs.
 fn check_udev_rule(files: &Path) {
     const RULE: &str = "/etc/udev/rules.d/70-flockswitch.rules";
     let new = std::fs::read(files.join("70-flockswitch.rules")).ok();
     if new.is_some() && new != std::fs::read(RULE).ok() {
-        log::warn!("update: the release's udev rule differs from {RULE}; run install.sh from the release once to update it (it asks for sudo)");
+        log::warn!("update: the release's udev rule differs from {RULE}; Settings → General → Setup check offers to install it (or run install.sh from the release)");
     }
 }
 

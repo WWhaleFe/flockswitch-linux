@@ -30,6 +30,19 @@ flockswitch는 **MX Master 3**와 **MX Master 4**를 바탕으로 만들고 시�
 - **Wayland에서 화면 모서리 전환**: KDE Plasma·sway·Hyprland는 따로 필요한 것이 없습니다. GNOME은 45 이상과 입력 캡처를 지원하는 데스크톱 포털(`xdg-desktop-portal` 1.17 이상, `xdg-desktop-portal-gnome` 45 이상, 보통 이미 설치됨)이 필요합니다. 확인: `busctl --user get-property org.freedesktop.portal.Desktop /org/freedesktop/portal/desktop org.freedesktop.portal.InputCapture version`에 숫자가 나오면 됩니다. GNOME 44 이하는 X11(Xorg) 세션에서 쓰세요
 - 설치 명령을 단계별로 정리한 안내는 [릴리스](../../releases/latest) 페이지의 "설치 전에 준비할 것"에 있습니다
 
+이 항목들은 flockswitch가 직접 확인합니다. 빠진 것이 있으면 시작한 뒤 알림을 한 번 보내고(트레이 아이콘이 빠진 기본 GNOME에서 유용), 트레이 메뉴에 **설정 필요 항목 N개…**가 생기며, 설정 → 일반 맨 위에 **설치·설정 점검** 카드가 나옵니다. 빠진 항목마다 필요한 이유와 **설치**·**나중에** 버튼이 있습니다. 설치를 누르면 실행할 명령을 그대로 먼저 보여 주고, **실행**을 눌러야 시작합니다. 관리자 권한이 필요한 명령은 `pkexec`로 실행해 데스크톱이 비밀번호를 묻습니다. 그렇게 할 수 없으면(pkexec가 없거나 취소함) 같은 명령을 `sudo`를 붙여 보여 주고 **명령 복사** 버튼으로 터미널에 붙여 넣을 수 있게 합니다. 할 수 있는 일:
+
+| 항목 | 알려 주는 경우 | 실행하는 것 |
+|---|---|---|
+| udev 규칙 | `/etc/udev/rules.d/70-flockswitch.rules`가 없거나 이 버전의 규칙과 다를 때, 또는 장치를 열 권한이 없을 때 | 규칙 쓰기, `udevadm control --reload-rules`, `udevadm trigger --subsystem-match=hidraw` (비밀번호). 그다음 수신기를 뺐다 꽂거나 블루투스를 다시 연결 |
+| 데스크톱 포털 | Wayland의 GNOME 45 이상에서 입력 캡처가 없고 `xdg-desktop-portal`·`xdg-desktop-portal-gnome`이 없거나 오래되었을 때 | `apt-get`·`dnf`·`zypper`·`pacman`으로 설치 (비밀번호). 그다음 로그아웃 후 다시 로그인. GNOME 44 이하는 설치 대신 X11 세션을 안내 |
+| 한글 글꼴 | 창이 한국어이고 한글 글꼴이 없을 때(`fc-list :lang=ko`) | `fonts-noto-cjk`·`google-noto-sans-cjk-fonts`·`noto-sans-cjk-fonts`·`noto-fonts-cjk` (비밀번호). 설치하면 창이 바로 그 글꼴을 씀. 그 전까지 이 카드는 영어로 표시 |
+| 트레이 아이콘 | StatusNotifierItem을 보여 줄 곳이 없는 GNOME (이미 있는 Ubuntu는 제외) | `gnome-shell-extension-appindicator` (비밀번호), 이어서 `gnome-extensions enable appindicatorsupport@rgcjonas.gmail.com`. 그다음 로그아웃 후 다시 로그인 |
+| 앱 메뉴 항목 | Homebrew로 설치했고 앱 메뉴 항목이 없을 때 | `~/.local/share/applications`에 링크 만들기 (비밀번호 없음) |
+| 새 버전 | Homebrew로 설치했고 새 릴리스가 있을 때 | `brew trust --formula wwhalefe/tap/flockswitch`(Homebrew 6 이상), `brew update`, `brew upgrade --formula wwhalefe/tap/flockswitch` 후 새 버전으로 다시 시작 (비밀번호 없음) |
+
+**나중에**를 누른 항목은 이 컴퓨터에서 다시 알리지 않으며(`config.toml`의 `[setup] snoozed`, 설정 백업에는 넣지 않음) **다시 보기**로 되돌릴 수 있습니다. 실행 중 출력은 모두 로그에 남습니다. 확인할 때는 파일을 읽고 세션 버스, `fc-list`, `dpkg-query`·`rpm -q`·`pacman -Q`에 물어볼 뿐 비밀번호나 네트워크가 필요하지 않습니다. 아래의 직접 설치 명령도 그대로 쓸 수 있습니다.
+
 ## 설치
 
 [Homebrew](https://brew.sh)를 쓰면:
@@ -37,7 +50,8 @@ flockswitch는 **MX Master 3**와 **MX Master 4**를 바탕으로 만들고 시�
 ```sh
 brew install --formula wwhalefe/tap/flockswitch
 
-# 최초 1회: udev 규칙 설치(sudo) 및 앱 메뉴 추가
+# 최초 1회: udev 규칙 설치(sudo) 및 앱 메뉴 추가. 설정 창의 설치·설정 점검이
+# 둘 다 대신 해 줄 수 있습니다.
 sudo install -m 644 "$(brew --prefix)/opt/flockswitch/share/flockswitch/70-flockswitch.rules" /etc/udev/rules.d/
 sudo udevadm control --reload-rules
 sudo udevadm trigger --subsystem-match=hidraw
@@ -45,7 +59,7 @@ mkdir -p ~/.local/share/applications
 ln -sf "$(brew --prefix)/opt/flockswitch/share/applications/flockswitch.desktop" ~/.local/share/applications/
 ```
 
-업데이트는 `brew update && brew upgrade --formula wwhalefe/tap/flockswitch`입니다 (Homebrew로 설치한 flockswitch는 스스로 업데이트를 설치하지 않습니다). 이 탭에는 같은 이름의 macOS용 cask가 함께 있어서, `--formula`와 `wwhalefe/tap/`을 빼면 Homebrew가 cask까지 읽으려다 멈춥니다.
+업데이트는 `brew update && brew upgrade --formula wwhalefe/tap/flockswitch`입니다. Homebrew로 설치한 flockswitch는 묻지 않고 업데이트하지 않습니다: 새 버전이 나오면 트레이 메뉴에 **업데이트 가능 (x.y.z)…**가 생기고, 설정 → 일반의 **지금 업데이트**가 이 명령을 보여 준 뒤 실행을 누르면 실행합니다('새 버전 자동 설치'가 켜져 있으면 알림으로 묻습니다). 이 탭에는 같은 이름의 macOS용 cask가 함께 있어서, `--formula`와 `wwhalefe/tap/`을 빼면 Homebrew가 cask까지 읽으려다 멈춥니다.
 
 Homebrew 6 이상에서 `Refusing to load … from untrusted tap wwhalefe/tap` 오류가 나면(그 전 버전에서 설치한 경우), 한 번만 실행하세요: `brew trust --formula wwhalefe/tap/flockswitch`
 
@@ -59,7 +73,7 @@ cd flockswitch-linux-x86_64-<버전>
 
 `install.sh`는 프로그램을 `~/.local/bin`에 넣고, 앱 메뉴에 flockswitch를 추가하고, udev 규칙 `/etc/udev/rules.d/70-flockswitch.rules`를 설치한 뒤(sudo가 비밀번호를 한 번 묻습니다) flockswitch를 실행합니다. 수신기가 꽂혀 있었다면 규칙이 적용되도록 한 번 뺐다 꽂아 주세요(블루투스는 다시 연결).
 
-업데이트는 저절로 설치됩니다: 하루 한 번 확인할 때 새 버전을 찾으면(또는 **지금 업데이트**를 누르면) 내려받아 릴리스의 SHA256SUMS.txt와 비교한 뒤, `~/.local/bin`의 프로그램과 앱 메뉴 항목·아이콘을 바꾸고 flockswitch를 다시 시작합니다. 설정 → 일반에서 끌 수 있습니다(`flockswitch set auto_update false`). 꺼 두어도 **지금 확인** 뒤 **지금 업데이트**를 누르면 언제든 설치합니다. sudo는 묻지 않으며, 새 릴리스에서 udev 규칙이 바뀌었으면 로그에 `install.sh`를 한 번 실행하라고 남깁니다. 쓸 수 없는 폴더(예: `/usr/bin`)에 있는 프로그램은 내려받기만 합니다.
+업데이트는 저절로 설치됩니다: 하루 한 번 확인할 때 새 버전을 찾으면(또는 **지금 업데이트**를 누르면) 내려받아 릴리스의 SHA256SUMS.txt와 비교한 뒤, `~/.local/bin`의 프로그램과 앱 메뉴 항목·아이콘을 바꾸고 flockswitch를 다시 시작합니다. 설정 → 일반에서 끌 수 있습니다(`flockswitch set auto_update false`). 꺼 두어도 **지금 확인** 뒤 **지금 업데이트**를 누르면 언제든 설치합니다. 비밀번호는 묻지 않으며, 새 릴리스에서 udev 규칙이 바뀌었으면 설치·설정 점검이 새 규칙 설치를 권합니다. 쓸 수 없는 폴더(예: `/usr/bin`)에 있는 프로그램은 내려받기만 합니다.
 
 ## 사용
 
@@ -79,6 +93,7 @@ cd flockswitch-linux-x86_64-<버전>
 | 일반 | 마우스 찾기 | 단축키, 다른 컴퓨터에서 도착, 마우스 흔들기로 커서 주변에 펄스 링·레이더·스포트라이트·랜덤 효과를 고른 색과 크기로 표시 (X11 세션과 컴포지터 필요). 흔들기는 0.5~2초 동안 쉬지 않고 흔들어야 하며, Ctrl·Alt·Shift를 누른 동안에만 반응하게 할 수 있음 |
 | 일반 | 설정 백업 | 저장(문서/flockswitch 폴더에 파일로, 10개까지), 불러오기(저장한 파일을 최신순으로 고르고 확인한 뒤 모든 설정을 바꿈), 관리(이름 바꾸기·삭제), 폴더 열기 |
 | 일반 | 초기화 | 언어를 뺀 모든 설정을 처음 상태로 되돌리기 |
+| 일반 | 설치·설정 점검 | 빠진 것이 있을 때만 맨 위에 표시. 항목마다 이유, 설치(명령을 먼저 보여 주고 실행을 눌러야 시작), 나중에 (위 참고) |
 | 일반 | 시작하기 전에 | Solaar와 함께 쓸 때의 주의, udev 규칙 안내 |
 | 일반 | 업데이트 | 새 버전 확인(자동/지금), 자동 설치 또는 **지금 업데이트** |
 | 일반 | 개발자에게 | 메일 앱 열기(버전·장치 정보 자동 기입), 주소 복사, GitHub 신고 |
@@ -125,7 +140,7 @@ flockswitch는 이 PC에 연결된 Logitech 장치와 통신합니다. 인터넷
 - 배포판, 데스크톱(GNOME, KDE 등)과 세션(X11 / Wayland), 연결 방식(Bolt / Unifying / 블루투스)
 - `~/.config/flockswitch/flockswitch.log`
 
-설정 창에 "장치에 접근할 권한이 없습니다"가 보이면 udev 규칙이 없는 것입니다. `./install.sh`를 다시 실행하고(Homebrew로 설치했다면 `brew info --formula wwhalefe/tap/flockswitch`에 나오는 udev 명령) 수신기를 뺐다 꽂아 주세요.
+설정 창에 "장치에 접근할 권한이 없습니다"가 보이면 udev 규칙이 없는 것입니다. 일반 탭의 설치·설정 점검에서 설치하거나(직접 하려면 `./install.sh`를 다시 실행, Homebrew로 설치했다면 `brew info --formula wwhalefe/tap/flockswitch`에 나오는 udev 명령) 수신기를 뺐다 꽂아 주세요.
 
 ## 시험 현황
 

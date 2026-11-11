@@ -18,6 +18,8 @@ mod overlay;
 mod overlay_render;
 mod overlay_wayland;
 mod settings_ui;
+mod setup;
+mod setup_logic;
 mod shared;
 mod tray;
 mod update;
@@ -149,15 +151,27 @@ fn real_main(args: &[String]) -> Result<()> {
         "run" => run_headless(),
         "settings" => {
             // One settings window at a time. Opening it again knocks on the open
-            // window's port (nothing is sent), which brings that window to the front.
+            // window's port (sending only the page asked for, if any), which brings that
+            // window to the front.
             let addr = std::net::SocketAddr::from(([127, 0, 0, 1], INSTANCE_PORT + 1));
             let Some(lock) = std::net::TcpListener::bind(addr).ok() else {
-                let _ = std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_secs(1));
+                // "setup" or "update" also turns it to the General tab.
+                if let Ok(mut knock) = std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_secs(1)) {
+                    if let Some(page) = args.get(1) {
+                        use std::io::Write;
+                        let _ = knock.write_all(page.as_bytes());
+                    }
+                }
                 return Ok(());
             };
-            // `settings update` opens on the General tab, where the new version is.
-            let update = args.get(1).map(String::as_str) == Some("update");
-            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| settings_ui::run(lock, update)))
+            // `settings update` opens on the General tab, where the new version is, and
+            // `settings setup` there too, for the setup check (tray menu, notification).
+            let opening = match args.get(1).map(String::as_str) {
+                Some("update") => settings_ui::Opening::Update,
+                Some("setup") => settings_ui::Opening::Setup,
+                _ => settings_ui::Opening::Default,
+            };
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| settings_ui::run(lock, opening)))
                 .unwrap_or_else(|_| Err(anyhow::anyhow!("the settings window crashed")));
             match result {
                 // Nothing left to try: say so instead of failing silently.

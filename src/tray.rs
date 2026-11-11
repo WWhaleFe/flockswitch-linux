@@ -26,6 +26,8 @@ enum Action {
     ShowDownload,
     ReleasePage,
     Report,
+    /// The settings window on the General tab: the setup check, or a Homebrew update.
+    OpenSetup,
     Quit,
 }
 
@@ -48,6 +50,9 @@ pub fn run(shared: Arc<Shared>, open_settings: bool) -> Result<()> {
     spawn_update_check(shared.clone());
     crate::overlay::set_ready();
     crate::edge_wayland::spawn(shared.clone());
+    // What this computer still lacks (udev rule, tray extension, …): counted in the
+    // menu, one notification; nothing is installed from here.
+    crate::setup::spawn_watch(shared.clone());
 
     let mut ui = Ui {
         shared: shared.clone(),
@@ -257,6 +262,11 @@ impl Ui {
         if let Some(last) = &st.last_switch {
             let _ = menu.append(&MenuItem::new(format!("{}: {} {last}", t.last_switch, t.channel), false, None));
         }
+        // Prerequisites the setup check found missing: the settings window installs them.
+        if st.setup_pending > 0 {
+            let tt = if st.setup_english { crate::i18n::english() } else { t };
+            let _ = menu.append(&self.item(format!("⚠ {}", tt.tray_setup.replace("{n}", &st.setup_pending.to_string())), Action::OpenSetup));
+        }
         let _ = menu.append(&PredefinedMenuItem::separator());
 
         let enabled = self.check(t.enabled, cfg.enabled, true, Action::Enabled);
@@ -293,13 +303,14 @@ impl Ui {
         self.actions.insert(check.id().clone(), Action::CheckUpdate);
         let _ = menu.append(&check);
         match &st.update {
-            // Install where this copy can replace itself; Homebrew updates it itself.
-            U::Available(_) | U::DownloadFailed(_) | U::InstallFailed(_) => match crate::update::install_kind() {
+            // Install where this copy can replace itself. A Homebrew copy is updated by
+            // brew once approved in the settings window.
+            U::Available(r) | U::DownloadFailed(r) | U::InstallFailed(r) => match crate::update::install_kind() {
                 crate::update::InstallKind::SelfReplace(_) => {
                     let _ = menu.append(&self.item(t.update_now, Action::InstallUpdate));
                 }
                 crate::update::InstallKind::Homebrew => {
-                    let _ = menu.append(&MenuItem::new(t.update_brew, false, None));
+                    let _ = menu.append(&self.item(t.tray_update.replace("{version}", &r.version), Action::OpenSetup));
                 }
                 crate::update::InstallKind::DownloadOnly => {
                     let _ = menu.append(&self.item(t.menu_download, Action::DownloadUpdate));
@@ -333,6 +344,7 @@ impl Ui {
                 }
             }
             Action::Settings => open_settings_window(),
+            Action::OpenSetup => open_settings_page("setup"),
             Action::CheckUpdate => {
                 let shared = self.shared.clone();
                 std::thread::spawn(move || {
@@ -407,6 +419,12 @@ fn spawn_update_check(shared: Arc<Shared>) {
 /// Starts the settings window as a separate process of this same program.
 pub fn open_settings_window() {
     start_settings(&["settings"]);
+}
+
+/// The settings window opened on a page: "setup" or "update" (both the General tab).
+/// One already open comes to the front instead.
+pub fn open_settings_page(page: &str) {
+    start_settings(&["settings", page]);
 }
 
 fn start_settings(args: &[&str]) {

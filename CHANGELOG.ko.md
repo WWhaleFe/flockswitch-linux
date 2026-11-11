@@ -1,5 +1,15 @@
 # 변경 기록
 
+## 0.11.0 — 2026-11-11
+
+- **설치·설정 점검**: flockswitch가 이 컴퓨터에 빠진 것을 찾아, 승인하면 설치합니다. 설정 → 일반 맨 위에 빠진 것이 있을 때만 카드가 나오며, 항목마다 필요한 이유와 **설치**(경우에 따라 **추가**, **켜기**, **업데이트**)와 **나중에**가 있습니다. 설치를 누르면 실행할 명령과 비밀번호를 묻는지를 그대로 먼저 보여 주고, **실행**을 눌러야 시작합니다. 관리자 권한이 필요한 단계는 항목마다 `pkexec /bin/sh -c '…'` 한 번(정해진 명령만)으로 실행해 데스크톱의 비밀번호 창이 뜹니다. pkexec가 없거나 비밀번호 창을 취소하면 같은 명령을 `sudo`를 붙여 보여 주고 **명령 복사** 버튼을 둡니다. 실행 후 그 줄에 결과(완료와 다음에 할 일, 또는 종료 코드와 마지막 출력)를 보여 주고, 출력은 모두 로그에 남기며, 다시 점검합니다
+- 점검하는 것: **udev 규칙**(없거나 이 버전과 다르거나 장치를 열 권한이 없을 때. 규칙을 쓰고 udev에 다시 읽혀 적용한 뒤 장치를 다시 찾음. 수신기를 뺐다 꽂거나 블루투스를 다시 연결), GNOME 45 이상 Wayland에서 입력 캡처가 없을 때 모서리 전환용 **데스크톱 포털**(`xdg-desktop-portal`, `xdg-desktop-portal-gnome`을 apt-get·dnf·zypper·pacman으로 설치한 뒤 다시 로그인. GNOME 44 이하는 설치할 것 없이 X11 세션을 안내), 창이 한국어인데 `fc-list :lang=ko`에 글꼴이 없을 때 **한글 글꼴**(설치하면 창이 바로 불러옴. 그 전까지 카드는 영어), StatusNotifierItem을 보여 줄 곳이 없는 GNOME의 **트레이 아이콘**(`gnome-shell-extension-appindicator` 설치 후 `gnome-extensions enable appindicatorsupport@rgcjonas.gmail.com`. Ubuntu는 이미 있음), Homebrew 설치의 **앱 메뉴 항목**(`~/.local/share/applications`에 링크), Homebrew 설치의 **새 버전**
+- Homebrew 업데이트: 일반 탭의 **지금 업데이트**(설치·설정 점검)가 Homebrew 6 이상이면 `brew trust --formula wwhalefe/tap/flockswitch`, 이어서 `brew update`와 `brew upgrade --formula wwhalefe/tap/flockswitch`를 실행한 뒤 `$(brew --prefix)/bin/flockswitch`의 새 버전으로 다시 시작하고 설정 창을 다시 엽니다. brew는 PATH가 아니라 프로그램 경로, `$HOMEBREW_PREFIX`, `/home/linuxbrew/.linuxbrew`에서 찾습니다. '새 버전 자동 설치'가 켜져 있어도 Homebrew 설치는 먼저 묻습니다: 새 버전이 있다고 알림을 보냅니다. `install.sh`로 설치한 경우는 전처럼 스스로 업데이트합니다
+- 트레이: **설정 필요 항목 N개…**와 (Homebrew) **업데이트 가능 (x.y.z)…**가 설정 창의 일반 탭을 열고, 시작할 때마다 알림을 한 번만 보냅니다(누르면 같은 화면). 트레이에서 바로 설치하지는 않습니다
+- **나중에**를 누른 항목은 이 컴퓨터에서 다시 알리지 않습니다(`config.toml`의 `[setup] snoozed`. 설정 백업에는 넣지 않고, 초기화와 불러오기에도 유지). 새 버전은 그 버전만 미룹니다. **다시 보기**로 되돌릴 수 있습니다
+- 점검은 파일을 읽고 세션 버스, `fc-list`, `dpkg-query`·`rpm -q`·`pacman -Q`, `gsettings`, `brew --version`에 물어볼 뿐이라 비밀번호도 네트워크도 필요 없습니다. X11 세션에서는 포털을 점검하지 않습니다
+- "장치에 접근할 권한이 없습니다" 안내와 모서리 페이지의 빨간 안내에 설치·설정 점검으로 가는 버튼을 넣었습니다. README와 릴리스 노트에 앱이 빠진 것을 찾아 설치를 권한다고 적고, 직접 설치하는 명령도 그대로 남겼습니다
+
 ## 0.10.2 — 2026-11-11
 
 - Homebrew 업그레이드 안내를 고쳤습니다. 이 탭에는 같은 이름의 macOS용 cask가 함께 있어서, Homebrew 6 이상에서 `brew upgrade flockswitch`가 cask까지 읽으려다 `Refusing to load cask … from untrusted tap` 오류로 멈췄습니다. 설정 창·트레이 메뉴·로그의 안내와 README, 릴리스 노트, `brew info`를 모두 `brew upgrade --formula wwhalefe/tap/flockswitch`로 바꾸고, 예전에 설치했다면 한 번만 `brew trust --formula wwhalefe/tap/flockswitch`를 실행하라고 적었습니다

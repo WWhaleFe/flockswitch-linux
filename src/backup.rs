@@ -68,7 +68,8 @@ fn export_to(dir: &Path, cfg: &Config, host: &str, stamp: &str, when: &str) -> R
 
 /// The file's content: a header saying where it came from, then the settings.
 pub fn export_text(cfg: &Config, host: &str, when: &str) -> Result<String> {
-    let settings = cfg.to_text()?;
+    // What the setup check set aside is about this computer, not the settings.
+    let settings = Config { setup: Default::default(), ..cfg.clone() }.to_text()?;
     Ok(format!(
         "# flockswitch settings\n\
          # Saved by flockswitch {} for Linux on {host}, {when}\n\
@@ -389,6 +390,18 @@ mod tests {
         assert!(same(&back, &c), "{text}");
         assert_eq!(back.locate.shake_key, ShakeKey::Alt);
         assert_eq!(back.follow, vec!["B366".to_string(), "MX Keys".to_string()]);
+    }
+
+    #[test]
+    fn setup_items_set_aside_stay_on_this_computer() {
+        let mut c = Config::default();
+        c.setup.snoozed = vec!["tray-icon".into()];
+        assert!(c.to_text().unwrap().contains("[setup]"));
+        let text = export_text(&c, "desk", "2026-11-11 10:00:00").unwrap();
+        assert!(!text.contains("[setup]") && !text.contains("tray-icon"), "{text}");
+        assert!(parse(&text).unwrap().setup.is_empty());
+        // Nothing set aside: no [setup] table in the settings file either.
+        assert!(!Config::default().to_text().unwrap().contains("[setup]"));
     }
 
     #[test]

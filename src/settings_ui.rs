@@ -11,6 +11,8 @@ use crate::config::{
 use crate::device::waveform;
 use crate::hotkey::LOCATE;
 use crate::i18n::{texts, Texts};
+use crate::setup;
+use crate::setup_logic::{self, After, Item, ItemId, State as SetupState, Why};
 use crate::shared::{self, DeviceInfo, HapticPreview, StatusFile};
 use crate::update::{self, Release};
 use crate::window_size::SizeGuard;
@@ -20,6 +22,7 @@ use eframe::egui::{
     self, Align2, Color32, CornerRadius, FontFamily, FontId, Margin, Pos2, Rect, Response, RichText, Role,
     Sense, Stroke, StrokeKind, Ui, UiBuilder, Vec2, WidgetInfo,
 };
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -42,10 +45,20 @@ const SCREEN_MARGIN: f32 = 90.0;
 const ICON_SIDE: u32 = 96;
 const ICON_RGBA: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/window-icon.rgba"));
 
+/// Which page the window opens on.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Opening {
+    Default,
+    /// The General tab, checking for a new version (the "new version" menu item).
+    Update,
+    /// The General tab, for the setup check (its menu entry and notification).
+    Setup,
+}
+
 /// Opens the window. `lock` keeps a second window from opening; a connection to it
-/// means "Settings…" was chosen again, so the window comes back to the front.
-/// `show_update` opens on the General tab (from the "new version" menu item).
-pub fn run(lock: std::net::TcpListener, show_update: bool) -> Result<()> {
+/// means "Settings…" was chosen again, so the window comes back to the front (and to
+/// the General tab when the connection says "setup" or "update").
+pub fn run(lock: std::net::TcpListener, opening: Opening) -> Result<()> {
     if let Ok(cfg) = Config::load_or_create() {
         crate::i18n::set_language(&cfg.language);
     }
@@ -72,14 +85,28 @@ pub fn run(lock: std::net::TcpListener, show_update: bool) -> Result<()> {
             install_fonts(&cc.egui_ctx);
             install_style(&cc.egui_ctx);
             let raise = Arc::new(AtomicBool::new(false));
-            let (ctx, flag) = (cc.egui_ctx.clone(), raise.clone());
+            let general = Arc::new(AtomicBool::new(false));
+            let (ctx, flag, to_general) = (cc.egui_ctx.clone(), raise.clone(), general.clone());
             std::thread::spawn(move || {
-                for _ in lock.incoming() {
+                for knock in lock.incoming() {
+                    // An older copy knocks without a word; a page name follows otherwise.
+                    let mut page = [0u8; 16];
+                    let n = knock
+                        .ok()
+                        .and_then(|mut s| {
+                            use std::io::Read;
+                            let _ = s.set_read_timeout(Some(Duration::from_millis(300)));
+                            s.read(&mut page).ok()
+                        })
+                        .unwrap_or(0);
+                    if matches!(&page[..n], b"setup" | b"update") {
+                        to_general.store(true, Ordering::Relaxed);
+                    }
                     flag.store(true, Ordering::Relaxed);
                     ctx.request_repaint();
                 }
             });
-            Ok(Box::new(SettingsApp::new(&cc.egui_ctx, raise, show_update)))
+            Ok(Box::new(SettingsApp::new(&cc.egui_ctx, raise, general, opening)))
         }),
     )
     .map_err(|e| anyhow!("cannot open the settings window: {e}"))
@@ -342,6 +369,53 @@ struct SettingsApp {
     grown_for: f32,
     /// Whether the window's first size was checked against the monitor.
     fitted_to_screen: bool,
+    /// The setup check at the top of the General tab.
+    setup: SetupUi,
+    /// The tray menu or a notification asked for the General tab while the window was open.
+    to_general: Arc<AtomicBool>,
+}
+
+/// The setup check: what is missing, and the fixes the user approved.
+#[derive(Default)]
+struct SetupUi {
+    /// What the last check found (None until the first one is done).
+    found: Arc<Mutex<Option<Vec<Item>>>>,
+    /// What the last check was started with; a change starts another.
+    asked: Option<setup::Inputs>,
+    checking: Arc<AtomicBool>,
+    /// A fix finished: check again.
+    stale: Arc<AtomicBool>,
+    /// The fixes run from this window and how they went, shown until it closes.
+    runs: Arc<Mutex<HashMap<ItemId, SetupRun>>>,
+    /// The item whose commands wait for Run or Cancel.
+    confirm: Option<Item>,
+    /// Whose commands were just copied ("Copied" for a moment).
+    copied: Option<(ItemId, Instant)>,
+    /// The Korean font installed from here was loaded.
+    fonts_reloaded: bool,
+    /// The running flockswitch had a device open since this window opened.
+    devices_seen: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum SetupRun {
+    Running,
+    Done(After),
+    /// brew ran, but Homebrew does not have the new version yet.
+    BrewSame,
+    /// Upgraded with brew while no tray app runs: the next start is the new version.
+    BrewInstalled,
+    /// No administrator rights: the same commands, with sudo, for a terminal.
+    NoAdmin(String),
+    Failed { code: Option<i32>, tail: Vec<String>, terminal: String },
+}
+
+/// What a row of the setup card asks for.
+enum SetupAction {
+    Install(Item),
+    Later(Item),
+    ShowAgain,
+    Copy(ItemId, String),
 }
 
 /// Choosing a saved settings file to load.
@@ -433,12 +507,12 @@ enum UpdateUi {
 }
 
 impl SettingsApp {
-    fn new(ctx: &egui::Context, raise: Arc<AtomicBool>, show_update: bool) -> SettingsApp {
+    fn new(ctx: &egui::Context, raise: Arc<AtomicBool>, to_general: Arc<AtomicBool>, opening: Opening) -> SettingsApp {
         let autostart = crate::tray::autostart();
         let autostart_on = autostart.as_ref().is_some_and(|a| a.is_enabled().unwrap_or(false));
         let image = egui::ColorImage::from_rgba_unmultiplied([ICON_SIDE as usize; 2], ICON_RGBA);
         let mut app = SettingsApp {
-            tab: if show_update { Tab::General } else { Tab::Switching },
+            tab: if opening == Opening::Default { Tab::Switching } else { Tab::General },
             button_tab: BUTTON_WHEEL_MODE,
             recording: None,
             gesture_tab: Gesture::Press,
@@ -468,9 +542,11 @@ impl SettingsApp {
             backup_manager: None,
             grown_for: 0.0,
             fitted_to_screen: false,
+            setup: SetupUi::default(),
+            to_general,
         };
         app.refresh();
-        if show_update || app.cfg.check_updates {
+        if opening == Opening::Update || app.cfg.check_updates {
             app.check_update(ctx);
         }
         app
@@ -642,6 +718,11 @@ impl eframe::App for SettingsApp {
             self.refresh();
         }
         ctx.request_repaint_after(REFRESH);
+        self.setup_tick(&ctx);
+        if self.to_general.swap(false, Ordering::Relaxed) {
+            self.tab = Tab::General;
+            self.stop_recording();
+        }
         if let Some(n) = self.recording {
             self.capture_shortcut(&ctx, t, n);
         }
@@ -669,7 +750,12 @@ impl eframe::App for SettingsApp {
             }
             self.header(ui, t, p);
             if self.status.hid_denied {
-                warning(ui, p, t.hid_denied_title, t.hid_denied);
+                // The setup check on the General tab installs the rule.
+                let open = (self.tab != Tab::General).then_some(t.setup_open);
+                if warning(ui, p, t.hid_denied_title, t.hid_denied, open) {
+                    self.tab = Tab::General;
+                    self.stop_recording();
+                }
             }
             ui.add_space(12.0);
             let tabs = [
@@ -705,6 +791,7 @@ impl eframe::App for SettingsApp {
                             self.group_section(ui, t, p);
                         }
                         Tab::General => {
+                            self.setup_card(ui, t, p);
                             two_columns(ui, |left, right| {
                                 // As on the Mac: haptics under finding the cursor, the
                                 // language at the top on the right.
@@ -735,6 +822,7 @@ impl eframe::App for SettingsApp {
         self.haptics_window(&ctx, t);
         self.backup_picker_ui(&ctx, t, p);
         self.backup_manager_ui(&ctx, t, p);
+        self.setup_confirm_ui(&ctx, p);
     }
 }
 
@@ -984,6 +1072,15 @@ impl SettingsApp {
                 error_box(ui, p, &text);
             } else {
                 info_box(ui, p, &text);
+            }
+            // The desktop portal is missing where installing it helps: the setup check
+            // on the General tab installs it.
+            if problem && self.setup_item(ItemId::Portal).is_some_and(|i| i.actionable()) {
+                ui.add_space(8.0);
+                if button(ui, p, t.setup_open, ButtonKind::Primary).clicked() {
+                    self.tab = Tab::General;
+                    self.stop_recording();
+                }
             }
             if self.status.edge_backend == "none" {
                 ui.add_space(10.0);
@@ -1644,7 +1741,7 @@ impl SettingsApp {
                 (true, Some(0)) => {
                     self.confirm_reset = false;
                     self.stop_recording();
-                    self.apply(|c| *c = Config { language: c.language.clone(), ..Config::default() });
+                    self.apply(|c| *c = Config { language: c.language.clone(), setup: c.setup.clone(), ..Config::default() });
                 }
                 (true, Some(_)) => self.confirm_reset = false,
                 _ => {}
@@ -1673,9 +1770,13 @@ impl SettingsApp {
         let state = self.update.lock().unwrap().clone();
         let ctx = ui.ctx().clone();
         let kind = update::install_kind();
+        // A Homebrew copy: brew updates it once approved (the setup check's item).
+        let brew_item = self.setup_item(ItemId::BrewUpdate).filter(Item::actionable);
+        let brew_running = self.setup.runs.lock().unwrap().get(&ItemId::BrewUpdate) == Some(&SetupRun::Running);
         section(ui, p, t.section_update, |ui| {
             ui.add_space(10.0);
             let (status, color) = match &state {
+                UpdateUi::Available(_) if brew_running => (t.update_installing.to_string(), p.muted),
                 UpdateUi::Idle => (String::new(), p.muted),
                 UpdateUi::Checking => (t.update_checking.to_string(), p.muted),
                 UpdateUi::UpToDate => (t.update_up_to_date.to_string(), p.green),
@@ -1715,7 +1816,15 @@ impl SettingsApp {
                                     self.download_update(&ctx, r.clone());
                                 }
                             }
-                            update::InstallKind::Homebrew => {}
+                            update::InstallKind::Homebrew => {
+                                if let Some(item) = brew_item.clone() {
+                                    ui.add_enabled_ui(!brew_running, |ui| {
+                                        if button(ui, p, t.update_now, ButtonKind::Primary).clicked() {
+                                            self.setup.confirm = Some(item);
+                                        }
+                                    });
+                                }
+                            }
                         }
                         if button(ui, p, t.update_page, ButtonKind::Plain).clicked() {
                             update::open_url(&r.page);
@@ -2020,7 +2129,8 @@ impl SettingsApp {
         match backup::read(&file.path) {
             Ok(loaded) => {
                 log::info!("settings loaded from {}", file.path.display());
-                self.apply(|c| *c = loaded);
+                // What the setup check set aside belongs to this computer.
+                self.apply(|c| *c = Config { setup: c.setup.clone(), ..loaded });
                 match self.error.take() {
                     None => {
                         self.backup_picker = None;
@@ -2090,6 +2200,443 @@ impl SettingsApp {
             ui.add_space(12.0);
         });
     }
+}
+
+// ---- The setup check ---------------------------------------------------------------
+
+impl SettingsApp {
+    /// What the setup check takes from the running flockswitch and the settings.
+    fn setup_inputs(&mut self) -> setup::Inputs {
+        self.setup.devices_seen |= !self.status.online.is_empty();
+        let newer = match &*self.update.lock().unwrap() {
+            UpdateUi::Available(r) | UpdateUi::InstallFailed(r, _) => Some(r.version.clone()),
+            _ => None,
+        };
+        setup::Inputs {
+            hid_denied: self.status.hid_denied,
+            devices_open: self.setup.devices_seen,
+            edge_backend: self.status.edge_backend.clone(),
+            edge_note: self.status.edge_note.clone(),
+            korean: crate::i18n::is_korean(),
+            newer_version: newer,
+        }
+    }
+
+    /// Checks again (in the background) when what the check depends on changed or a fix
+    /// finished, and loads a Korean font installed from here.
+    fn setup_tick(&mut self, ctx: &egui::Context) {
+        let font_done = self.setup.runs.lock().unwrap().get(&ItemId::KoreanFont) == Some(&SetupRun::Done(After::Fonts));
+        if font_done && !self.setup.fonts_reloaded {
+            self.setup.fonts_reloaded = true;
+            log::info!("setup: loading the Korean font just installed");
+            install_fonts(ctx);
+        }
+        if self.setup.checking.load(Ordering::Relaxed) {
+            return;
+        }
+        let inputs = self.setup_inputs();
+        let stale = self.setup.stale.swap(false, Ordering::Relaxed);
+        if !stale && self.setup.asked.as_ref() == Some(&inputs) {
+            return;
+        }
+        self.setup.asked = Some(inputs.clone());
+        self.setup.checking.store(true, Ordering::Relaxed);
+        let (found, checking, ctx) = (self.setup.found.clone(), self.setup.checking.clone(), ctx.clone());
+        std::thread::spawn(move || {
+            let items = setup::detect(&inputs);
+            *found.lock().unwrap() = Some(items);
+            checking.store(false, Ordering::Relaxed);
+            ctx.request_repaint();
+        });
+    }
+
+    fn setup_items(&self) -> Vec<Item> {
+        self.setup.found.lock().unwrap().clone().unwrap_or_default()
+    }
+
+    fn setup_item(&self, id: ItemId) -> Option<Item> {
+        self.setup_items().into_iter().find(|i| i.id == id)
+    }
+
+    /// At the top of the General tab, only while something is missing: a row for each
+    /// item with why it is needed, Install (which first shows the commands) and Later.
+    /// A fix run from here keeps its row, with how it went, until the window closes.
+    fn setup_card(&mut self, ui: &mut Ui, t: &Texts, p: Palette) {
+        let items = self.setup_items();
+        if items.is_empty() {
+            return;
+        }
+        // Korean without a font to draw it: this card speaks English.
+        let t = if setup::korean_unreadable(&items) { crate::i18n::english() } else { t };
+        let snoozed = self.cfg.setup.snoozed.clone();
+        let runs = self.setup.runs.lock().unwrap().clone();
+        let rows: Vec<&Item> = items
+            .iter()
+            .filter(|i| runs.contains_key(&i.id) || (i.state == SetupState::Missing && !setup_logic::is_snoozed(i, &snoozed)))
+            .collect();
+        // Set aside, and not run from here (a run keeps its row).
+        let not_run: Vec<Item> = items.iter().filter(|i| !runs.contains_key(&i.id)).cloned().collect();
+        let hidden = setup_logic::snoozed_count(&not_run, &snoozed);
+        let copied = self.setup.copied.filter(|(_, at)| at.elapsed() < Duration::from_secs(2)).map(|(id, _)| id);
+        let busy = runs.values().any(|r| *r == SetupRun::Running);
+        let mut action = None;
+        if rows.is_empty() {
+            if hidden > 0 {
+                ui.add_space(8.0);
+                if set_aside_line(ui, p, t, hidden) {
+                    action = Some(SetupAction::ShowAgain);
+                }
+            }
+        } else {
+            section_with_info(ui, p, t.setup_title, Some(t.setup_info), |ui| {
+                for (i, item) in rows.iter().enumerate() {
+                    if i > 0 {
+                        divider(ui, p);
+                    }
+                    if let Some(a) = setup_row(ui, p, t, item, runs.get(&item.id), busy, copied == Some(item.id)) {
+                        action = Some(a);
+                    }
+                }
+                if hidden > 0 {
+                    divider(ui, p);
+                    if set_aside_line(ui, p, t, hidden) {
+                        action = Some(SetupAction::ShowAgain);
+                    }
+                }
+                ui.add_space(4.0);
+            });
+        }
+        match action {
+            Some(SetupAction::Install(item)) => self.setup.confirm = Some(item),
+            Some(SetupAction::Later(item)) => {
+                log::info!("setup {}: set aside", item.snooze_key());
+                self.apply(|c| setup_logic::snooze(&mut c.setup.snoozed, &item));
+                shared::request_setup_recheck();
+            }
+            Some(SetupAction::ShowAgain) => {
+                self.apply(|c| c.setup.snoozed.clear());
+                shared::request_setup_recheck();
+            }
+            Some(SetupAction::Copy(id, text)) => {
+                ui.ctx().copy_text(text);
+                self.setup.copied = Some((id, Instant::now()));
+                ui.ctx().request_repaint_after(Duration::from_secs(2));
+            }
+            None => {}
+        }
+    }
+
+    /// The commands of the item chosen, for approval: what runs as administrator (the
+    /// system asks for the password) and what runs as the user. Nothing runs before Run.
+    fn setup_confirm_ui(&mut self, ctx: &egui::Context, p: Palette) {
+        let Some(item) = self.setup.confirm.clone() else { return };
+        let Some(fix) = item.fix.clone() else {
+            self.setup.confirm = None;
+            return;
+        };
+        let t = if setup::korean_unreadable(&self.setup_items()) { crate::i18n::english() } else { texts() };
+        let (mut run, mut cancel) = (false, false);
+        let frame = egui::Frame::new()
+            .fill(p.bg)
+            .stroke(Stroke::new(1.0, p.border))
+            .corner_radius(14)
+            .inner_margin(Margin::symmetric(20, 16));
+        let shown = egui::Modal::new(egui::Id::unique("setup-confirm")).frame(frame).show(ctx, |ui| {
+            ui.set_width(640.0);
+            ui.label(RichText::new(setup_title(t, &item)).font(bold(16.0)).color(p.text));
+            ui.add_space(4.0);
+            ui.label(RichText::new(setup_why(t, &item)).size(12.5).color(p.muted));
+            ui.add_space(10.0);
+            if fix.needs_admin() {
+                ui.label(RichText::new(t.setup_as_admin).size(13.0).color(p.text));
+                ui.add_space(4.0);
+                command_box(ui, p, "setup-confirm-admin", &format!("# pkexec /bin/sh -c\n{}", fix.admin_script()), 300.0);
+                ui.add_space(10.0);
+            }
+            if !fix.user.is_empty() {
+                ui.label(RichText::new(t.setup_as_user).size(13.0).color(p.text));
+                ui.add_space(4.0);
+                command_box(ui, p, "setup-confirm-user", &format!("# /bin/sh -c\n{}", fix.user_script()), 160.0);
+                ui.add_space(10.0);
+            }
+            if let Some(note) = after_note(t, fix.after) {
+                ui.label(RichText::new(note).size(12.5).color(p.amber));
+                ui.add_space(4.0);
+            }
+            ui.add_space(8.0);
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.spacing_mut().item_spacing.x = 8.0;
+                cancel = button(ui, p, t.cancel, ButtonKind::Plain).clicked();
+                run = button(ui, p, t.setup_run, ButtonKind::Primary).clicked();
+            });
+        });
+        if cancel || shown.should_close() {
+            log::info!("setup {}: not approved", item.id.key());
+            self.setup.confirm = None;
+        } else if run {
+            self.setup.confirm = None;
+            self.start_setup_run(ctx, item);
+        }
+    }
+
+    /// Runs an approved fix in the background; its row shows how it goes. Afterwards
+    /// the check runs again here and in the tray app.
+    fn start_setup_run(&mut self, ctx: &egui::Context, item: Item) {
+        let (runs, stale, update, ctx) = (self.setup.runs.clone(), self.setup.stale.clone(), self.update.clone(), ctx.clone());
+        runs.lock().unwrap().insert(item.id, SetupRun::Running);
+        std::thread::spawn(move || {
+            let terminal = item.fix.as_ref().map(setup_logic::Fix::terminal).unwrap_or_default();
+            let after = item.fix.as_ref().map_or(After::Menu, |f| f.after);
+            let next = match setup::run(&item) {
+                setup::Outcome::Done => match after {
+                    After::Restart => brew_restart(&update),
+                    After::Replug => {
+                        // Let udev apply the rule, then the engine looks for the devices again.
+                        std::thread::sleep(Duration::from_secs(2));
+                        shared::request_rescan();
+                        SetupRun::Done(after)
+                    }
+                    _ => SetupRun::Done(after),
+                },
+                setup::Outcome::NoAdmin => SetupRun::NoAdmin(terminal),
+                setup::Outcome::Failed { code, tail } => SetupRun::Failed { code, tail, terminal },
+            };
+            runs.lock().unwrap().insert(item.id, next);
+            stale.store(true, Ordering::Relaxed);
+            shared::request_setup_recheck();
+            ctx.request_repaint();
+        });
+    }
+}
+
+/// After `brew upgrade`: the tray app restarts into the new version (from
+/// `<prefix>/bin/flockswitch`) and this window closes and comes back in it, the way an
+/// update does. When Homebrew had no newer version yet, nothing restarts.
+fn brew_restart(update: &Mutex<UpdateUi>) -> SetupRun {
+    let installed = setup::brew_installed_version();
+    log::info!("update: Homebrew has flockswitch {} now", installed.as_deref().unwrap_or("?"));
+    if installed.as_deref().is_some_and(|v| !update::is_newer(v, env!("CARGO_PKG_VERSION"))) {
+        return SetupRun::BrewSame;
+    }
+    let restarting = match setup::brew_program() {
+        Some(exe) if crate::main_instance_running() => match update::start_new_version(&exe, &["tray", "--settings"]) {
+            Ok(()) => true,
+            Err(e) => {
+                log::warn!("update: upgraded with brew, but cannot start it: {e:#}");
+                false
+            }
+        },
+        _ => false,
+    };
+    *update.lock().unwrap() = if restarting { UpdateUi::Restarting } else { UpdateUi::Installed };
+    if restarting { SetupRun::Done(After::Restart) } else { SetupRun::BrewInstalled }
+}
+
+fn setup_title(t: &Texts, item: &Item) -> String {
+    match item.id {
+        ItemId::UdevRule => t.setup_udev.into(),
+        ItemId::Portal => t.setup_portal.into(),
+        ItemId::KoreanFont => t.setup_font.into(),
+        ItemId::TrayIcon => t.setup_tray.into(),
+        ItemId::MenuEntry => t.setup_menu.into(),
+        ItemId::BrewUpdate => {
+            let version = match &item.why {
+                Some(Why::BrewUpdate { version } | Why::BrewNotFound { version }) => version.as_str(),
+                _ => "",
+            };
+            t.setup_brew.replace("{version}", version)
+        }
+    }
+}
+
+fn setup_why(t: &Texts, item: &Item) -> String {
+    let Some(why) = &item.why else { return String::new() };
+    match why {
+        Why::UdevMissing => t.setup_udev_missing.into(),
+        Why::UdevOutdated => t.setup_udev_outdated.into(),
+        Why::UdevDenied => t.setup_udev_denied.into(),
+        Why::PortalPackages { gnome, packages } => {
+            t.setup_portal_packages.replace("{version}", &gnome.to_string()).replace("{packages}", &packages.join(", "))
+        }
+        Why::PortalRelogin { .. } => t.setup_portal_relogin.into(),
+        Why::PortalX11 { gnome } => t.setup_portal_x11.replace("{version}", &gnome.to_string()),
+        Why::FontMissing => t.setup_font_missing.into(),
+        Why::TrayInstall => t.setup_tray_install.into(),
+        Why::TrayEnable => t.setup_tray_enable.into(),
+        Why::TrayRelogin => t.setup_tray_relogin.into(),
+        Why::MenuMissing => t.setup_menu_missing.into(),
+        Why::BrewUpdate { .. } => t.setup_brew_update.into(),
+        Why::BrewNotFound { .. } => t.setup_brew_not_found.into(),
+    }
+}
+
+/// The word on an item's button: 설치 / Install, 추가 / Add, 켜기 / Turn on, 업데이트 / Update.
+fn setup_button<'a>(t: &'a Texts, item: &Item) -> &'a str {
+    match item.id {
+        ItemId::MenuEntry => t.setup_add,
+        ItemId::BrewUpdate => t.setup_update,
+        ItemId::TrayIcon if !item.needs_admin() => t.setup_turn_on,
+        _ => t.setup_install,
+    }
+}
+
+/// What to do once a fix went through.
+fn after_text<'a>(t: &'a Texts, after: After) -> &'a str {
+    match after {
+        After::Replug => t.setup_after_replug,
+        After::Relogin => t.setup_after_relogin,
+        After::MaybeRelogin => t.setup_after_maybe_relogin,
+        After::Fonts => t.setup_after_fonts,
+        After::Menu => t.setup_after_menu,
+        After::Restart => t.setup_after_restart,
+    }
+}
+
+/// Said before Run, where something remains to be done afterwards.
+fn after_note<'a>(t: &'a Texts, after: After) -> Option<&'a str> {
+    match after {
+        After::Replug => Some(t.setup_note_replug),
+        After::Relogin => Some(t.setup_note_relogin),
+        After::Restart => Some(t.setup_note_restart),
+        After::MaybeRelogin | After::Fonts | After::Menu => None,
+    }
+}
+
+/// One item of the setup card: its name and why on the left, its buttons on the right,
+/// and under it how its fix went (or the commands to run by hand).
+fn setup_row(ui: &mut Ui, p: Palette, t: &Texts, item: &Item, run: Option<&SetupRun>, busy: bool, copied: bool) -> Option<SetupAction> {
+    let mut labels: Vec<(&str, ButtonKind)> = Vec::new();
+    let mut actions: Vec<SetupAction> = Vec::new();
+    match run {
+        Some(SetupRun::Running | SetupRun::Done(_) | SetupRun::BrewInstalled) => {}
+        Some(SetupRun::NoAdmin(_) | SetupRun::Failed { .. } | SetupRun::BrewSame) => {
+            labels.push((t.setup_retry, ButtonKind::Plain));
+            actions.push(SetupAction::Install(item.clone()));
+        }
+        None => {
+            if item.fix.is_some() {
+                labels.push((setup_button(t, item), ButtonKind::Primary));
+                actions.push(SetupAction::Install(item.clone()));
+            }
+            labels.push((t.setup_later, ButtonKind::Plain));
+            actions.push(SetupAction::Later(item.clone()));
+        }
+    }
+    let mut action = titled_row(ui, p, &setup_title(t, item), &setup_why(t, item), &labels, !busy).and_then(|i| actions.into_iter().nth(i));
+    let copy_label = if copied { t.setup_copied } else { t.setup_copy };
+    let mut commands = |ui: &mut Ui, note: &str, color: Color32, text: &str, copy: Option<&str>| {
+        ui.label(RichText::new(note).size(12.5).color(color));
+        ui.add_space(4.0);
+        command_box(ui, p, &format!("setup-{}", item.id.key()), text, 150.0);
+        if let Some(copy) = copy {
+            ui.add_space(6.0);
+            if compact_button(ui, p, copy_label, ButtonKind::Plain).clicked() {
+                action = Some(SetupAction::Copy(item.id, copy.to_string()));
+            }
+        }
+        ui.add_space(8.0);
+    };
+    match run {
+        Some(SetupRun::Running) => {
+            ui.horizontal(|ui| {
+                ui.add(egui::Spinner::new().size(14.0));
+                ui.label(RichText::new(t.setup_running).size(12.5).color(p.muted));
+            });
+            ui.add_space(8.0);
+        }
+        Some(SetupRun::Done(after)) => {
+            ui.label(RichText::new(format!("✓ {}", after_text(t, *after))).size(12.5).color(p.green));
+            ui.add_space(8.0);
+        }
+        Some(SetupRun::BrewSame) => {
+            ui.label(RichText::new(t.setup_brew_same).size(12.5).color(p.amber));
+            ui.add_space(8.0);
+        }
+        Some(SetupRun::BrewInstalled) => {
+            ui.label(RichText::new(format!("✓ {}", t.update_installed)).size(12.5).color(p.green));
+            ui.add_space(8.0);
+        }
+        Some(SetupRun::NoAdmin(terminal)) => commands(ui, t.setup_no_admin, p.amber, terminal, Some(terminal)),
+        Some(SetupRun::Failed { code, tail, terminal }) => {
+            let code = code.map_or_else(|| "?".to_string(), |c| c.to_string());
+            commands(ui, &t.setup_failed.replace("{code}", &code), p.red, &tail.join("\n"), Some(terminal));
+        }
+        None => {
+            if let (None, Some(manual)) = (&item.fix, &item.manual) {
+                let note = if item.id == ItemId::BrewUpdate { t.setup_manual } else { t.setup_no_package_manager };
+                commands(ui, note, p.muted, manual, Some(manual));
+            }
+        }
+    }
+    action
+}
+
+/// "2 set aside for later · Show again". True when Show again was clicked.
+fn set_aside_line(ui: &mut Ui, p: Palette, t: &Texts, n: usize) -> bool {
+    let mut clicked = false;
+    ui.add_space(6.0);
+    ui.horizontal(|ui| {
+        ui.label(RichText::new(t.setup_set_aside.replace("{n}", &n.to_string())).size(12.5).color(p.muted));
+        clicked = ui.link(RichText::new(t.setup_show_again).size(12.5).color(p.accent)).clicked();
+    });
+    ui.add_space(6.0);
+    clicked
+}
+
+/// A row with a title and, under it, an explanation on the left and buttons on the
+/// right. Returns the index of the button clicked.
+fn titled_row(ui: &mut Ui, p: Palette, title: &str, text: &str, labels: &[(&str, ButtonKind)], enabled: bool) -> Option<usize> {
+    let buttons: f32 = if labels.is_empty() {
+        0.0
+    } else {
+        labels.iter().map(|(l, k)| button_width(ui, l, *k)).sum::<f32>() + 8.0 * (labels.len() - 1) as f32
+    };
+    let width = ui.available_width();
+    let wrap = (width - buttons - 16.0).max(160.0);
+    let title_text = ui.painter().layout(title.to_string(), FontId::proportional(14.5), p.text, wrap);
+    let body = ui.painter().layout(text.to_string(), FontId::proportional(12.5), p.muted, wrap);
+    let (title_h, body_h) = (title_text.size().y, if text.is_empty() { 0.0 } else { body.size().y + 3.0 });
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(width, (title_h + body_h + 20.0).max(48.0)), Sense::hover());
+    let top = rect.center().y - (title_h + body_h) / 2.0;
+    ui.painter().galley(Pos2::new(rect.left(), top), title_text, p.text);
+    if !text.is_empty() {
+        ui.painter().galley(Pos2::new(rect.left(), top + title_h + 3.0), body, p.muted);
+    }
+    let mut clicked = None;
+    if !labels.is_empty() {
+        let area = Rect::from_min_max(
+            Pos2::new(rect.right() - buttons, rect.center().y - 15.0),
+            Pos2::new(rect.right(), rect.center().y + 15.0),
+        );
+        ui.new_child(UiBuilder::new().max_rect(area)).scope(|ui| {
+            ui.spacing_mut().item_spacing.x = 8.0;
+            ui.add_enabled_ui(enabled, |ui| {
+                ui.horizontal(|ui| {
+                    for (i, (label, kind)) in labels.iter().enumerate() {
+                        if button(ui, p, label, *kind).clicked() {
+                            clicked = Some(i);
+                        }
+                    }
+                });
+            });
+        });
+    }
+    clicked
+}
+
+/// Commands or a program's output, as they are, in a box whose text can be selected.
+fn command_box(ui: &mut Ui, p: Palette, id: &str, text: &str, max_height: f32) {
+    egui::Frame::new()
+        .fill(p.bg)
+        .stroke(Stroke::new(1.0, p.border))
+        .corner_radius(8)
+        .inner_margin(Margin::symmetric(10, 8))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            egui::ScrollArea::vertical().id_salt(id).max_height(max_height).auto_shrink([false, true]).show(ui, |ui| {
+                ui.add(egui::Label::new(RichText::new(text).monospace().size(12.0).color(p.text)).selectable(true).wrap());
+            });
+        });
 }
 
 fn device_subtitle(d: &DeviceInfo, t: &Texts) -> String {
@@ -2310,9 +2857,11 @@ fn notice(ui: &mut Ui, p: Palette, t: &Texts) {
         });
 }
 
-/// Something to fix before flockswitch can work, under the header.
-fn warning(ui: &mut Ui, p: Palette, title: &str, text: &str) {
+/// Something to fix before flockswitch can work, under the header, with a button that
+/// leads to the fix when there is one. True when it was clicked.
+fn warning(ui: &mut Ui, p: Palette, title: &str, text: &str, button_label: Option<&str>) -> bool {
     ui.add_space(12.0);
+    let mut clicked = false;
     egui::Frame::new()
         .fill(p.amber.gamma_multiply(0.12))
         .stroke(Stroke::new(1.0, p.amber.gamma_multiply(0.6)))
@@ -2323,7 +2872,12 @@ fn warning(ui: &mut Ui, p: Palette, title: &str, text: &str) {
             ui.spacing_mut().item_spacing.y = 4.0;
             ui.label(RichText::new(format!("⚠  {title}")).font(bold(14.0)).color(p.amber));
             ui.label(RichText::new(text).size(12.5).color(p.text));
+            if let Some(label) = button_label {
+                ui.add_space(4.0);
+                clicked = button(ui, p, label, ButtonKind::Plain).clicked();
+            }
         });
+    clicked
 }
 
 /// The desktop's name for the Wayland notes ("ubuntu:GNOME" → "GNOME").

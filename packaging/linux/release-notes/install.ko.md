@@ -1,4 +1,20 @@
+> [!IMPORTANT]
+> **Homebrew로 설치했는데 업데이트가 안 된다면 (Homebrew 6 이상)**
+>
+> `brew upgrade flockswitch`가 `Error: Refusing to load cask wwhalefe/tap/flockswitch from untrusted tap wwhalefe/tap.`로 멈추면, 이 탭의 macOS용 cask가 Linux용 formula와 이름이 같아서입니다. 터미널에서 한 번만 실행하세요.
+>
+> ```bash
+> brew trust --formula wwhalefe/tap/flockswitch
+> brew update && brew upgrade --formula wwhalefe/tap/flockswitch
+> brew list --versions flockswitch     # 새 버전 번호가 나오면 성공
+> flockswitch quit                     # 그다음 앱 메뉴에서 flockswitch를 다시 실행
+> ```
+>
+> 0.11.0부터는 새 버전이 나오면 앱이 설치할지 묻고(트레이 메뉴 "업데이트 가능", 설정 → 일반의 **지금 업데이트**), 승인하면 위 명령을 대신 실행한 뒤 다시 시작합니다. 0.11.0으로 넘어가는 이번 한 번은 위 명령을 직접 실행해 주세요.
+
 ### 설치 전에 준비할 것
+
+**flockswitch가 빠진 것을 찾아 설치를 권합니다.** 실행하면 알림과 트레이 메뉴(**설정 필요 항목 N개…**)가 설정 → 일반 → **설치·설정 점검**으로 안내합니다. 빠진 항목(udev 규칙, 한글 글꼴, 트레이 아이콘 확장, 데스크톱 포털, Homebrew의 앱 메뉴 항목과 업데이트)마다 **설치**와 **나중에**가 있습니다. 설치를 누르면 실행할 명령을 그대로 먼저 보여 주고, **실행**을 눌러야 시작하며, 관리자 권한이 필요하면 데스크톱이 비밀번호를 묻습니다. 아래 명령은 같은 내용이니 직접 하고 싶거나 비밀번호 창이 뜨지 않을 때 쓰세요.
 
 | 항목 | 필요한 경우 | 설치 |
 |---|---|---|
@@ -6,7 +22,7 @@
 | 한글 글꼴 | 설정 창의 한글 표시 | `sudo apt-get install -y fonts-noto-cjk` (Fedora: `google-noto-sans-cjk-fonts`) |
 | 트레이 아이콘 확장 | Fedora·Debian의 기본 GNOME (Ubuntu·KDE는 필요 없음) | `gnome-shell-extension-appindicator` (아래 3) |
 | 데스크톱 포털 | GNOME Wayland에서 화면 모서리 전환 | `xdg-desktop-portal`, `xdg-desktop-portal-gnome` (보통 이미 설치됨, 아래 4) |
-| udev 규칙 | 항상 (장치를 열 권한) | 설치 명령에 포함 |
+| udev 규칙 | 항상 (장치를 열 권한) | 설치 명령에 포함 (또는 설치·설정 점검) |
 
 **1. Homebrew** (이미 있으면 건너뛰기)
 
@@ -70,7 +86,7 @@ sudo dnf install -y libxkbcommon mesa-libGL mesa-libEGL       # Fedora
 # 설치
 brew install --formula wwhalefe/tap/flockswitch
 
-# 초기 설정 (최초 1회 — udev 규칙 및 앱 메뉴 등록)
+# 초기 설정 (최초 1회 — udev 규칙 및 앱 메뉴 등록). 설치·설정 점검이 대신 해 줄 수 있음
 sudo install -m 644 "$(brew --prefix)/opt/flockswitch/share/flockswitch/70-flockswitch.rules" /etc/udev/rules.d/
 sudo udevadm control --reload-rules
 sudo udevadm trigger --subsystem-match=hidraw
@@ -80,7 +96,7 @@ ln -sf "$(brew --prefix)/opt/flockswitch/share/applications/flockswitch.desktop"
 # Homebrew 6 이상에서 'untrusted tap' 오류가 나면 한 번만 (예전에 설치한 경우)
 brew trust --formula wwhalefe/tap/flockswitch
 
-# 업데이트 / 제거
+# 업데이트 (또는 설정 → 일반 → 지금 업데이트: 승인하면 이 명령을 실행) / 제거
 brew update && brew upgrade --formula wwhalefe/tap/flockswitch
 flockswitch uninstall && brew uninstall --formula wwhalefe/tap/flockswitch
 ```
@@ -99,6 +115,6 @@ cd flockswitch-linux-x86_64-@VERSION@
 
 ### 설치 후 이런 화면이 보이면
 
-- **상단에 "장치를 찾는 중…"**: 마우스·키보드가 지금 이 컴퓨터에 연결되어 있지 않습니다. 이 컴퓨터의 채널로 돌려놓고(블루투스면 연결될 때까지 몇 초) 기다리세요. 계속 그대로면 `flockswitch list` 결과를 확인하고, 일반 탭에 "장치에 접근할 권한이 없습니다"가 보이면 위의 udev 명령을 실행한 뒤 수신기를 뺐다 꽂으세요.
+- **상단에 "장치를 찾는 중…"**: 마우스·키보드가 지금 이 컴퓨터에 연결되어 있지 않습니다. 이 컴퓨터의 채널로 돌려놓고(블루투스면 연결될 때까지 몇 초) 기다리세요. 계속 그대로면 `flockswitch list` 결과를 확인하고, "장치에 접근할 권한이 없습니다"가 보이면 일반 탭의 설치·설정 점검에서 udev 규칙을 설치하고(또는 위의 udev 명령을 실행하고) 수신기를 뺐다 꽂으세요.
 - **모서리 페이지의 빨간 안내**: 위 4번 표대로 하세요.
 - **마우스 찾기 "Wayland에서는…"**: 마우스 찾기는 커서 위치가 필요해서 X11 세션에서만 동작합니다.

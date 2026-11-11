@@ -824,11 +824,18 @@ impl Engine {
         let mut last_scan = Instant::now();
         let mut last_config = Instant::now();
         while !self.shared.stopped() {
+            // The settings window just installed the udev rule: look again now.
+            let mut asked = false;
             if last_config.elapsed() > CONFIG_CHECK {
                 last_config = Instant::now();
                 self.shared.reload_if_edited();
                 if let Some((what, intensity)) = shared::take_haptic_preview() {
                     self.feel(what, intensity);
+                }
+                asked = shared::take_rescan_file();
+                if asked {
+                    log::info!("devices: looking again (udev rule installed)");
+                    self.backoff = Duration::from_secs(1);
                 }
             }
             if let Err(e) = self.reload_config() {
@@ -844,7 +851,7 @@ impl Engine {
             // Rescan when a receiver or Bluetooth device went away (read error, with
             // back-off) or when the OS lists a different set of endpoints.
             let dead = self.endpoints.iter().any(|e| e.dead);
-            let mut rescan = dead && last_scan.elapsed() > self.backoff;
+            let mut rescan = asked || (dead && last_scan.elapsed() > self.backoff);
             if !rescan && self.last_enumerate.elapsed() > ENUMERATE_INTERVAL {
                 self.last_enumerate = Instant::now();
                 if self.api.refresh_devices().is_ok() {

@@ -50,6 +50,10 @@ pub struct Status {
     /// Its state for the settings window: "ready", "off", "asking:1", "denied", a
     /// reason code for "none", … (see edge_wayland.rs and edge_portal.rs).
     pub edge_note: String,
+    /// Missing prerequisites the setup check can install, not set aside (tray menu).
+    pub setup_pending: usize,
+    /// Korean has no font yet: the menu's setup entry is in English.
+    pub setup_english: bool,
 }
 
 /// What the engine sees right now, written for the settings window (a separate
@@ -116,6 +120,33 @@ pub fn quit_request_path() -> std::path::PathBuf {
 /// move everything by writing the channel here.
 pub fn switch_request_path() -> std::path::PathBuf {
     Config::path().with_file_name("switch.request")
+}
+
+/// The settings window ran a fix of the setup check or set an item aside: the tray app
+/// checks again (its menu shows how many items are left).
+fn setup_recheck_path() -> std::path::PathBuf {
+    Config::path().with_file_name("setup.recheck")
+}
+
+pub fn request_setup_recheck() {
+    let _ = std::fs::write(setup_recheck_path(), b"");
+}
+
+pub fn take_setup_recheck() -> bool {
+    std::fs::remove_file(setup_recheck_path()).is_ok()
+}
+
+/// The udev rule was just installed: the engine looks for the devices again at once.
+fn rescan_request_path() -> std::path::PathBuf {
+    Config::path().with_file_name("rescan.request")
+}
+
+pub fn request_rescan() {
+    let _ = std::fs::write(rescan_request_path(), b"");
+}
+
+pub fn take_rescan_file() -> bool {
+    std::fs::remove_file(rescan_request_path()).is_ok()
 }
 
 /// The channel asked for through the request file, if any; the file is removed.

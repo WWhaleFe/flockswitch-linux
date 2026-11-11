@@ -789,6 +789,25 @@ pub struct Config {
     pub haptics: Haptics,
     /// Showing where the cursor is.
     pub locate: Locate,
+    /// The setup check's items set aside with "Later". Written only when there are
+    /// some, and kept out of settings backups (it is about this computer).
+    #[serde(skip_serializing_if = "Setup::is_empty")]
+    pub setup: Setup,
+}
+
+/// What the setup check remembers on this computer.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Setup {
+    /// Items set aside ("udev-rule", "tray-icon", "brew-update:0.11.1", …): no longer
+    /// shown or counted until "Show again".
+    pub snoozed: Vec<String>,
+}
+
+impl Setup {
+    pub fn is_empty(&self) -> bool {
+        self.snoozed.is_empty()
+    }
 }
 
 /// Keyboard shortcuts that send the group and the master mouse to a channel; pressed on
@@ -835,6 +854,7 @@ impl Default for Config {
             edges: Edges::default(),
             haptics: Haptics::default(),
             locate: Locate::default(),
+            setup: Setup::default(),
         }
     }
 }
