@@ -36,7 +36,7 @@ jobs:
             if ! grep -q "^## $want " "$f"; then echo "$f has no '## $want' section"; exit 1; fi
           done
       - name: Build dependencies
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libudev-dev pkg-config
+        run: bash .github/scripts/build-deps.sh
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo test --locked
       - run: cargo build --release --locked

@@ -15,7 +15,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Build dependencies
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libudev-dev pkg-config
+        run: bash .github/scripts/build-deps.sh
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo test --locked
       - run: cargo build --release --locked
