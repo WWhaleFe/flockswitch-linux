@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.11.1 — 2026-11-12
+
+- Fixed screen-edge switching on GNOME 50's Wayland session (Ubuntu 26.04 and others) reporting "the desktop portal has no InputCapture". The portal has it, but GNOME 50 lists a capability older libraries don't know (it reports 15), and reading that value failed. flockswitch now looks only at the capabilities it knows, and uses input capture
+
 ## 0.11.0 — 2026-11-11
 
 - **Setup check**: flockswitch finds what this computer is missing and installs it after you approve. Settings → General starts with a card, shown only when something is missing, with one row per item, why it's needed, **Install** (**Add**, **Turn on** or **Update** where that fits) and **Later**. Install first shows the exact commands and whether the system will ask for your password; nothing runs until **Run**. Administrator steps run through one `pkexec /bin/sh -c '…'` per item (fixed commands only), so the desktop's own password dialog appears; without pkexec, or when the dialog is cancelled, the same commands are shown with `sudo` and a **Copy commands** button. The row then says how it went (done, what to do next, or the exit code and the last lines of output), every line goes to the log, and the check runs again

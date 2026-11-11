@@ -44,8 +44,16 @@ use std::time::{Duration, Instant};
 /// The portal's version and what it can capture ("keyboard, pointer").
 pub async fn probe() -> Result<(u32, String), String> {
     let ic = InputCapture::new().await.map_err(|e| format!("{e}"))?;
-    let caps = ic.supported_capabilities().await.map_err(|e| format!("{e}"))?;
-    Ok((ic.version(), caps_text(caps)))
+    // Read as a plain number: newer portals report capabilities ashpd doesn't know (GNOME 50
+    // says 15, keyboard | pointer | touchscreen | 8), and ashpd's conversion then fails.
+    let raw: u32 = ic.get_property("SupportedCapabilities").await.map_err(|e| format!("{e}"))?;
+    let caps = ashpd::enumflags2::BitFlags::<Capabilities>::from_bits_truncate(raw);
+    let unknown = raw & !caps.bits();
+    let mut text = caps_text(caps);
+    if unknown != 0 {
+        text.push_str(&format!(" (+ unknown 0x{unknown:x})"));
+    }
+    Ok((ic.version(), text))
 }
 
 fn caps_text(caps: ashpd::enumflags2::BitFlags<Capabilities>) -> String {
