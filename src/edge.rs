@@ -7,17 +7,18 @@
 //! The shared part (edge geometry, the watcher) is the same in every port; the
 //! `platform` module at the end reads the cursor and the displays.
 
-use crate::config::{Edge, Edges, EDGES};
+use crate::config::{Config, Edge, Edges, EDGES};
 use crate::device::waveform;
 use crate::overlay;
 use crate::shared::Shared;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-/// How often the cursor is read. Reading it is cheap; 25 ms is finer than anyone moves.
-const POLL: Duration = Duration::from_millis(25);
+/// How often the cursor is read (also how often the Wayland watchers look). Reading it
+/// is cheap; 25 ms is finer than anyone moves.
+pub(crate) const POLL: Duration = Duration::from_millis(25);
 /// How often the engine's status (this computer's channel, is the mouse here) is read.
-const STATUS_POLL: Duration = Duration::from_millis(300);
+pub(crate) const STATUS_POLL: Duration = Duration::from_millis(300);
 /// How often the display arrangement is re-read.
 const DISPLAYS_POLL: Duration = Duration::from_secs(2);
 /// After one switch, the next needs the cursor to leave the edge and this much time.
@@ -27,7 +28,7 @@ const INSET: f64 = 24.0;
 /// While the cursor waits at an edge, the mouse pulses this often (if it has a motor).
 pub(crate) const HAPTIC_TICK: Duration = Duration::from_millis(150);
 /// A pulse takes a moment to play; Change Host right after would cut it short.
-const FINAL_PULSE: Duration = Duration::from_millis(150);
+pub(crate) const FINAL_PULSE: Duration = Duration::from_millis(150);
 /// A turn of a shake: the cursor reverses after this many points of travel one way.
 const SHAKE_MIN_RUN: f64 = 80.0;
 /// A shake goes on while each turn follows the last within this long; a longer pause
@@ -95,7 +96,7 @@ pub fn landing(displays: &[Rect], edge: Edge) -> Option<(f64, f64)> {
 }
 
 /// The channel a "last switch" status text ends with ("1 → 2", "→ 2").
-fn last_channel(text: &str) -> Option<u8> {
+pub(crate) fn last_channel(text: &str) -> Option<u8> {
     text.rsplit(' ').next()?.parse().ok()
 }
 
@@ -191,16 +192,34 @@ impl Shake {
     }
 }
 
+/// The edge and the length of a preview of the countdown: the first edge with a channel,
+/// for at least a second, so a short wait can still be judged.
+pub(crate) fn preview_edge(edges: &Edges) -> (Edge, Duration) {
+    let edge = EDGES.into_iter().find(|&e| edges.channel(e) != 0).unwrap_or(Edge::Right);
+    (edge, Duration::from_millis(edges.dwell_ms.max(1000)))
+}
+
 /// Plays the countdown once, at an edge of the display the cursor is on, for the
-/// settings window. At least a second, so a short wait can still be judged.
+/// settings window.
 pub fn preview(edges: &Edges) {
     let displays = platform::displays();
     let cursor = platform::cursor();
     let on_cursor = cursor.and_then(|(x, y)| displays.iter().find(|d| d.contains(x, y)));
     let Some(display) = on_cursor.or(displays.first()) else { return };
-    let edge = EDGES.into_iter().find(|&e| edges.channel(e) != 0).unwrap_or(Edge::Right);
-    let duration = Duration::from_millis(edges.dwell_ms.max(1000));
+    let (edge, duration) = preview_edge(edges);
     overlay::edge_begin(edges, edge, display, Duration::ZERO, duration, true);
+}
+
+/// Logs which edges switch to which channel, when the edge settings are read.
+pub(crate) fn announce(cfg: &Config) {
+    let active = cfg.enabled && cfg.edges.on && cfg.edges.any();
+    if active {
+        let list: Vec<String> =
+            EDGES.iter().filter(|&&e| cfg.edges.channel(e) != 0).map(|&e| format!("{} → {}", e.name(), cfg.edges.channel(e))).collect();
+        log::info!("edges: {} after {} ms", list.join(", "), cfg.edges.dwell_ms);
+    } else if cfg.edges.on {
+        log::info!("edges: on, but no edge has a channel");
+    }
 }
 
 /// Takes the countdown away, if one is showing.
@@ -258,29 +277,19 @@ fn watch(shared: Arc<Shared>) {
             announced = false;
         }
         let active = cfg.enabled && cfg.edges.on && cfg.edges.any();
-        if !announced {
-            announced = true;
-            if active {
-                let list: Vec<String> = crate::config::EDGES
-                    .iter()
-                    .filter(|&&e| cfg.edges.channel(e) != 0)
-                    .map(|&e| format!("{} → {}", e.name(), cfg.edges.channel(e)))
-                    .collect();
-                log::info!("edges: {} after {} ms", list.join(", "), cfg.edges.dwell_ms);
-            } else if cfg.edges.on {
-                log::info!("edges: on, but no edge has a channel");
-            }
+        if !std::mem::replace(&mut announced, true) {
+            announce(&cfg);
         }
         if status_read.is_none_or(|t| t.elapsed() >= STATUS_POLL) {
             let first = status_read.is_none();
             status_read = Some(Instant::now());
-            let st = shared.status();
-            here = st.channel;
-            if st.last_switch != last_switch_text {
-                last_switch_text = st.last_switch.clone();
-                landing_channel = st.last_switch.as_deref().and_then(last_channel);
+            let (channel, now_here, switch_changed) =
+                shared.read_status(|st| (st.channel, st.trigger.is_some(), (st.last_switch != last_switch_text).then(|| st.last_switch.clone())));
+            here = channel;
+            if let Some(text) = switch_changed {
+                landing_channel = text.as_deref().and_then(last_channel);
+                last_switch_text = text;
             }
-            let now_here = st.trigger.is_some();
             let arrived = now_here && !mouse_here && !first;
             if arrived && active && cfg.edges.place_cursor {
                 // The mouse has come back from the channel it was sent to: put the
@@ -428,14 +437,9 @@ mod platform {
 
     static X11: OnceLock<Option<X>> = OnceLock::new();
 
-    fn wayland() -> bool {
-        let var = |name: &str| std::env::var(name).unwrap_or_default();
-        var("XDG_SESSION_TYPE").eq_ignore_ascii_case("wayland") || !var("WAYLAND_DISPLAY").is_empty()
-    }
-
     /// An X11 session: cursor and displays can be read.
     pub fn available() -> bool {
-        !wayland() && std::env::var_os("DISPLAY").is_some()
+        !crate::edge_wayland::session_is_wayland() && std::env::var_os("DISPLAY").is_some()
     }
 
     fn x() -> Option<&'static X> {

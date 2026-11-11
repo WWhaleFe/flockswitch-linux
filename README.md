@@ -8,7 +8,7 @@ flockswitch turns buttons of an MX Master mouse — the wheel mode-shift button,
 
 This repository is the Linux version. The others live in [flockswitch-mac](https://github.com/WWhaleFe/flockswitch-mac), [flockswitch-windows](https://github.com/WWhaleFe/flockswitch-windows) and [flockswitch-android](https://github.com/WWhaleFe/flockswitch-android); all of them switch the same way and can be mixed.
 
-> **Not tried on a Linux PC yet.** The Linux version shares its device code with the macOS and Windows versions, which are tested, but it has not run on real Linux hardware. Reports are very welcome.
+> **Tested on Ubuntu 26.04 (GNOME 50, Wayland).** X11 (Xorg) sessions and KDE Plasma, sway or Hyprland have not been tried yet; reports are very welcome.
 
 > Not affiliated with Logitech. "Logitech", "MX Master", "Easy-Switch", "Bolt" and "Unifying" are trademarks of Logitech.
 
@@ -148,13 +148,18 @@ Open a [problem report](../../issues/new/choose) with:
 
 ## Status
 
-| Connection | Status |
+Tried on real hardware: Ubuntu 26.04, GNOME 50, Wayland session.
+
+| Feature | Status |
 |---|---|
-| Logi Bolt receiver | implemented, not tried on Linux yet |
-| Unifying receiver | implemented, not tried on Linux yet |
-| Bluetooth | implemented, not tried on Linux yet |
-| Screen edges on Wayland (GNOME input capture, KDE/wlroots layer shell) | implemented, not tried yet |
-| Find the cursor and shortcuts on Wayland (XWayland / layer shell, GlobalShortcuts portal) | implemented, not tried yet |
+| Switching with the mouse button | works |
+| Screen edges on GNOME Wayland (input capture portal) | works |
+| Find the cursor on GNOME Wayland (through XWayland) | works |
+| Keyboard shortcuts on GNOME Wayland (GlobalShortcuts portal) | works |
+| Setup check | works |
+| Updating a Homebrew install | works |
+| Screen edges and find the cursor on KDE Plasma, sway, Hyprland (layer shell) | implemented, not tried yet |
+| X11 (Xorg) session: edges, find the cursor, shortcuts | implemented, not tried yet |
 
 ## Build
 

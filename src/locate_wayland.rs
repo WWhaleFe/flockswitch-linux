@@ -6,17 +6,14 @@
 //! highlight the way `path` finds for this session. Shaking the mouse needs the cursor
 //! all the time and stays X11 only (edge.rs). An X11 session does all of this in edge.rs.
 
+use crate::edge::{POLL, STATUS_POLL};
 use crate::edge_logic::{self, Zone};
 use crate::edge_wayland::session_is_wayland;
 use crate::locate_logic::{self as logic, LocatePath};
 use crate::overlay;
 use crate::shared::Shared;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
-
-const POLL: Duration = Duration::from_millis(25);
-/// How often the engine's status (is the master mouse here) is read, as edge.rs does.
-const STATUS_POLL: Duration = Duration::from_millis(300);
+use std::time::Instant;
 
 /// How the highlight can be drawn in this session, and what that was decided from (for
 /// the log). Asked each time, as the displays may have changed: a few milliseconds.
@@ -26,7 +23,7 @@ pub fn path() -> (LocatePath, String) {
     if !wayland {
         return (logic::locate_path(false, x11_display, None, None), "X11 session".into());
     }
-    let (layer_shell, zones, problem) = match crate::wl::Wl::connect(false) {
+    let (layer_shell, zones, problem) = match crate::wl::Wl::connect(false, false) {
         Ok(wl) => (Some(wl.has_layer_shell()), wl.displays().iter().map(|d| d.rect).collect::<Vec<Zone>>(), None),
         Err(e) => (None, Vec::new(), Some(e)),
     };
@@ -44,7 +41,8 @@ pub fn path() -> (LocatePath, String) {
 
 /// Watches for what asks to show the cursor, in a Wayland session (the tray app).
 pub fn spawn(shared: Arc<Shared>) {
-    let started = std::thread::Builder::new().name("locate".into()).spawn(move || watch(shared));
+    // It only looks at shared flags and hands requests on: a small stack is plenty.
+    let started = std::thread::Builder::new().name("locate".into()).stack_size(256 * 1024).spawn(move || watch(shared));
     if let Err(e) = started {
         log::warn!("locate: cannot start its thread: {e}");
     }
@@ -71,7 +69,7 @@ fn watch(shared: Arc<Shared>) {
         if status_read.is_none_or(|t| t.elapsed() >= STATUS_POLL) {
             let first = status_read.is_none();
             status_read = Some(Instant::now());
-            let now_here = shared.status().trigger.is_some();
+            let now_here = shared.read_status(|st| st.trigger.is_some());
             if now_here && !mouse_here && !first && cfg.locate.on && cfg.locate.on_arrival {
                 log::info!("locate: the master mouse arrived from another computer");
                 overlay::locate(&cfg.locate);

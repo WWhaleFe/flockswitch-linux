@@ -323,20 +323,22 @@ pub fn readable_texts(items: &[Item]) -> &'static crate::i18n::Texts {
 }
 
 fn tray_inputs(shared: &Shared, devices_seen: &mut bool) -> Inputs {
-    let st = shared.status();
-    *devices_seen |= st.devices.iter().any(|d| d.online);
-    let newer = match st.update {
-        UpdateState::Available(r) | UpdateState::DownloadFailed(r) | UpdateState::InstallFailed(r) => Some(r.version),
-        _ => None,
-    };
-    Inputs {
-        hid_denied: st.hid_denied,
-        devices_open: *devices_seen,
-        edge_backend: st.edge_backend,
-        edge_note: st.edge_note,
-        korean: crate::i18n::is_korean(),
-        newer_version: newer,
-    }
+    let korean = crate::i18n::is_korean();
+    shared.read_status(|st| {
+        *devices_seen |= st.devices.iter().any(|d| d.online);
+        let newer = match &st.update {
+            UpdateState::Available(r) | UpdateState::DownloadFailed(r) | UpdateState::InstallFailed(r) => Some(r.version.clone()),
+            _ => None,
+        };
+        Inputs {
+            hid_denied: st.hid_denied,
+            devices_open: *devices_seen,
+            edge_backend: st.edge_backend.clone(),
+            edge_note: st.edge_note.clone(),
+            korean,
+            newer_version: newer,
+        }
+    })
 }
 
 /// In the tray app: checks once what the session has settled on (the edges' probe and
@@ -349,9 +351,10 @@ pub fn spawn_watch(shared: Arc<Shared>) {
     let started = std::thread::Builder::new().name("setup".into()).spawn(move || {
         let start = Instant::now();
         while !shared.stopped() && start.elapsed() < Duration::from_secs(45) {
-            let (st, cfg) = (shared.status(), shared.config());
-            let edges_known = !st.edge_backend.is_empty();
-            let update_known = !cfg.check_updates || !matches!(st.update, UpdateState::Idle | UpdateState::Checking);
+            let check_updates = shared.config().check_updates;
+            let (edges_known, update_known) = shared.read_status(|st| {
+                (!st.edge_backend.is_empty(), !check_updates || !matches!(st.update, UpdateState::Idle | UpdateState::Checking))
+            });
             if start.elapsed() >= Duration::from_secs(5) && edges_known && update_known {
                 break;
             }

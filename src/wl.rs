@@ -2,8 +2,8 @@
 //! strips along the edges that notice the pointer (edge_layer.rs), the click-through
 //! countdown, and for finding the cursor the surfaces over each output that learn where
 //! the pointer is and the highlight itself (overlay_wayland.rs), all wlr-layer-shell
-//! surfaces. Each user opens its own connection on its own thread. libwayland-client is loaded at run
-//! time (wayland-dlopen), so on a computer without it `connect` just fails.
+//! surfaces. Each user opens its own connection on its own thread. libwayland-client is
+//! loaded at run time (wayland-dlopen), so on a computer without it `connect` just fails.
 
 use crate::edge_logic::Zone;
 use memmap2::MmapMut;
@@ -66,6 +66,17 @@ pub struct Display {
     pub name: String,
 }
 
+impl Display {
+    /// Its name for the log ("DP-1"), or "an output" when the compositor gave none.
+    pub fn label(&self) -> &str {
+        if self.name.is_empty() {
+            "an output"
+        } else {
+            &self.name
+        }
+    }
+}
+
 /// What the pointer did over our surfaces.
 #[derive(Debug, Clone, PartialEq)]
 pub enum PointerEvent {
@@ -101,6 +112,7 @@ pub struct State {
     shapes: Vec<(ObjectId, wp_cursor_shape_device_v1::WpCursorShapeDeviceV1)>,
     outputs: Vec<Output>,
     want_pointer: bool,
+    want_keyboard: bool,
     /// Outputs came, went or changed since this was last cleared.
     pub outputs_changed: bool,
     pub pointer_events: Vec<PointerEvent>,
@@ -123,8 +135,9 @@ pub struct Wl {
 
 impl Wl {
     /// Connects and reads the globals and the outputs. `want_pointer`: also follow the
-    /// pointer over our surfaces.
-    pub fn connect(want_pointer: bool) -> Result<Wl, String> {
+    /// pointer over our surfaces; `want_keyboard`: and the keys while one of them has the
+    /// keyboard (only the edge strips ever take it).
+    pub fn connect(want_pointer: bool, want_keyboard: bool) -> Result<Wl, String> {
         let conn = Connection::connect_to_env().map_err(|e| format!("{e}"))?;
         let mut queue = conn.new_event_queue();
         let qh = queue.handle();
@@ -139,6 +152,7 @@ impl Wl {
             shapes: Vec::new(),
             outputs: Vec::new(),
             want_pointer,
+            want_keyboard,
             outputs_changed: true,
             pointer_events: Vec::new(),
             key_events: Vec::new(),
@@ -368,7 +382,7 @@ impl Dispatch<wl_registry::WlRegistry, ()> for State {
                     state.xdg_outputs = Some(manager);
                 }
                 "wp_cursor_shape_manager_v1" if state.want_pointer => state.cursor_shape = Some(registry.bind(name, 1, qh, ())),
-                "wl_seat" if state.want_pointer => {
+                "wl_seat" if state.want_pointer || state.want_keyboard => {
                     let seat: wl_seat::WlSeat = registry.bind(name, version.min(5), qh, ());
                     state.seats.push(Seat { global: name, seat, pointer: None, keyboard: None });
                 }
@@ -442,7 +456,7 @@ impl Dispatch<wl_seat::WlSeat, ()> for State {
     fn event(state: &mut Self, seat: &wl_seat::WlSeat, event: wl_seat::Event, _: &(), _: &Connection, qh: &QueueHandle<Self>) {
         let wl_seat::Event::Capabilities { capabilities: WEnum::Value(caps) } = event else { return };
         let Some(entry) = state.seats.iter_mut().find(|s| &s.seat == seat) else { return };
-        let has = caps.contains(wl_seat::Capability::Pointer);
+        let has = state.want_pointer && caps.contains(wl_seat::Capability::Pointer);
         match (&entry.pointer, has) {
             (None, true) => {
                 let pointer = seat.get_pointer(qh, ());
@@ -461,7 +475,7 @@ impl Dispatch<wl_seat::WlSeat, ()> for State {
             }
             _ => {}
         }
-        let has = caps.contains(wl_seat::Capability::Keyboard);
+        let has = state.want_keyboard && caps.contains(wl_seat::Capability::Keyboard);
         match (&entry.keyboard, has) {
             (None, true) => entry.keyboard = Some(seat.get_keyboard(qh, ())),
             (Some(_), false) => {

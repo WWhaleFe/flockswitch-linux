@@ -5,16 +5,17 @@
 use crate::engine::Engine;
 use crate::i18n::{texts, Texts};
 use crate::icon;
-use crate::shared::{Shared, Status};
+use crate::shared::Shared;
 use anyhow::Result;
 use auto_launch::{AutoLaunch, AutoLaunchBuilder, LinuxLaunchMode};
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::process::Child;
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuId, MenuItem, PredefinedMenuItem};
-use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
+use tray_icon::{Icon, TrayIcon, TrayIconBuilder, TrayIconEvent};
 
 #[derive(Clone)]
 enum Action {
@@ -35,7 +36,8 @@ struct Ui {
     shared: Arc<Shared>,
     tray: Option<TrayIcon>,
     actions: HashMap<MenuId, Action>,
-    shown: (Status, u64),
+    /// The status generation and settings version the menu was built from.
+    shown: (u64, u64),
     uninstall_requested: bool,
     shortcuts: Option<crate::hotkey::Shortcuts>,
 }
@@ -58,7 +60,7 @@ pub fn run(shared: Arc<Shared>, open_settings: bool) -> Result<()> {
         shared: shared.clone(),
         tray: None,
         actions: HashMap::new(),
-        shown: (Status::default(), u64::MAX),
+        shown: (u64::MAX, u64::MAX),
         uninstall_requested: false,
         shortcuts: None,
     };
@@ -80,7 +82,7 @@ pub fn run(shared: Arc<Shared>, open_settings: bool) -> Result<()> {
             }
         });
     }
-    if crate::hotkey::unsupported_session() {
+    if crate::edge_wayland::session_is_wayland() {
         // Wayland: the shortcuts go through the system's shortcut service, and finding
         // the cursor has a watcher of its own (on X11 both are hotkey.rs and edge.rs).
         log::info!("keyboard shortcuts: Wayland session: through the system's shortcut service (GlobalShortcuts portal)");
@@ -93,11 +95,17 @@ pub fn run(shared: Arc<Shared>, open_settings: bool) -> Result<()> {
         }
     }
 
+    // The settings version and recording pause the shortcuts were last checked against.
+    let mut shortcuts_for = None;
     loop {
         // Follow the shortcut settings (and let go while the settings window records one).
         if let Some(s) = ui.shortcuts.as_mut() {
-            if let Some(failed) = s.sync(&shared.config()) {
-                shared.set_status(|st| st.hotkeys_failed = failed);
+            let now = Some((shared.version(), crate::hotkey::paused()));
+            if now != shortcuts_for {
+                shortcuts_for = now;
+                if let Some(failed) = s.sync(&shared.config()) {
+                    shared.set_status(|st| st.hotkeys_failed = failed);
+                }
             }
         }
 
@@ -132,8 +140,9 @@ pub fn run(shared: Arc<Shared>, open_settings: bool) -> Result<()> {
             return Ok(());
         }
 
+        reap_children();
         // Redraw when the engine found/lost devices or switched.
-        let now = (shared.status(), shared.version());
+        let now = (shared.status_generation(), shared.version());
         if ui.tray.is_some() && now != ui.shown {
             ui.refresh();
         }
@@ -214,17 +223,24 @@ fn tray_icon(enabled: bool) -> Result<Icon> {
 
 impl Ui {
     fn create_tray(&mut self) -> Result<()> {
+        // The icon's own events (clicks) are not used: the menu does everything.
+        // Without a handler tray-icon queues every one of them, and a queue nobody reads
+        // grows for as long as the app runs.
+        TrayIconEvent::set_event_handler(Some(|_: TrayIconEvent| {}));
+        // Read before the menu is built: a change while it is built is drawn next time.
+        let shown = (self.shared.status_generation(), self.shared.version());
         let menu = self.build_menu();
         let cfg = self.shared.config();
         let builder = TrayIconBuilder::new().with_menu(Box::new(menu)).with_tooltip("flockswitch");
         let builder = builder.with_icon(tray_icon(cfg.enabled)?);
         let tray = builder.build()?;
         self.tray = Some(tray);
-        self.shown = (self.shared.status(), self.shared.version());
+        self.shown = shown;
         Ok(())
     }
 
     fn refresh(&mut self) {
+        let shown = (self.shared.status_generation(), self.shared.version());
         let menu = self.build_menu();
         let enabled = self.shared.config().enabled;
         if let Some(tray) = &self.tray {
@@ -233,7 +249,7 @@ impl Ui {
                 let _ = tray.set_icon(Some(icon));
             }
         }
-        self.shown = (self.shared.status(), self.shared.version());
+        self.shown = shown;
     }
 
     fn check(&mut self, text: impl AsRef<str>, checked: bool, enabled: bool, action: Action) -> CheckMenuItem {
@@ -395,7 +411,9 @@ impl Ui {
 /// is installed and started straight away. A failed install is tried again only at the
 /// next daily check.
 fn spawn_update_check(shared: Arc<Shared>) {
-    std::thread::spawn(move || {
+    // A timer that mostly sleeps: a small stack is plenty (installing runs on a thread of
+    // its own).
+    let started = std::thread::Builder::new().name("update-check".into()).stack_size(256 * 1024).spawn(move || {
         let mut wait = Duration::from_secs(20);
         loop {
             let until = Instant::now() + wait;
@@ -418,6 +436,9 @@ fn spawn_update_check(shared: Arc<Shared>) {
             }
         }
     });
+    if let Err(e) = started {
+        log::warn!("update check: cannot start its thread: {e}");
+    }
 }
 
 /// Starts the settings window as a separate process of this same program.
@@ -433,15 +454,26 @@ pub fn open_settings_page(page: &str) {
 
 fn start_settings(args: &[&str]) {
     match std::env::current_exe() {
-        Ok(exe) => {
-            if let Err(e) = std::process::Command::new(exe).args(args).spawn() {
-                log::warn!("cannot open the settings window: {e}");
-            }
-        }
+        Ok(exe) => match std::process::Command::new(exe).args(args).spawn() {
+            Ok(child) => adopt(child),
+            Err(e) => log::warn!("cannot open the settings window: {e}"),
+        },
         Err(e) => log::warn!("cannot open the settings window: {e}"),
     }
 }
 
+/// Programs started and not waited for (the settings window, xdg-open). The tray app
+/// collects each one's exit in its loop, so none stays in the process table as a zombie
+/// for the rest of the day.
+static CHILDREN: Mutex<Vec<Child>> = Mutex::new(Vec::new());
+
+pub fn adopt(child: Child) {
+    CHILDREN.lock().unwrap().push(child);
+}
+
+fn reap_children() {
+    CHILDREN.lock().unwrap().retain_mut(|c| matches!(c.try_wait(), Ok(None)));
+}
 
 #[cfg(test)]
 mod tests {

@@ -12,9 +12,10 @@
 
 use crate::edge::Rect;
 use crate::locate_logic::{self as logic, CATCH_MAX, CATCH_WAIT};
+use crate::overlay::once;
 use crate::overlay_render as render;
 use crate::wl::{Anchor, Display, Layer, PointerEvent, Wl};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
 use std::time::{Duration, Instant};
 use tiny_skia::{Color, Pixmap};
 
@@ -89,16 +90,12 @@ pub struct EdgeEffect {
     logged: bool,
 }
 
-fn once(flag: &AtomicBool) -> bool {
-    !flag.swap(true, Ordering::Relaxed)
-}
-
 impl Painter {
     pub fn open() -> Option<Painter> {
         static WARNED: AtomicBool = AtomicBool::new(false);
         // With the pointer: the surfaces that find the cursor need it (the countdown's
-        // take no input, so they never hear from it).
-        match Wl::connect(true) {
+        // take no input, so they never hear from it). No surface here takes the keyboard.
+        match Wl::connect(true, false) {
             Ok(wl) if wl.has_layer_shell() => {
                 log::info!("overlay: drawing on wlr-layer-shell surfaces ({} outputs)", wl.displays().len());
                 Some(Painter { wl })
@@ -214,7 +211,7 @@ impl Painter {
         });
         if drawn && !e.logged {
             e.logged = true;
-            log::info!("overlay: countdown on {} at {:?}, scale {scale}", if e.display.name.is_empty() { "an output" } else { &e.display.name }, e.layer.configured());
+            log::info!("overlay: countdown on {} at {:?}, scale {scale}", e.display.label(), e.layer.configured());
         }
         true
     }
@@ -241,7 +238,7 @@ impl Painter {
             log::info!("locate: no output to put a surface on (outputs: {:?}); not shown", displays.iter().map(|d| d.rect).collect::<Vec<_>>());
             return None;
         }
-        let names: Vec<String> = catchers.iter().map(|c| format!("{} {:?} scale {}", output_name(&c.display), c.display.rect, c.display.scale)).collect();
+        let names: Vec<String> = catchers.iter().map(|c| format!("{} {:?} scale {}", c.display.label(), c.display.rect, c.display.scale)).collect();
         log::info!(
             "locate: through layer shell: a transparent surface over each output takes the pointer ({}); waiting up to {} ms for it",
             names.join("; "),
@@ -291,7 +288,7 @@ impl Painter {
                             let since = e.covered.unwrap_or(e.asked);
                             log::info!(
                                 "locate: position {at:?} (desktop, logical) from wl_pointer.enter on {} at ({x:.1}, {y:.1}), {} ms after the surfaces appeared",
-                                output_name(d),
+                                d.label(),
                                 now.duration_since(since).as_millis()
                             );
                         }
@@ -392,17 +389,9 @@ impl Painter {
         if drawn && !shown.logged {
             shown.logged = true;
             let what = if shown.full { "the whole output".to_string() } else { format!("a {} px square", shown.side) };
-            log::info!("locate: highlight on {} ({what}), scale {scale}", output_name(&shown.display));
+            log::info!("locate: highlight on {} ({what}), scale {scale}", shown.display.label());
         }
         true
-    }
-}
-
-fn output_name(d: &Display) -> &str {
-    if d.name.is_empty() {
-        "an output"
-    } else {
-        &d.name
     }
 }
 

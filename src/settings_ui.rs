@@ -525,7 +525,7 @@ impl SettingsApp {
             autostart_on,
             error: None,
             last_refresh: Instant::now() - REFRESH,
-            // Started from a menu-bar app: come to the front once at start.
+            // Started from the tray app: come to the front once at start.
             raise_frames: 2,
             raise,
             title: texts().settings_title,
@@ -995,7 +995,7 @@ impl SettingsApp {
         }
         label_info(ui, p, row, 40.0, t.hotkeys_title, t.hotkey_help);
         hint(ui, p, t.hotkeys_hint);
-        if crate::hotkey::unsupported_session() && self.cfg.hotkeys.on {
+        if crate::edge_wayland::session_is_wayland() && self.cfg.hotkeys.on {
             // Wayland: registered through the system's shortcut service; how that stands.
             ui.add_space(8.0);
             self.portal_box(ui, t, p, false);
@@ -1048,7 +1048,7 @@ impl SettingsApp {
         if failed {
             hint(ui, p, t.hotkey_taken);
         }
-        if crate::hotkey::unsupported_session() && !recording && !key.is_empty() {
+        if crate::edge_wayland::session_is_wayland() && !recording && !key.is_empty() {
             self.portal_trigger_hint(ui, t, p, n, &key);
         }
         if start {
@@ -1372,7 +1372,7 @@ impl SettingsApp {
         let events = ctx.input(|i| i.events.clone());
         for event in events {
             let egui::Event::Key { key, physical_key, pressed: true, modifiers, .. } = event else { continue };
-            // The physical key: with ⌥ held, macOS turns 1 into ¡.
+            // The physical key, not what the keyboard layout makes of it with the modifiers held.
             let key = physical_key.unwrap_or(key);
             if key == egui::Key::Escape {
                 self.stop_recording();

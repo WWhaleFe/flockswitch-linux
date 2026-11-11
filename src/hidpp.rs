@@ -10,6 +10,7 @@ use hidapi::{HidApi, HidDevice};
 use std::collections::{BTreeMap, VecDeque};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 /// Set by the last scan when a Logitech device could not be opened for lack of
@@ -19,6 +20,10 @@ static PERMISSION_DENIED: AtomicBool = AtomicBool::new(false);
 pub fn permission_denied() -> bool {
     PERMISSION_DENIED.load(Ordering::Relaxed)
 }
+
+/// What the last scan could not open. Without the udev rule the engine looks again every
+/// few seconds; the same failures again go to the debug log only.
+static OPEN_FAILURES: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
 pub const LOGITECH_VID: u16 = 0x046d;
 pub const REPORT_SHORT: u8 = 0x10;
@@ -50,9 +55,6 @@ pub struct Endpoint {
     pub product: String,
     /// USB/Bluetooth product ID. For a Bluetooth device this identifies the model.
     pub product_id: u16,
-    /// Stable identity of the endpoint across re-enumerations.
-    #[allow(dead_code)]
-    pub key: String,
     long: HidDevice,
     /// Separate handle for short reports. `None` when the OS exposes short and long
     /// reports on the same handle (macOS) or the endpoint has no short collection.
@@ -262,8 +264,9 @@ pub fn endpoint_keys(api: &HidApi) -> Vec<String> {
 /// Opens every Logitech HID++ endpoint on this machine.
 pub fn discover(api: &HidApi) -> Vec<Endpoint> {
     let mut out = Vec::new();
+    let mut failures = Vec::new();
     PERMISSION_DENIED.store(false, Ordering::Relaxed);
-    for (key, g) in groups(api) {
+    for g in groups(api).into_values() {
         let (Some(long_path), Some(kind)) = (g.long, g.kind) else { continue };
         let open = |p: &str| api.open_path(&std::ffi::CString::new(p).unwrap());
         let long = match open(&long_path) {
@@ -271,9 +274,9 @@ pub fn discover(api: &HidApi) -> Vec<Endpoint> {
             Err(e) => {
                 if access_denied(&long_path) {
                     PERMISSION_DENIED.store(true, Ordering::Relaxed);
-                    log::warn!("no permission to open {long_path} ({}): the udev rule is missing", g.product);
+                    failures.push(format!("no permission to open {long_path} ({}): the udev rule is missing", g.product));
                 } else {
-                    log::warn!("cannot open {long_path}: {e}");
+                    failures.push(format!("cannot open {long_path}: {e}"));
                 }
                 continue;
             }
@@ -284,7 +287,7 @@ pub fn discover(api: &HidApi) -> Vec<Endpoint> {
             Some(sp) if sp != long_path => match open(&sp) {
                 Ok(d) => Some(d),
                 Err(e) => {
-                    log::warn!("cannot open the short-report collection {sp}: {e}");
+                    failures.push(format!("cannot open the short-report collection {sp}: {e}"));
                     short_unavailable = true;
                     None
                 }
@@ -295,7 +298,6 @@ pub fn discover(api: &HidApi) -> Vec<Endpoint> {
             kind,
             product: g.product,
             product_id: g.product_id,
-            key,
             long,
             short,
             backlog: VecDeque::new(),
@@ -314,6 +316,12 @@ pub fn discover(api: &HidApi) -> Vec<Endpoint> {
         log::debug!("endpoint {:?} '{}' (separate short handle: {})", kind, ep.product, ep.short.is_some());
         out.push(ep);
     }
+    let mut reported = OPEN_FAILURES.lock().unwrap();
+    let level = if *reported == failures { log::Level::Debug } else { log::Level::Warn };
+    for f in &failures {
+        log::log!(level, "{f}");
+    }
+    *reported = failures;
     out
 }
 

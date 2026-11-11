@@ -10,7 +10,7 @@
 
 use crate::config::{Config, Edge, Edges, EDGES};
 use crate::device::waveform;
-use crate::edge::{rising_pulse, Rect, HAPTIC_TICK};
+use crate::edge::{rising_pulse, Rect, FINAL_PULSE, HAPTIC_TICK, STATUS_POLL};
 use crate::edge_logic::{self as logic, Choice, DwellConfig, Effect, Probe, Reason, Side, Situation};
 use crate::overlay;
 use crate::shared::Shared;
@@ -19,11 +19,11 @@ use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 /// How often the watchers look (the same as edge.rs).
-pub const POLL: Duration = Duration::from_millis(25);
-const STATUS_POLL: Duration = Duration::from_millis(300);
-/// A pulse takes a moment to play; Change Host right after would cut it short.
-const FINAL_PULSE: Duration = Duration::from_millis(150);
+pub(crate) use crate::edge::POLL;
 
+/// A Wayland session (XDG_SESSION_TYPE=wayland, or WAYLAND_DISPLAY set): no app may read
+/// the cursor or grab keys for the whole desktop, so the edges, the cursor highlight and
+/// the shortcuts go the Wayland ways.
 pub fn session_is_wayland() -> bool {
     let var = |name: &str| std::env::var(name).unwrap_or_default();
     var("XDG_SESSION_TYPE").eq_ignore_ascii_case("wayland") || !var("WAYLAND_DISPLAY").is_empty()
@@ -154,7 +154,7 @@ fn probe(forced: Option<String>) -> (Probe, String) {
         p.forced.as_deref().map(|f| format!(", forced '{f}'")).unwrap_or_default()
     );
     if wayland {
-        match crate::wl::Wl::connect(false) {
+        match crate::wl::Wl::connect(false, false) {
             Ok(wl) => {
                 p.layer_shell = Some(wl.has_layer_shell());
                 let outputs: Vec<String> = wl.displays().iter().map(|d| format!("{} {:?} scale {}", d.name, d.rect, d.scale)).collect();
@@ -232,7 +232,7 @@ async fn gnome_shell_version() -> Option<u32> {
 pub fn preview(edges: &Edges) {
     static TARGET: OnceLock<&'static str> = OnceLock::new();
     let target = *TARGET.get_or_init(|| {
-        if crate::wl::Wl::connect(false).is_ok_and(|wl| wl.has_layer_shell()) {
+        if crate::wl::Wl::connect(false, false).is_ok_and(|wl| wl.has_layer_shell()) {
             overlay::use_layer_shell();
             "layer-shell"
         } else if std::env::var_os("DISPLAY").is_some() {
@@ -246,8 +246,7 @@ pub fn preview(edges: &Edges) {
     if target.is_empty() {
         return;
     }
-    let edge = EDGES.into_iter().find(|&e| edges.channel(e) != 0).unwrap_or(Edge::Right);
-    let duration = Duration::from_millis(edges.dwell_ms.max(1000));
+    let (edge, duration) = crate::edge::preview_edge(edges);
     overlay::edge_begin_at(edges, edge, None, None, Duration::ZERO, duration, true);
 }
 
@@ -335,29 +334,20 @@ impl Watch {
             changed = true;
         }
         let active = self.active();
-        if !self.announced {
-            self.announced = true;
-            if active {
-                let list: Vec<String> = EDGES
-                    .iter()
-                    .filter(|&&e| self.cfg.edges.channel(e) != 0)
-                    .map(|&e| format!("{} → {}", e.name(), self.cfg.edges.channel(e)))
-                    .collect();
-                log::info!("edges: {} after {} ms", list.join(", "), self.cfg.edges.dwell_ms);
-            } else if self.cfg.edges.on {
-                log::info!("edges: on, but no edge has a channel");
-            }
+        if !std::mem::replace(&mut self.announced, true) {
+            crate::edge::announce(&self.cfg);
         }
         if self.status_read.is_none_or(|t| t.elapsed() >= STATUS_POLL) {
             let first = self.status_read.is_none();
             self.status_read = Some(Instant::now());
-            let st = self.shared.status();
-            self.sit.here = st.channel;
-            if st.last_switch != self.last_switch_text {
-                self.last_switch_text = st.last_switch.clone();
-                self.landing_channel = st.last_switch.as_deref().and_then(|t| t.rsplit(' ').next()?.parse().ok());
+            let last_seen = &self.last_switch_text;
+            let (channel, now_here, switch_changed) =
+                self.shared.read_status(|st| (st.channel, st.trigger.is_some(), (st.last_switch != *last_seen).then(|| st.last_switch.clone())));
+            self.sit.here = channel;
+            if let Some(text) = switch_changed {
+                self.landing_channel = text.as_deref().and_then(crate::edge::last_channel);
+                self.last_switch_text = text;
             }
-            let now_here = st.trigger.is_some();
             let arrived = now_here && !self.sit.mouse_here && !first;
             if arrived && active && self.cfg.edges.place_cursor {
                 let edge = self.landing_channel.take().and_then(|c| self.cfg.edges.edge_for(c));

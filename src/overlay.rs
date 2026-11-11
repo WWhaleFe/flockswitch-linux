@@ -25,7 +25,7 @@ use crate::edge::Rect;
 use crate::locate_logic::{LocatePath, CATCH_MAX, CATCH_WAIT};
 use crate::overlay_render as render;
 use crate::overlay_wayland as wayland;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::mpsc::{channel, Receiver, RecvTimeoutError, Sender};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
@@ -76,19 +76,18 @@ pub(crate) fn xwayland_allowed() -> bool {
     OUTSIDE_X11.load(Ordering::Relaxed) == OUTSIDE_X11_XWAYLAND
 }
 
+static READY: AtomicBool = AtomicBool::new(false);
 static COMMANDS: OnceLock<Sender<Command>> = OnceLock::new();
 
-/// Says this process has an interface and may draw. Without it (`flockswitch run`, as on
-/// macOS) no thread is started and nothing is drawn.
+/// Says this process has an interface and may draw. Without it (`flockswitch run`)
+/// nothing is drawn. The drawing thread starts with the first effect asked for.
 pub fn set_ready() {
-    COMMANDS.get_or_init(|| {
-        let (commands, received) = channel();
-        let started = std::thread::Builder::new().name("overlay".into()).spawn(move || run(received));
-        if let Err(e) = started {
-            log::warn!("overlay: cannot start its thread: {e}");
-        }
-        commands
-    });
+    READY.store(true, Ordering::Relaxed);
+}
+
+/// True the first time it is called with `flag`: for messages logged once.
+pub(crate) fn once(flag: &AtomicBool) -> bool {
+    !flag.swap(true, Ordering::Relaxed)
 }
 
 /// A colour from the settings as red, green and blue.
@@ -97,9 +96,22 @@ fn components(text: &str) -> [u8; 3] {
 }
 
 fn send(command: Command) {
-    if let Some(commands) = COMMANDS.get() {
-        let _ = commands.send(command);
+    if !READY.load(Ordering::Relaxed) {
+        return;
     }
+    // Nothing was ever drawn, so there is nothing to move or take away.
+    if COMMANDS.get().is_none() && matches!(command, Command::EdgeEnd | Command::EdgeCursor(_)) {
+        return;
+    }
+    let commands = COMMANDS.get_or_init(|| {
+        let (commands, received) = channel();
+        let started = std::thread::Builder::new().name("overlay".into()).spawn(move || run(received));
+        if let Err(e) = started {
+            log::warn!("overlay: cannot start its thread: {e}");
+        }
+        commands
+    });
+    let _ = commands.send(command);
 }
 
 /// Starts the countdown on `edge` of `display`, `elapsed` into the wait of `duration`.
@@ -573,9 +585,11 @@ mod platform {
         xcursor: Option<Xcursor>,
     }
 
+    /// One message about why nothing is drawn is enough.
+    static WARNED: AtomicBool = AtomicBool::new(false);
+
     fn once() -> bool {
-        static WARNED: AtomicBool = AtomicBool::new(false);
-        !WARNED.swap(true, Ordering::Relaxed)
+        super::once(&WARNED)
     }
 
     impl Connection {
@@ -691,9 +705,8 @@ mod platform {
                 return None;
             }
             let pixmap = Pixmap::new(w as u32, h as u32)?;
-            let len = (w as usize) * (h as usize) * 4;
             // Safety: attributes and region are built here; the window is destroyed in
-            // `Layer::destroy`, before this connection ends.
+            // `Layer`'s `Drop`, before this connection ends.
             unsafe {
                 let mut attributes: XSetWindowAttributes = zeroed();
                 attributes.override_redirect = 1;
@@ -713,7 +726,7 @@ mod platform {
                 (self.xfixes.XFixesSetWindowShapeRegion)(self.display, window, SHAPE_INPUT, 0, 0, region);
                 (self.xfixes.XFixesDestroyRegion)(self.display, region);
                 let gc = (self.xlib.XCreateGC)(self.display, window, 0, null_mut());
-                let mut layer = Layer { window, gc, pixmap, bgra: vec![0; len], image: zeroed(), x, y, mapped: false, gone: None };
+                let mut layer = Layer { window, gc, pixmap, image: zeroed(), x, y, mapped: false, gone: None };
                 layer.gone = Some((self.xlib.XDestroyWindow, self.xlib.XFreeGC, self.xlib.XFlush, self.display));
                 layer.init_image(self);
                 Some(layer)
@@ -876,9 +889,9 @@ mod platform {
     pub struct Layer {
         window: u64,
         gc: GC,
+        /// Drawn in premultiplied RGBA, then turned into the BGRA the 32-bit visual takes
+        /// in place: `image` shows these same bytes, so no second copy of the frame is kept.
         pixmap: Pixmap,
-        /// The window's pixels: premultiplied BGRA as the 32-bit visual takes them.
-        bgra: Vec<u8>,
         image: XImage,
         x: i32,
         y: i32,
@@ -892,7 +905,7 @@ mod platform {
             self.image.width = w as c_int;
             self.image.height = h as c_int;
             self.image.format = ZPixmap;
-            self.image.data = self.bgra.as_mut_ptr().cast();
+            self.image.data = self.pixmap.data_mut().as_mut_ptr().cast();
             self.image.byte_order = LSBFirst;
             self.image.bitmap_unit = 32;
             self.image.bitmap_bit_order = LSBFirst;
@@ -927,11 +940,12 @@ mod platform {
         pub fn draw(&mut self, x: &Connection, paint: impl FnOnce(&mut Pixmap)) {
             self.pixmap.fill(Color::TRANSPARENT);
             paint(&mut self.pixmap);
-            for (out, rgba) in self.bgra.chunks_exact_mut(4).zip(self.pixmap.data().chunks_exact(4)) {
-                out.copy_from_slice(&[rgba[2], rgba[1], rgba[0], rgba[3]]);
+            // RGBA → BGRA; the next frame starts by clearing it all again.
+            for px in self.pixmap.data_mut().chunks_exact_mut(4) {
+                px.swap(0, 2);
             }
-            // Safety: the image points at `bgra`, which is exactly as large as it says
-            // and is not resized.
+            // Safety: the image points at the pixmap's bytes, which are exactly as large
+            // as it says and are never reallocated (a pixmap keeps its size).
             unsafe {
                 (x.xlib.XPutImage)(x.display, self.window, self.gc, &mut self.image, 0, 0, 0, 0, self.pixmap.width(), self.pixmap.height());
                 if !self.mapped {

@@ -21,33 +21,20 @@ pub fn parse(text: &str) -> Result<HotKey> {
     text.parse::<HotKey>().map_err(|e| anyhow!("shortcut '{text}': {e}"))
 }
 
-/// How a shortcut is shown: ⌃⌥1 on macOS, Ctrl+Alt+1 elsewhere.
+/// How a shortcut is shown: Ctrl+Alt+1.
 pub fn display(text: &str) -> String {
     let parts: Vec<&str> = text.split('+').map(str::trim).collect();
     let has = |names: &[&str]| parts.iter().any(|p| names.iter().any(|n| p.eq_ignore_ascii_case(n)));
     let mods = [
-        (has(&["ctrl", "control"]), "⌃", "Ctrl"),
-        (has(&["alt", "option"]), "⌥", "Alt"),
-        (has(&["shift"]), "⇧", "Shift"),
-        (has(&["super", "cmd", "command", "meta"]), "⌘", "Super"),
+        (has(&["ctrl", "control"]), "Ctrl"),
+        (has(&["alt", "option"]), "Alt"),
+        (has(&["shift"]), "Shift"),
+        (has(&["super", "cmd", "command", "meta"]), "Super"),
     ];
     let key = parts.last().map(|k| k.to_uppercase()).unwrap_or_default();
-    if cfg!(target_os = "macos") {
-        let mut out: String = mods.iter().filter(|m| m.0).map(|m| m.1).collect();
-        out.push_str(&key);
-        out
-    } else {
-        let mut out: Vec<&str> = mods.iter().filter(|m| m.0).map(|m| m.2).collect();
-        out.push(&key);
-        out.join("+")
-    }
-}
-
-/// A Wayland session: global key grabs only see keys typed into X11 windows there, so
-/// flockswitch registers none with X and asks the system's shortcut service instead.
-pub fn unsupported_session() -> bool {
-    let var = |name: &str| std::env::var(name).unwrap_or_default();
-    var("XDG_SESSION_TYPE").eq_ignore_ascii_case("wayland") || !var("WAYLAND_DISPLAY").is_empty()
+    let mut out: Vec<&str> = mods.iter().filter(|m| m.0).map(|m| m.1).collect();
+    out.push(&key);
+    out.join("+")
 }
 
 /// While the settings window records a new shortcut it keeps this file fresh, and the
@@ -149,11 +136,6 @@ mod tests {
         assert!(parse("ctrl+alt+1").is_ok());
         assert!(parse("ctrl+alt+f5").is_ok());
         assert!(parse("ctrl+alt+").is_err());
-        let shown = display("ctrl+alt+shift+k");
-        if cfg!(target_os = "macos") {
-            assert_eq!(shown, "⌃⌥⇧K");
-        } else {
-            assert_eq!(shown, "Ctrl+Alt+Shift+K");
-        }
+        assert_eq!(display("ctrl+alt+shift+k"), "Ctrl+Alt+Shift+K");
     }
 }

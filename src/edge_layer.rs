@@ -41,7 +41,7 @@ fn rect(z: Zone) -> Rect {
 }
 
 pub fn run(shared: Arc<Shared>) {
-    let mut wl = match Wl::connect(true) {
+    let mut wl = match Wl::connect(true, true) {
         Ok(wl) if wl.has_layer_shell() => wl,
         Ok(_) => {
             log::warn!("layer-shell: the compositor has no wlr-layer-shell after all");
@@ -234,7 +234,7 @@ fn make_strip(wl: &mut Wl, displays: &[Display], seg: &Segment) -> Option<Strip>
     log::info!(
         "layer-shell: {} strip on {} {:?}: {} px from its start, {} px long",
         seg.side.name(),
-        if display.name.is_empty() { "an output" } else { &display.name },
+        display.label(),
         z,
         offset,
         length

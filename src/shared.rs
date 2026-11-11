@@ -82,7 +82,7 @@ pub struct StatusFile {
     /// Trigger buttons the master mouse has (control IDs).
     #[serde(default)]
     pub buttons: Vec<u16>,
-    /// Version of the running menu-bar app (empty before 0.3.5).
+    /// Version of the running tray app (empty before 0.3.5).
     #[serde(default)]
     pub version: String,
     /// Channels whose keyboard shortcut could not be registered.
@@ -349,6 +349,9 @@ pub struct Shared {
     /// Bumped on every config change so the engine knows to reload.
     version: AtomicU64,
     status: Mutex<Status>,
+    /// Bumped whenever the status really changes, so the tray menu needs no copy of it
+    /// to see that it is out of date.
+    status_generation: AtomicU64,
     last_status_file: Mutex<StatusFile>,
     pub stop: AtomicBool,
     /// Channel asked for by a keyboard shortcut, for the engine to act on (0 = none).
@@ -385,6 +388,7 @@ impl Shared {
             config_mtime: Mutex::new(config_mtime()),
             version: AtomicU64::new(0),
             status: Mutex::new(Status::default()),
+            status_generation: AtomicU64::new(0),
             last_status_file: Mutex::new(StatusFile { online: vec!["-".into()], ..StatusFile::default() }),
             stop: AtomicBool::new(false),
             switch_request: AtomicU8::new(0),
@@ -450,9 +454,24 @@ impl Shared {
         self.status.lock().unwrap().clone()
     }
 
+    /// Reads part of the status without copying all of it (the device list included):
+    /// for the watchers that look several times a second.
+    pub fn read_status<T>(&self, read: impl FnOnce(&Status) -> T) -> T {
+        read(&self.status.lock().unwrap())
+    }
+
+    /// Changes whenever the status does.
+    pub fn status_generation(&self) -> u64 {
+        self.status_generation.load(Ordering::SeqCst)
+    }
+
     pub fn set_status(&self, change: impl FnOnce(&mut Status)) {
         let mut st = self.status.lock().unwrap();
+        let before = st.clone();
         change(&mut st);
+        if *st != before {
+            self.status_generation.fetch_add(1, Ordering::SeqCst);
+        }
         let file = StatusFile {
             trigger: st.trigger.clone(),
             trigger_key: st.trigger_key.clone(),

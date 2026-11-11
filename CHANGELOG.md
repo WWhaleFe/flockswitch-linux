@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.13.0 — 2026-11-12
+
+Nothing works differently; the tray app, which runs all day, holds less memory and does less work.
+
+- The tray icon's click events no longer pile up in a queue nothing read, so memory no longer creeps up over a long uptime
+- The memory of an effect drawn over the screen (the edge countdown, the cursor highlight) goes back to the system when it ends. Before, after one large effect (such as the spotlight over a whole display) the memory of later, smaller ones stayed with the app: up to tens of MB on a large display. flockswitch now has the system allocator give every large buffer back, and keeps two memory pools instead of one per thread
+- On X11 and through XWayland (GNOME on Wayland) an effect keeps one copy of its frame instead of two: half the memory while it shows (a spotlight over a 2560×1440 display: 15 MB instead of 30 MB)
+- The drawing thread starts with the first effect instead of at start; the update timer and the Wayland find-the-cursor watcher use small stacks
+- The tray menu, the screen-edge and find-the-cursor watchers and the setup check no longer copy the whole status (with the device list) several times a second to see whether it changed, and the X11 shortcuts are looked at again only when the settings change
+- Programs started from the tray (the settings window, the browser for the release page or a report) no longer stay behind as finished processes until flockswitch quits
+- Without the udev rule, the same "no permission to open …" warning is no longer written to the log every few seconds, only when it changes
+- Smaller program: the regular-expression support of `RUST_LOG` filters is left out (levels such as `RUST_LOG=debug` work as before)
+- README: tested on Ubuntu 26.04 (GNOME 50, Wayland): switching, screen edges through input capture, find the cursor, shortcuts, the setup check and Homebrew updates. X11 sessions and KDE Plasma, sway and Hyprland are not tried yet
+
 ## 0.12.0 — 2026-11-12
 
 - **Find the cursor on Wayland.** No app may follow the cursor there, so for the moment the highlight shows (about a second, 2 s at most) flockswitch puts a transparent surface that takes the pointer over every screen and reads the position there: on GNOME a window through XWayland (when XWayland's screens line up with the displays, as for the edge countdown), on KDE Plasma, sway and Hyprland a layer-shell surface on each output. The highlight follows the pointer while it shows. It comes up when the mouse arrives from another computer, with the shortcut, and with the new command `flockswitch locate` (for a custom desktop shortcut; the running flockswitch shows it). The first click while it shows only ends it and goes no further; typing is not affected. Shaking the mouse needs the cursor all the time and stays X11 only, as the settings window now says. X11 sessions work exactly as before

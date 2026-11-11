@@ -8,7 +8,7 @@ flockswitch는 MX Master 마우스의 **휠 모드 전환 버튼, 제스처 버�
 
 이 저장소는 리눅스 버전입니다. 다른 버전은 [flockswitch-mac](https://github.com/WWhaleFe/flockswitch-mac), [flockswitch-windows](https://github.com/WWhaleFe/flockswitch-windows), [flockswitch-android](https://github.com/WWhaleFe/flockswitch-android)에 있으며, 모두 같은 방식으로 전환되어 섞어 쓸 수 있습니다.
 
-> **아직 실제 리눅스 PC에서 시험하지 않았습니다.** 장치와 통신하는 코드는 시험을 마친 macOS·Windows 버전과 같지만, 리눅스 기기에서는 아직 실행해 보지 않았습니다. 써 보신 결과를 알려 주시면 큰 도움이 됩니다.
+> **Ubuntu 26.04(GNOME 50, Wayland)에서 시험했습니다.** X11(Xorg) 세션과 KDE Plasma·sway·Hyprland에서는 아직 시험하지 않았습니다. 써 보신 결과를 알려 주시면 큰 도움이 됩니다.
 
 > Logitech과 관계없는 개인 오픈소스입니다. "Logitech", "MX Master", "Easy-Switch", "Bolt", "Unifying"은 Logitech의 상표입니다.
 
@@ -159,13 +159,18 @@ flockswitch는 이 PC에 연결된 Logitech 장치와 통신합니다. 인터넷
 
 ## 시험 현황
 
-| 연결 | 상태 |
+실제 기기에서 시험한 환경: Ubuntu 26.04, GNOME 50, Wayland 세션.
+
+| 기능 | 상태 |
 |---|---|
-| Logi Bolt 수신기 | 구현, 리눅스에서 미확인 |
-| Unifying 수신기 | 구현, 리눅스에서 미확인 |
-| 블루투스 | 구현, 리눅스에서 미확인 |
-| Wayland에서 화면 모서리 전환 (GNOME 입력 캡처, KDE·wlroots layer shell) | 구현, 미확인 |
-| Wayland에서 마우스 찾기와 단축키 (XWayland·layer shell, GlobalShortcuts 포털) | 구현, 미확인 |
+| 마우스 버튼으로 전환 | 동작 확인 |
+| GNOME Wayland에서 화면 모서리 전환 (입력 캡처 포털) | 동작 확인 |
+| GNOME Wayland에서 마우스 찾기 (XWayland) | 동작 확인 |
+| GNOME Wayland에서 키보드 단축키 (GlobalShortcuts 포털) | 동작 확인 |
+| 설치·설정 점검 | 동작 확인 |
+| Homebrew 설치본 업데이트 | 동작 확인 |
+| KDE Plasma·sway·Hyprland에서 화면 모서리와 마우스 찾기 (layer shell) | 구현, 미확인 |
+| X11(Xorg) 세션: 화면 모서리, 마우스 찾기, 단축키 | 구현, 미확인 |
 
 ## 빌드
 

@@ -26,7 +26,7 @@ pub const REPORT_EMAIL: &str = "feedback.wwhale@gmail.com";
 /// How often the running app looks for a new version (plus once shortly after start).
 pub const CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
 
-/// Where the menu-bar app is with updates (shown in its menu).
+/// Where the tray app is with updates (shown in its menu).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum UpdateState {
     #[default]
@@ -596,8 +596,9 @@ pub fn reveal(path: &Path) {
 
 /// Opens a web or mailto link (or a folder) with the desktop's default app.
 pub fn open_url(url: &str) {
-    if let Err(e) = Command::new("xdg-open").arg(url).spawn() {
-        log::warn!("cannot open {url}: {e}");
+    match Command::new("xdg-open").arg(url).spawn() {
+        Ok(child) => crate::tray::adopt(child),
+        Err(e) => log::warn!("cannot open {url}: {e}"),
     }
 }
 

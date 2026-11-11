@@ -108,7 +108,11 @@ fn main() {
     // The long-running modes take the single-instance lock before touching the log, so
     // a second copy does not wipe the running copy's log file.
     let tray_mode = args.is_empty() || args[0] == "tray";
-    let _lock = if tray_mode || args[0] == "run" {
+    let long_running = tray_mode || args[0] == "run";
+    if long_running {
+        tune_malloc();
+    }
+    let _lock = if long_running {
         match single_instance() {
             Some(lock) => Some(lock),
             None if tray_mode => match already_running() {
@@ -319,7 +323,33 @@ fn load_config() -> Config {
     }
 }
 
-/// Started while the menu-bar app already runs. Starting it again is how people look
+/// The tray app runs all day, with a dozen mostly idle threads and short bursts of large
+/// buffers (an effect drawn over the screen: up to width × height × 4 bytes). glibc's
+/// defaults keep memory freed by such a burst: after a large buffer is freed it raises
+/// its mmap threshold to that size, so later buffers come from the heap and stay there
+/// once freed, and every thread gets an arena of its own. A fixed threshold sends every
+/// allocation of 128 KiB or more to mmap, which gives it back to the system when freed,
+/// and two arenas are plenty for threads that mostly sleep.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+fn tune_malloc() {
+    use std::ffi::c_int;
+    extern "C" {
+        fn mallopt(param: c_int, value: c_int) -> c_int;
+    }
+    // From glibc's <malloc.h>.
+    const M_MMAP_THRESHOLD: c_int = -3;
+    const M_ARENA_MAX: c_int = -8;
+    // Safety: mallopt only changes the allocator's settings; called before any thread starts.
+    unsafe {
+        mallopt(M_MMAP_THRESHOLD, 128 * 1024);
+        mallopt(M_ARENA_MAX, 2);
+    }
+}
+
+#[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+fn tune_malloc() {}
+
+/// Started while the tray app already runs. Starting it again is how people look
 /// for it, so the same version opens the settings window. A different version (for
 /// example an older one still set to start at login) is asked to quit, and this copy
 /// takes over, so the version the user just started is the one that runs.
