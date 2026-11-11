@@ -53,7 +53,7 @@ pub fn run(lock: std::net::TcpListener, show_update: bool) -> Result<()> {
     let icon = egui::IconData { rgba: ICON_RGBA.to_vec(), width: ICON_SIDE, height: ICON_SIDE };
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_title(t.settings_title)
+            .with_title(window_title(t.settings_title))
             // Matches flockswitch.desktop, so the dock shows the app's name and icon.
             .with_app_id("flockswitch")
             .with_icon(icon)
@@ -620,7 +620,7 @@ impl eframe::App for SettingsApp {
         let t = texts();
         if self.title != t.settings_title {
             self.title = t.settings_title;
-            ctx.send_viewport_cmd(egui::ViewportCommand::Title(t.settings_title.into()));
+            ctx.send_viewport_cmd(egui::ViewportCommand::Title(window_title(t.settings_title)));
         }
         keep_size(&ctx, &mut self.size_guard, WINDOW_MIN, WINDOW_MAX);
         let p = Palette::new(ui.visuals().dark_mode);
@@ -1420,7 +1420,7 @@ impl SettingsApp {
     fn haptics_window(&mut self, ctx: &egui::Context, t: &Texts) {
         let Some(dialog) = &self.haptics_dialog else { return };
         let mut builder = egui::ViewportBuilder::default()
-            .with_title(t.haptics_dialog_title)
+            .with_title(window_title(t.haptics_dialog_title))
             .with_inner_size(HAPTICS_DIALOG_SIZE)
             .with_resizable(false)
             .with_minimize_button(false)
@@ -2327,6 +2327,18 @@ fn warning(ui: &mut Ui, p: Palette, title: &str, text: &str) {
 }
 
 /// The desktop's name for the Wayland notes ("ubuntu:GNOME" → "GNOME").
+/// The window title. On GNOME's Wayland session the title bar is drawn by winit with one
+/// font that has no Hangul, so a Korean title would show as boxes there: "flockswitch".
+fn window_title(text: &str) -> String {
+    let wayland = crate::edge_wayland::session_is_wayland();
+    let gnome = std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_default().to_ascii_lowercase().contains("gnome");
+    if wayland && gnome && !text.is_ascii() {
+        "flockswitch".into()
+    } else {
+        text.into()
+    }
+}
+
 fn desktop_name() -> String {
     let desktop = std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_default();
     desktop.rsplit(':').next().map(str::trim).filter(|d| !d.is_empty()).unwrap_or("Wayland").to_string()
@@ -2365,13 +2377,21 @@ fn edge_backend_text(t: &Texts, backend: &str, note: &str, require_control: bool
             }
             (text, false)
         }
-        "none" => match code {
-            "gnome-old" => (t.edges_none_gnome.replace("{version}", arg), true),
-            "no-wayland" => (t.edges_none_wayland.to_string(), true),
-            "no-display" => (t.edges_none_display.to_string(), true),
-            "forced" => (t.edges_none_forced.replace("{name}", arg), true),
-            _ => (fill(t.edges_none_support), true),
-        },
+        "none" => {
+            let text = match code {
+                "gnome-old" => return (t.edges_none_gnome.replace("{version}", arg), true),
+                "no-wayland" => t.edges_none_wayland.to_string(),
+                "no-display" => t.edges_none_display.to_string(),
+                "forced" => return (t.edges_none_forced.replace("{name}", arg), true),
+                _ => fill(t.edges_none_support),
+            };
+            // What the running flockswitch found (GNOME version, the portal's answer).
+            if arg.is_empty() {
+                (text, true)
+            } else {
+                (format!("{text}\n{}", t.edges_none_found.replace("{found}", arg)), true)
+            }
+        }
         _ => (t.edges_unknown.to_string(), false),
     }
 }

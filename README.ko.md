@@ -27,6 +27,8 @@ flockswitch는 **MX Master 3**와 **MX Master 4**를 바탕으로 만들고 시�
 - systemd-logind (대부분의 데스크톱 배포판). 장치를 열게 해 주는 udev 규칙에 필요합니다
 - **트레이 아이콘**: StatusNotifierItem 아이콘을 보여 주는 패널. KDE Plasma, Ubuntu의 GNOME, Cinnamon, XFCE 등 대부분이 지원합니다. 기본 GNOME(예: Fedora)은 *AppIndicator and KStatusNotifierItem Support* 확장이 필요합니다. 트레이가 없으면 앱 메뉴에서 flockswitch를 한 번 더 실행하면 설정 창이 열립니다.
 - 창의 **한글 표시**: 한글 글꼴. 예: `fonts-noto-cjk`(Debian/Ubuntu), `google-noto-sans-cjk-fonts`(Fedora)
+- **Wayland에서 화면 모서리 전환**: KDE Plasma·sway·Hyprland는 따로 필요한 것이 없습니다. GNOME은 45 이상과 입력 캡처를 지원하는 데스크톱 포털(`xdg-desktop-portal` 1.17 이상, `xdg-desktop-portal-gnome` 45 이상, 보통 이미 설치됨)이 필요합니다. 확인: `busctl --user get-property org.freedesktop.portal.Desktop /org/freedesktop/portal/desktop org.freedesktop.portal.InputCapture version`에 숫자가 나오면 됩니다. GNOME 44 이하는 X11(Xorg) 세션에서 쓰세요
+- 설치 명령을 단계별로 정리한 안내는 [릴리스](../../releases/latest) 페이지의 "설치 전에 준비할 것"에 있습니다
 
 ## 설치
 

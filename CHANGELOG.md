@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.10.1 — 2026-11-11
+
+- On GNOME's Wayland session the settings window's title bar showed Korean as boxes: winit draws that title bar with one font that has no Hangul, so the title there is "flockswitch"
+- The red box on the Edges page now has a "Found" line with the GNOME version and the desktop portal's answer about input capture (error text included), so a screenshot shows the cause. On GNOME 45 or newer it says to install the portal packages
+- When the input capture portal or the compositor isn't ready yet (started at login), flockswitch looks again every 30 s, up to ten times. Where the GNOME version can't be read over D-Bus, it asks `gnome-shell --version`
+- The release page lists what to install first (Homebrew, a Korean font, the tray extension, the desktop portal, the udev rule) and explains the screens people often see after installing; the README's requirements say what Wayland edge switching needs
+
 ## 0.10.0 — 2026-11-11
 
 - Switching at the screen edge works on Wayland. flockswitch picks what the desktop offers and logs it (`edge backend: …`): on **GNOME 45 or newer** the desktop portal's input capture (a barrier on each edge that has a channel; when the cursor pushes against it the system hands the cursor to flockswitch, which switches after the time at the edge or gives it back as soon as you move back in, click or type), on **KDE Plasma, sway, Hyprland** and other wlroots desktops a transparent one-pixel strip along those edges (wlr-layer-shell). The corners and edges that continue onto another display are left out as on X11, the haptic pulses work the same, and a change of displays moves the barriers or strips. X11 sessions work exactly as before

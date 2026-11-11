@@ -72,13 +72,32 @@ pub fn spawn(shared: Arc<Shared>) {
         return;
     }
     let started = std::thread::Builder::new().name("edges".into()).spawn(move || {
-        let probe = probe(forced);
-        let choice = logic::choose(&probe);
-        match &choice {
-            Choice::None(reason) => {
+        let mut tries = 0;
+        let (probe, choice) = loop {
+            let (probe, found) = probe(forced.clone());
+            let choice = logic::choose(&probe);
+            // A portal or compositor that is still starting (flockswitch started at
+            // login) answers a little later: look again for a few minutes.
+            let again = matches!(choice, Choice::None(Reason::NoSupport | Reason::NoWayland)) && tries < PROBE_RETRIES;
+            if let Choice::None(reason) = &choice {
                 log::info!("edge backend: none ({})", reason.explain());
-                set_status(&shared, choice.name(), &reason.code());
+                // What was found, for the settings window: a screenshot of it then says
+                // why without the log.
+                let code = match reason {
+                    Reason::NoSupport | Reason::NoWayland => format!("{}:{found}", reason.code()),
+                    _ => reason.code(),
+                };
+                set_status(&shared, choice.name(), &code);
             }
+            if !again {
+                break (probe, choice);
+            }
+            tries += 1;
+            log::info!("edge probe: looking again in {} s ({tries}/{PROBE_RETRIES})", PROBE_RETRY.as_secs());
+            std::thread::sleep(PROBE_RETRY);
+        };
+        match &choice {
+            Choice::None(_) => {}
             Choice::InputCapture => {
                 log::info!(
                     "edge backend: input-capture (xdg-desktop-portal InputCapture v{}{})",
@@ -118,8 +137,12 @@ pub async fn within<T>(limit: Duration, fut: impl Future<Output = T>) -> Option<
     }
 }
 
-/// What this session offers, logged step by step.
-fn probe(forced: Option<String>) -> Probe {
+const PROBE_RETRIES: u32 = 10;
+const PROBE_RETRY: Duration = Duration::from_secs(30);
+
+/// What this session offers, logged step by step, and a one-line summary of it.
+fn probe(forced: Option<String>) -> (Probe, String) {
+    let mut found = Vec::new();
     let wayland = session_is_wayland();
     let mut p = Probe { wayland, x11_display: std::env::var_os("DISPLAY").is_some(), forced, ..Probe::default() };
     log::info!(
@@ -142,7 +165,13 @@ fn probe(forced: Option<String>) -> Probe {
                     outputs.join("; ")
                 );
             }
-            Err(e) => log::info!("edge probe: cannot connect to the Wayland compositor: {e}"),
+            Err(e) => {
+                log::info!("edge probe: cannot connect to the Wayland compositor: {e}");
+                found.push(format!("Wayland: {e}"));
+            }
+        }
+        if p.layer_shell == Some(false) {
+            found.push("wlr-layer-shell: no".into());
         }
     }
     let want_portal = p.layer_shell != Some(true) || p.forced.as_deref() == Some("input-capture");
@@ -150,7 +179,11 @@ fn probe(forced: Option<String>) -> Probe {
     async_io::block_on(async {
         if gnome_desktop {
             p.gnome = within(Duration::from_secs(5), gnome_shell_version()).await.flatten();
+            if p.gnome.is_none() {
+                p.gnome = gnome_shell_version_command();
+            }
             log::info!("edge probe: GNOME Shell {}", p.gnome.map(|v| v.to_string()).unwrap_or_else(|| "version unknown".into()));
+            found.push(format!("GNOME {}", p.gnome.map(|v| v.to_string()).unwrap_or_else(|| "?".into())));
         }
         if want_portal {
             match within(Duration::from_secs(25), crate::edge_portal::probe()).await {
@@ -158,14 +191,31 @@ fn probe(forced: Option<String>) -> Probe {
                     log::info!("edge probe: portal InputCapture v{version}, capabilities {caps}");
                     if caps.contains("pointer") {
                         p.input_capture = Some(version);
+                    } else {
+                        found.push(format!("InputCapture v{version}: {caps}"));
                     }
                 }
-                Some(Err(e)) => log::info!("edge probe: portal InputCapture: {e}"),
-                None => log::info!("edge probe: portal InputCapture: no answer in 25 s"),
+                Some(Err(e)) => {
+                    log::info!("edge probe: portal InputCapture: {e}");
+                    found.push(format!("InputCapture: {e}"));
+                }
+                None => {
+                    log::info!("edge probe: portal InputCapture: no answer in 25 s");
+                    found.push("InputCapture: no answer".into());
+                }
             }
         }
     });
-    p
+    (p, found.join(" · "))
+}
+
+/// `gnome-shell --version` ("GNOME Shell 46.0" → 46), where the D-Bus property is not
+/// readable.
+fn gnome_shell_version_command() -> Option<u32> {
+    let out = std::process::Command::new("gnome-shell").arg("--version").stderr(std::process::Stdio::null()).output().ok()?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    let version = text.split_whitespace().find(|w| w.chars().next().is_some_and(|c| c.is_ascii_digit()))?;
+    version.split('.').next()?.parse().ok()
 }
 
 /// The running GNOME Shell's major version ("46.2" → 46).

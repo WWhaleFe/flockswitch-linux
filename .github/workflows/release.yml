@@ -85,10 +85,10 @@ jobs:
           {
             printf '## 변경 사항\n\n'
             section CHANGELOG.ko.md
-            printf '\n### Homebrew 설치 (Linux)\n\n```sh\n# 설치\nbrew install wwhalefe/tap/flockswitch\n\n# 초기 설정 (최초 1회 — udev 규칙 및 앱 메뉴 등록)\nsudo install -m 644 "$(brew --prefix)/opt/flockswitch/share/flockswitch/70-flockswitch.rules" /etc/udev/rules.d/\nsudo udevadm control --reload-rules\nsudo udevadm trigger --subsystem-match=hidraw\nmkdir -p ~/.local/share/applications\nln -sf "$(brew --prefix)/opt/flockswitch/share/applications/flockswitch.desktop" ~/.local/share/applications/\n\n# 업데이트 / 제거\nbrew update && brew upgrade flockswitch\nflockswitch uninstall && brew uninstall flockswitch\n```\n\n'
+            printf '\n'; sed "s/@VERSION@/$version/g" packaging/linux/release-notes/install.ko.md; printf '\n'
             printf '## Changes\n\n'
             section CHANGELOG.md
-            printf '\n### Install with Homebrew (Linux)\n\n```sh\n# Install\nbrew install wwhalefe/tap/flockswitch\n\n# First-time setup (udev rule and app menu entry)\nsudo install -m 644 "$(brew --prefix)/opt/flockswitch/share/flockswitch/70-flockswitch.rules" /etc/udev/rules.d/\nsudo udevadm control --reload-rules\nsudo udevadm trigger --subsystem-match=hidraw\nmkdir -p ~/.local/share/applications\nln -sf "$(brew --prefix)/opt/flockswitch/share/applications/flockswitch.desktop" ~/.local/share/applications/\n\n# Upgrade / Uninstall\nbrew update && brew upgrade flockswitch\nflockswitch uninstall && brew uninstall flockswitch\n```\n'
+            printf '\n'; sed "s/@VERSION@/$version/g" packaging/linux/release-notes/install.en.md
           } > notes.md
           cat notes.md
       - uses: actions/download-artifact@v4

@@ -32,6 +32,8 @@ Install flockswitch on **every** computer you switch between, and pair each devi
 - systemd-logind (nearly every desktop distribution), for the udev rule that lets you open the devices
 - **Tray icon**: a panel that shows StatusNotifierItem icons — KDE Plasma, Ubuntu's GNOME, Cinnamon, XFCE and most others do. Plain GNOME (e.g. Fedora) needs the *AppIndicator and KStatusNotifierItem Support* extension. Without a tray, start flockswitch from the app menu again to open its settings.
 - **Korean text** in the window: a font with Hangul, e.g. `fonts-noto-cjk` (Debian/Ubuntu) or `google-noto-sans-cjk-fonts` (Fedora)
+- **Screen-edge switching on Wayland**: nothing extra on KDE Plasma, sway or Hyprland. GNOME needs version 45 or newer and a desktop portal with input capture (`xdg-desktop-portal` 1.17+, `xdg-desktop-portal-gnome` 45+, usually already installed). Check: `busctl --user get-property org.freedesktop.portal.Desktop /org/freedesktop/portal/desktop org.freedesktop.portal.InputCapture version` prints a number. On GNOME 44 or older use an X11 (Xorg) session
+- Step-by-step install commands are under "Before you install" on the [release](../../releases/latest) page
 
 ## Install
 
