@@ -50,6 +50,11 @@ USAGE:
                             shortcut where Wayland has no shortcut service)
     flockswitch locate       ask the running flockswitch to show where the cursor is (for a
                             custom desktop shortcut on Wayland; finding the cursor must be on)
+    flockswitch setup        check what this computer still needs (udev rule, Korean font,
+                            tray extension, desktop portal, app menu entry) and install it
+                            all with one password; --yes installs without asking,
+                            --dry-run only shows the commands, --check only tells
+                            (exit 1 when something is missing); see `flockswitch setup --help`
     flockswitch config       print the config file path (created on first use)
     flockswitch quit         ask the running flockswitch to give the button back and quit
     flockswitch uninstall    remove start-at-login and all settings (also quits the running
@@ -128,6 +133,15 @@ fn main() {
         None
     };
     Config::migrate_old_name();
+    // `flockswitch setup` talks to the person at the terminal; what it runs goes to
+    // setup.log, and only when it may install something.
+    if args.first().map(String::as_str) == Some("setup") {
+        let installs = setup_logic::parse_cli(&args[1..]).is_ok_and(|o| !o.help && !o.dry_run && !o.check);
+        if installs {
+            init_logging(Some(setup::log_path()));
+        }
+        std::process::exit(setup::cli(&args[1..]));
+    }
     // The settings window has no console when started from the menu: log to its own
     // file so a window that fails to open (graphics drivers) leaves a trace.
     let log_file = if tray_mode {
@@ -156,7 +170,19 @@ fn real_main(args: &[String]) -> Result<()> {
     let cmd = args.first().map(String::as_str).unwrap_or("tray");
     match cmd {
         // `tray --settings`: started by the settings window after it installed an update.
-        "tray" => tray::run(Arc::new(Shared::new(load_config())), args.get(1).map(String::as_str) == Some("--settings")),
+        "tray" => {
+            // No settings file yet: the first start on this computer. Its setup check
+            // then opens the settings window once, if something is missing.
+            let first_start = !Config::path().exists();
+            let mut cfg = load_config();
+            if first_start {
+                cfg.setup.first_check = true;
+                if let Err(e) = cfg.save() {
+                    log::warn!("cannot save the settings: {e:#}");
+                }
+            }
+            tray::run(Arc::new(Shared::new(cfg)), args.get(1).map(String::as_str) == Some("--settings"))
+        }
         "run" => run_headless(),
         "settings" => {
             // One settings window at a time. Opening it again knocks on the open

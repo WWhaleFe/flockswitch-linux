@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.14.0 — 2026-11-12
+
+Installing takes one command and one password; every feature stays as it was.
+
+- **One-line install**: `curl -fsSL https://github.com/WWhaleFe/flockswitch-linux/releases/latest/download/get.sh | sh` downloads the latest release for this computer (x86_64 or arm64), stops unless it matches the release's SHA256SUMS.txt, and runs its install.sh (`… | sh -s -- --yes` installs without asking). It works with curl or wget and refuses to run as root. Every release now carries `get.sh`, also listed in SHA256SUMS.txt
+- **`flockswitch setup`**, the setup check in a terminal: a short numbered list of what this computer still needs and why (the udev rule, and where they apply a font with Hangul, the GNOME tray icon extension, the desktop portal for screen edges, the app menu entry of a Homebrew install), the exact commands, then `Install these now? [Y/n]` (asked on the terminal, so it works under `curl | sh`). Every step that needs administrator rights runs in one `sudo` (pkexec, the desktop's dialog, where there is no terminal), so the password is asked once; then the steps run as you, then what is left ("log out and in", "replug the receiver"). One item failing does not stop the others. `--yes` doesn't ask, `--dry-run` only shows, `--check` exits 1 when something is missing; the exit status says what happened (`flockswitch setup --help`), and what runs is written to `~/.config/flockswitch/setup.log`. It looks at the same things as the settings window, including the desktop portal (asked briefly when flockswitch is not running); a Homebrew update is not part of it
+- install.sh runs `flockswitch setup` (passing `--yes` on), so the udev rule and what the desktop needs come together with one password; if that cannot run, it installs the udev rule with sudo as before. It still works the same from an unpacked release folder
+- Homebrew: `brew install --formula wwhalefe/tap/flockswitch && flockswitch setup` does the first-time setup (udev rule, app menu entry and the rest)
+- Settings → General → Setup check: with two or more items missing, **Install all** shows every command in one confirmation and runs all the administrator steps in one pkexec, so the password is asked once; each row then shows how its own item went
+- On the very first start (no settings yet), if something is missing, the settings window opens once on the setup check instead of the notification (kept in `config.toml` as `[setup] first_check` until then)
+- README and the release notes start with the one-line install, then Homebrew, then the release file; the commands for setting up by hand are kept, shorter
+
 ## 0.13.0 — 2026-11-12
 
 Nothing works differently; the tray app, which runs all day, holds less memory and does less work.

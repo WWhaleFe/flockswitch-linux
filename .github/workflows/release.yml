@@ -1,5 +1,6 @@
 # Builds flockswitch for Linux (x86_64 and arm64) from source on GitHub-hosted Ubuntu
-# and publishes it as a GitHub release when a version tag (v*) is pushed.
+# and publishes it as a GitHub release when a version tag (v*) is pushed, together with
+# the one-line installer get.sh (releases/latest/download/get.sh) and SHA256SUMS.txt.
 
 name: Release
 
@@ -69,6 +70,7 @@ jobs:
             CHANGELOG.md
             CHANGELOG.ko.md
             packaging/linux/release-notes/
+            packaging/linux/get.sh
           sparse-checkout-cone-mode: false
       - name: Release notes from CHANGELOG.ko.md and CHANGELOG.md
         run: |
@@ -101,8 +103,14 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           cp artifacts/flockswitch-linux-*.tar.gz .
-          sha256sum flockswitch-linux-*.tar.gz > SHA256SUMS.txt
+          # The one-line installer is published as a file of every release, so
+          # releases/latest/download/get.sh always is the latest one.
+          cp packaging/linux/get.sh get.sh
+          sh -n get.sh
+          # get.sh is listed too, for anyone who checks the script before running it; the
+          # updater and get.sh look up the tarball's own line, so an extra line is harmless.
+          sha256sum flockswitch-linux-*.tar.gz get.sh > SHA256SUMS.txt
           # --generate-notes adds GitHub's "Full Changelog" link after notes.md.
-          gh release create "$GITHUB_REF_NAME" flockswitch-linux-*.tar.gz SHA256SUMS.txt \
+          gh release create "$GITHUB_REF_NAME" flockswitch-linux-*.tar.gz get.sh SHA256SUMS.txt \
             --repo "$GITHUB_REPOSITORY" --title "flockswitch $GITHUB_REF_NAME" \
             --notes-file notes.md --generate-notes

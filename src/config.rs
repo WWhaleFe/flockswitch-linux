@@ -789,8 +789,9 @@ pub struct Config {
     pub haptics: Haptics,
     /// Showing where the cursor is.
     pub locate: Locate,
-    /// The setup check's items set aside with "Later". Written only when there are
-    /// some, and kept out of settings backups (it is about this computer).
+    /// The setup check's items set aside with "Later", and whether its first check is
+    /// still to come. Written only when there is something, and kept out of settings
+    /// backups (it is about this computer).
     #[serde(skip_serializing_if = "Setup::is_empty")]
     pub setup: Setup,
 }
@@ -801,12 +802,18 @@ pub struct Config {
 pub struct Setup {
     /// Items set aside ("udev-rule", "tray-icon", "brew-update:0.11.1", …): no longer
     /// shown or counted until "Show again".
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub snoozed: Vec<String>,
+    /// Set when the tray app started without a settings file: its first setup check
+    /// opens the settings window on the General tab if something is missing, then
+    /// clears it (as does opening the settings window), so that happens once.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub first_check: bool,
 }
 
 impl Setup {
     pub fn is_empty(&self) -> bool {
-        self.snoozed.is_empty()
+        self.snoozed.is_empty() && !self.first_check
     }
 }
 

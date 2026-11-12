@@ -402,6 +402,13 @@ mod tests {
         assert!(parse(&text).unwrap().setup.is_empty());
         // Nothing set aside: no [setup] table in the settings file either.
         assert!(!Config::default().to_text().unwrap().contains("[setup]"));
+        // The first check still to come is kept in the settings file, not in a backup.
+        let mut c = Config::default();
+        c.setup.first_check = true;
+        let text = c.to_text().unwrap();
+        assert!(text.contains("[setup]") && text.contains("first_check = true") && !text.contains("snoozed"), "{text}");
+        assert!(Config::parse(&text).unwrap().setup.first_check);
+        assert!(!export_text(&c, "desk", "2026-11-11 10:00:00").unwrap().contains("first_check"));
     }
 
     #[test]

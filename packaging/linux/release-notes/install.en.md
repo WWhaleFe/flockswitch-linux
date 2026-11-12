@@ -12,109 +12,52 @@
 >
 > From 0.11.0 on, when a new version is out the app asks first (tray menu "Update available", Settings → General **Update now**) and, once you approve, runs these commands and restarts. Moving to 0.11.0 itself needs the commands above once.
 
-### Before you install
-
-**flockswitch finds what is missing and offers to install it.** After it starts, a notification and the tray menu (**Setup needed: N…**) point to Settings → General → **Setup check**: each missing item (udev rule, Korean font, tray icon extension, desktop portal, Homebrew's app menu entry and updates) with **Install** and **Later**. Install shows the exact commands first and runs nothing until you press **Run**; your desktop asks for your password where administrator rights are needed. The commands below are the same ones, to run by hand if you prefer (or if there is no password dialog).
-
-| What | When | Install |
-|---|---|---|
-| Homebrew | To install with Homebrew (1 below) | Otherwise see "Install without Homebrew" |
-| Korean font | Only to show Korean in the settings window | `sudo apt-get install -y fonts-noto-cjk` (Fedora: `google-noto-sans-cjk-fonts`) |
-| Tray icon extension | Stock GNOME on Fedora or Debian (not Ubuntu or KDE) | `gnome-shell-extension-appindicator` (3 below) |
-| Desktop portal | Screen-edge switching on GNOME Wayland | `xdg-desktop-portal`, `xdg-desktop-portal-gnome` (usually already there, 4 below) |
-| udev rule | Always (permission to open the devices) | Part of the install commands (or the setup check) |
-
-**1. Homebrew** (skip if you have it)
+### Quick install (one line)
 
 ```sh
-# Ubuntu / Debian
-sudo apt-get install -y build-essential procps curl file git
-# Fedora
-sudo dnf group install -y development-tools && sudo dnf install -y procps-ng curl file git
-
-# Install Homebrew, then make brew available in this and new terminals
-/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
-echo 'eval "$(/home/linuxbrew/.linuxbrew/bin/brew shellenv)"' >> ~/.bashrc
-eval "$(/home/linuxbrew/.linuxbrew/bin/brew shellenv)"
+curl -fsSL https://github.com/WWhaleFe/flockswitch-linux/releases/latest/download/get.sh | sh
 ```
 
-**2. Korean font**
+Downloads the file for this computer (x86_64 or arm64), checks it against SHA256SUMS.txt below, puts the program in `~/.local/bin` and flockswitch in the app menu, then `flockswitch setup` lists what this computer still needs and why (the udev rule, and where they apply the Korean font, the GNOME tray icon extension and the desktop portal), shows the commands and asks once; everything that needs administrator rights runs in one `sudo`, so you type your password once. Finally it says what is left (such as "log out and in once") and starts flockswitch. `… | sh -s -- --yes` installs without asking. Run it as yourself, not with sudo. From then on flockswitch updates itself.
+
+### Homebrew
 
 ```sh
-sudo apt-get install -y fonts-noto-cjk            # Ubuntu / Debian
-sudo dnf install -y google-noto-sans-cjk-fonts    # Fedora
+brew install --formula wwhalefe/tap/flockswitch && flockswitch setup
 ```
 
-**3. Tray icon** — nothing to do on KDE, Ubuntu, Cinnamon or XFCE. On stock GNOME (Fedora, Debian) install the extension, log out and back in, then enable it:
+`flockswitch setup` also adds the app menu entry; then start flockswitch from the app menu. Upgrade (or Settings → General → **Update now**, which runs it after you approve): `brew update && brew upgrade --formula wwhalefe/tap/flockswitch`. Uninstall: `flockswitch uninstall && brew uninstall --formula wwhalefe/tap/flockswitch`. No Homebrew yet? The one line above needs none (Homebrew itself: [brew.sh](https://brew.sh)).
 
-```sh
-sudo dnf install -y gnome-shell-extension-appindicator      # Fedora
-sudo apt-get install -y gnome-shell-extension-appindicator  # Debian
-# after logging back in
-gnome-extensions enable appindicatorsupport@rgcjonas.gmail.com
-```
-
-**4. Screen-edge switching on Wayland** — check your session first:
-
-```sh
-echo $XDG_SESSION_TYPE $XDG_CURRENT_DESKTOP   # e.g. wayland ubuntu:GNOME
-gnome-shell --version                          # GNOME only
-# GNOME: is the input capture portal there? (a number such as "u 1" means yes)
-busctl --user get-property org.freedesktop.portal.Desktop /org/freedesktop/portal/desktop org.freedesktop.portal.InputCapture version
-```
-
-| You see | What to do |
-|---|---|
-| `x11` | Nothing |
-| KDE Plasma, sway, Hyprland | Nothing |
-| GNOME 45 or newer (Ubuntu 24.04+, Fedora 39+) | Click **Allow** when the system asks about input capture the first time (GNOME 45–50 ask each time flockswitch starts) |
-| GNOME 45 or newer, but `busctl` gives an error | Install or update the portal, then log in again: `sudo apt-get install -y xdg-desktop-portal xdg-desktop-portal-gnome` (Fedora: `sudo dnf install -y xdg-desktop-portal xdg-desktop-portal-gnome`) |
-| GNOME 44 or older (Ubuntu 22.04, Debian 12) | Not available on Wayland. Log out, pick "Ubuntu on Xorg" or "GNOME on Xorg" from ⚙ at the bottom right of the login screen, and log in |
-
-When Settings → Switching → Edges shows a red box, its "Found" line has the GNOME version and the portal's answer. Please include that line when you report a problem.
-
-**5. (Minimal installs only) If the settings window doesn't open**
-
-```sh
-sudo apt-get install -y libxkbcommon0 libgl1 libegl1          # Ubuntu / Debian
-sudo dnf install -y libxkbcommon mesa-libGL mesa-libEGL       # Fedora
-```
-
-### Install with Homebrew (Linux)
-
-```sh
-# Install
-brew install --formula wwhalefe/tap/flockswitch
-
-# First-time setup (udev rule and app menu entry); the setup check can do this for you
-sudo install -m 644 "$(brew --prefix)/opt/flockswitch/share/flockswitch/70-flockswitch.rules" /etc/udev/rules.d/
-sudo udevadm control --reload-rules
-sudo udevadm trigger --subsystem-match=hidraw
-mkdir -p ~/.local/share/applications
-ln -sf "$(brew --prefix)/opt/flockswitch/share/applications/flockswitch.desktop" ~/.local/share/applications/
-
-# Homebrew 6+: if you get an 'untrusted tap' error (installed with an older Homebrew), once
-brew trust --formula wwhalefe/tap/flockswitch
-
-# Upgrade (or Settings → General → Update now, which runs this after you approve) / Uninstall
-brew update && brew upgrade --formula wwhalefe/tap/flockswitch
-flockswitch uninstall && brew uninstall --formula wwhalefe/tap/flockswitch
-```
-
-After installing: replug the receiver once (or reconnect Bluetooth) and start flockswitch from the app menu. When `flockswitch list` shows your mouse and keyboard, you're set.
-
-### Install without Homebrew
+### Install by hand
 
 Download `flockswitch-linux-<x86_64|aarch64>-@VERSION@.tar.gz` from Assets below, then:
 
 ```sh
 tar xzf flockswitch-linux-x86_64-@VERSION@.tar.gz
 cd flockswitch-linux-x86_64-@VERSION@
-./install.sh      # installs to ~/.local/bin, adds the menu entry and udev rule (sudo asks once), starts it
+./install.sh      # to ~/.local/bin, app menu entry, then flockswitch setup (one password), then starts it
 ```
+
+<details>
+<summary>The setup commands, to run yourself (what <code>flockswitch setup</code> runs)</summary>
+
+`flockswitch setup --dry-run` prints only the ones this computer needs.
+
+| What | When | Commands |
+|---|---|---|
+| udev rule | Always (permission to open the devices); then replug the receiver | `sudo install -m 644 70-flockswitch.rules /etc/udev/rules.d/` (Homebrew: `"$(brew --prefix)/opt/flockswitch/share/flockswitch/70-flockswitch.rules"`), `sudo udevadm control --reload-rules`, `sudo udevadm trigger --subsystem-match=hidraw` |
+| Korean font | The window in Korean | `sudo apt-get install -y fonts-noto-cjk` (Fedora: `google-noto-sans-cjk-fonts`) |
+| Tray icon | Stock GNOME on Fedora or Debian (not Ubuntu or KDE); then log out and in | `sudo dnf install -y gnome-shell-extension-appindicator` (Debian: `apt-get`), `gnome-extensions enable appindicatorsupport@rgcjonas.gmail.com` |
+| Desktop portal | Screen edges on GNOME 45+ Wayland without input capture; then log out and in | `sudo apt-get install -y xdg-desktop-portal xdg-desktop-portal-gnome` (Fedora: `dnf`) |
+| App menu entry | Homebrew only | `mkdir -p ~/.local/share/applications && ln -sf "$(brew --prefix)/opt/flockswitch/share/applications/flockswitch.desktop" ~/.local/share/applications/` |
+| Window libraries | Minimal installs where the settings window doesn't open | `sudo apt-get install -y libxkbcommon0 libgl1 libegl1` (Fedora: `libxkbcommon mesa-libGL mesa-libEGL`) |
+
+Screen-edge switching on Wayland: nothing to do on KDE Plasma, sway or Hyprland; on GNOME 45 or newer click **Allow** when the system asks about input capture (GNOME 45–50 ask each time flockswitch starts); GNOME 44 or older (Ubuntu 22.04, Debian 12) has no input capture, so pick "Ubuntu on Xorg" or "GNOME on Xorg" from ⚙ at the bottom right of the login screen.
+
+</details>
 
 ### If you see this after installing
 
-- **"Looking for devices…" at the top**: the mouse and keyboard aren't connected to this computer right now. Switch them to this computer's channel (Bluetooth takes a few seconds to connect). If it stays, check `flockswitch list`; if it says "No permission to use the devices", install the udev rule from the setup check on the General tab (or run the udev commands above) and replug the receiver.
-- **A red box on the Edges page**: follow the table in 4.
+- **"Looking for devices…" at the top**: the mouse and keyboard aren't connected to this computer right now. Switch them to this computer's channel (Bluetooth takes a few seconds to connect). If it stays, check `flockswitch list`; if it says "No permission to use the devices", run `flockswitch setup` (or use the setup check on the General tab) and replug the receiver.
+- **A red box on the Edges page**: run `flockswitch setup`, or see "Screen-edge switching on Wayland" above. Its "Found" line has the GNOME version and the portal's answer; please include it when you report a problem.
 - **Find the cursor says "On Wayland…"**: finding the cursor needs the cursor position, so it works in an X11 session only.

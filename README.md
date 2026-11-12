@@ -34,9 +34,9 @@ Install flockswitch on **every** computer you switch between, and pair each devi
 - **Korean text** in the window: a font with Hangul, e.g. `fonts-noto-cjk` (Debian/Ubuntu) or `google-noto-sans-cjk-fonts` (Fedora)
 - **Keyboard shortcuts on Wayland**: a desktop portal with GlobalShortcuts (GNOME 48 or newer and KDE Plasma have one; sway's portal does not) and flockswitch in the app menu (`flockswitch.desktop`: install.sh adds it, the setup check does for Homebrew). Check: `busctl --user get-property org.freedesktop.portal.Desktop /org/freedesktop/portal/desktop org.freedesktop.portal.GlobalShortcuts version` prints a number. Without it, custom desktop shortcuts run `flockswitch switch N` and `flockswitch locate`
 - **Screen-edge switching on Wayland**: nothing extra on KDE Plasma, sway or Hyprland. GNOME needs version 45 or newer and a desktop portal with input capture (`xdg-desktop-portal` 1.17+, `xdg-desktop-portal-gnome` 45+, usually already installed). Check: `busctl --user get-property org.freedesktop.portal.Desktop /org/freedesktop/portal/desktop org.freedesktop.portal.InputCapture version` prints a number. On GNOME 44 or older use an X11 (Xorg) session
-- Step-by-step install commands are under "Before you install" on the [release](../../releases/latest) page
+- The commands for each of these are under [Setting up by hand](#setting-up-by-hand); `flockswitch setup` runs them for you
 
-flockswitch looks for these itself. When something is missing it sends one notification after it starts (useful on stock GNOME, where the tray icon may be what's missing), the tray menu shows **Setup needed: N…**, and Settings → General starts with a **Setup check** card: one row per missing item with why it's needed, **Install** and **Later**. Install first shows exactly the commands that will run; nothing runs until you press **Run**. Commands that need administrator rights run through `pkexec`, so your desktop asks for your password; if that isn't possible (no pkexec, or you cancelled), the card shows the same commands with `sudo` and a **Copy commands** button for a terminal. What it can do:
+flockswitch looks for these itself: in a terminal with `flockswitch setup` (see [Install](#install)), and in the app. When something is missing it sends one notification after it starts (useful on stock GNOME, where the tray icon may be what's missing; on the very first start the settings window opens on the setup check instead, once), the tray menu shows **Setup needed: N…**, and Settings → General starts with a **Setup check** card: one row per missing item with why it's needed, **Install** and **Later**, and with two or more of them **Install all**, which runs every administrator step together so your password is asked once. Install first shows exactly the commands that will run; nothing runs until you press **Run**. Commands that need administrator rights run through `pkexec`, so your desktop asks for your password; if that isn't possible (no pkexec, or you cancelled), the card shows the same commands with `sudo` and a **Copy commands** button for a terminal. What it can do:
 
 | Item | When it's offered | What runs |
 |---|---|---|
@@ -47,39 +47,68 @@ flockswitch looks for these itself. When something is missing it sends one notif
 | App menu entry | installed with Homebrew, no menu entry yet | a link in `~/.local/share/applications` (no password) |
 | New version | installed with Homebrew and a newer release is out | `brew trust --formula wwhalefe/tap/flockswitch` (Homebrew 6+), `brew update`, `brew upgrade --formula wwhalefe/tap/flockswitch`, then flockswitch restarts into it (no password) |
 
-**Later** hides an item on this computer (kept in `config.toml` as `[setup] snoozed`, not in settings backups); **Show again** brings them back. Everything printed goes to the log. Detecting reads files and asks the session bus, `fc-list` and `dpkg-query` / `rpm -q` / `pacman -Q`; it never needs a password or the network. The manual commands below still work as before.
+**Later** hides an item on this computer (kept in `config.toml` as `[setup] snoozed`, not in settings backups); **Show again** brings them back. Everything printed goes to the log. Detecting reads files and asks the session bus, `fc-list` and `dpkg-query` / `rpm -q` / `pacman -Q`; it never needs a password or the network.
 
 ## Install
+
+**One command** (one question, your password once):
+
+```sh
+curl -fsSL https://github.com/WWhaleFe/flockswitch-linux/releases/latest/download/get.sh | sh
+```
+
+It downloads the latest release for this computer (x86_64 or arm64), stops unless the file matches the release's `SHA256SUMS.txt`, puts the program in `~/.local/bin` and flockswitch in the app menu, runs `flockswitch setup` (below) and starts flockswitch. `… | sh -s -- --yes` installs without asking. Run it as yourself, not with sudo. Running it again reinstalls the latest version.
+
+**`flockswitch setup`** lists what this computer still needs and why: the udev rule that lets flockswitch open the devices (always), and where they apply a Korean font, the tray icon extension (stock GNOME), the desktop portal for screen edges (GNOME on Wayland) and the app menu entry (Homebrew). It shows the exact commands, asks `Install these now? [Y/n]`, runs every administrator step in one `sudo` (one password; the desktop's password dialog where there is no terminal) and the rest as you, and ends with what is left, such as "log out and in" or "replug the receiver". `--yes` doesn't ask, `--dry-run` only shows, `--check` exits 1 when something is missing (`flockswitch setup --help` lists the exit codes); what runs goes to `~/.config/flockswitch/setup.log`. Run it again any time; the app's setup check (above) does the same.
 
 With [Homebrew](https://brew.sh):
 
 ```sh
-brew install --formula wwhalefe/tap/flockswitch
-
-# First-time setup: udev rule (once, with sudo) and app menu entry. The settings
-# window's Setup check offers to do both for you.
-sudo install -m 644 "$(brew --prefix)/opt/flockswitch/share/flockswitch/70-flockswitch.rules" /etc/udev/rules.d/
-sudo udevadm control --reload-rules
-sudo udevadm trigger --subsystem-match=hidraw
-mkdir -p ~/.local/share/applications
-ln -sf "$(brew --prefix)/opt/flockswitch/share/applications/flockswitch.desktop" ~/.local/share/applications/
+brew install --formula wwhalefe/tap/flockswitch && flockswitch setup
 ```
 
-`brew update && brew upgrade --formula wwhalefe/tap/flockswitch` updates it. A Homebrew copy never updates without asking: when a new version is out, the tray menu shows **Update available (x.y.z)…** and Settings → General offers **Update now**, which shows these commands and runs them once you press Run (with **Install updates automatically** on, a notification asks). The tap also has a macOS cask of the same name, so without `--formula` and `wwhalefe/tap/` Homebrew tries to load the cask too and stops.
+then start flockswitch from the app menu. `brew update && brew upgrade --formula wwhalefe/tap/flockswitch` updates it. A Homebrew copy never updates without asking: when a new version is out, the tray menu shows **Update available (x.y.z)…** and Settings → General offers **Update now**, which shows these commands and runs them once you press Run (with **Install updates automatically** on, a notification asks). The tap also has a macOS cask of the same name, so without `--formula` and `wwhalefe/tap/` Homebrew tries to load the cask too and stops.
 
 On Homebrew 6 or newer, if you see `Refusing to load … from untrusted tap wwhalefe/tap` (installed with an older Homebrew), run once: `brew trust --formula wwhalefe/tap/flockswitch`
 
-Or get `flockswitch-linux-<x86_64|aarch64>-<version>.tar.gz` from [Releases](../../releases), then:
+Or by hand: get `flockswitch-linux-<x86_64|aarch64>-<version>.tar.gz` from [Releases](../../releases), then
 
 ```sh
 tar xzf flockswitch-linux-x86_64-<version>.tar.gz
 cd flockswitch-linux-x86_64-<version>
-./install.sh
+./install.sh      # what the one command does after the download; --yes doesn't ask
 ```
 
-`install.sh` puts the program in `~/.local/bin`, adds flockswitch to the app menu, installs the udev rule `/etc/udev/rules.d/70-flockswitch.rules` (sudo asks for your password once) and starts flockswitch. If a receiver was plugged in, replug it once (or reconnect Bluetooth) so the rule applies.
-
 Updates install themselves: when the daily check finds a new version (or you press **Update now**), flockswitch downloads it, checks it against the release's SHA256SUMS.txt, replaces the program in `~/.local/bin` along with its app-menu entry and icon, and restarts. Turn this off in Settings → General (`flockswitch set auto_update false`); **Check now** followed by **Update now** still installs a new version whenever you ask. It never asks for a password; if a release changes the udev rule, the setup check offers the new one. A program in a folder you cannot write to (for example `/usr/bin`) is only downloaded.
+
+### Setting up by hand
+
+The same commands `flockswitch setup` runs, for those who prefer to type them (`flockswitch setup --dry-run` prints the ones this computer needs):
+
+```sh
+# udev rule (always), from the unpacked release folder; with Homebrew the file is
+# "$(brew --prefix)/opt/flockswitch/share/flockswitch/70-flockswitch.rules". Then replug the receiver.
+sudo install -m 644 70-flockswitch.rules /etc/udev/rules.d/
+sudo udevadm control --reload-rules
+sudo udevadm trigger --subsystem-match=hidraw
+
+# Korean font (window in Korean). Fedora: google-noto-sans-cjk-fonts, openSUSE: noto-sans-cjk-fonts, Arch: noto-fonts-cjk
+sudo apt-get install -y fonts-noto-cjk
+
+# Tray icon on stock GNOME (Fedora, Debian; not Ubuntu or KDE), then log out and in
+sudo dnf install -y gnome-shell-extension-appindicator      # Debian: sudo apt-get install -y …
+gnome-extensions enable appindicatorsupport@rgcjonas.gmail.com
+
+# Screen edges on GNOME 45+ (Wayland) without input capture, then log out and in.
+# GNOME 44 or older: choose "GNOME on Xorg" (or "Ubuntu on Xorg") on the login screen instead.
+sudo apt-get install -y xdg-desktop-portal xdg-desktop-portal-gnome   # Fedora: sudo dnf install -y …
+
+# App menu entry (Homebrew only; install.sh makes its own)
+mkdir -p ~/.local/share/applications
+ln -sf "$(brew --prefix)/opt/flockswitch/share/applications/flockswitch.desktop" ~/.local/share/applications/
+```
+
+On a minimal install where the settings window doesn't open: `sudo apt-get install -y libxkbcommon0 libgl1 libegl1` (Fedora: `libxkbcommon mesa-libGL mesa-libEGL`).
 
 ## Use
 
@@ -93,7 +122,7 @@ The tray icon's menu shows the status, turns switching on or off, checks for upd
 
 Linux has no Logi Options+, so no button has to be set aside first. If you use **Solaar**, give the buttons you turn on in flockswitch no Solaar setting or rule; both apps can stay installed otherwise. When flockswitch quits or a button is turned off, the button is put back exactly as it was.
 
-Command line: `flockswitch help` (`list`, `switch <N>`, `locate`, `set <key> <value>`, `run`, `quit`).
+Command line: `flockswitch help` (`setup`, `list`, `switch <N>`, `locate`, `set <key> <value>`, `run`, `quit`).
 
 Settings live in `~/.config/flockswitch/`.
 
@@ -144,7 +173,7 @@ Open a [problem report](../../issues/new/choose) with:
 - your distribution, desktop (GNOME, KDE, …) and session (X11 or Wayland), and how the devices connect (Bolt / Unifying / Bluetooth)
 - `~/.config/flockswitch/flockswitch.log`
 
-"No permission to use the devices" in the settings window means the udev rule is missing: install it from the setup check on the General tab (or run `./install.sh` again; installed with Homebrew: the udev commands `brew info --formula wwhalefe/tap/flockswitch` shows), then replug the receiver.
+"No permission to use the devices" in the settings window means the udev rule is missing: install it with `flockswitch setup` or from the setup check on the General tab, then replug the receiver.
 
 ## Status
 

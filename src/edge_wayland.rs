@@ -55,9 +55,38 @@ pub fn set_status(shared: &Shared, backend: &str, note: &str) {
     });
 }
 
+/// FLOCKSWITCH_EDGE_BACKEND, lower case.
+fn forced_backend() -> Option<String> {
+    std::env::var("FLOCKSWITCH_EDGE_BACKEND").ok().map(|s| s.trim().to_lowercase()).filter(|s| !s.is_empty())
+}
+
+/// The note written to the status file when no way works: what was found, where that
+/// says why.
+fn none_note(reason: &Reason, found: &str) -> String {
+    match reason {
+        Reason::NoSupport | Reason::NoWayland => format!("{}:{found}", reason.code()),
+        _ => reason.code(),
+    }
+}
+
+/// What the edge watcher would write to the status file (backend, note), found once
+/// now: for `flockswitch setup` while flockswitch is not running. `portal_limit` bounds
+/// the wait for the desktop portal's answer.
+pub fn probe_now(portal_limit: Duration) -> (String, String) {
+    let forced = forced_backend();
+    if !session_is_wayland() && forced.is_none() {
+        return if std::env::var_os("DISPLAY").is_some() { ("x11".into(), String::new()) } else { ("none".into(), Reason::NoDisplay.code()) };
+    }
+    let (probe, found) = probe(forced, portal_limit);
+    match logic::choose(&probe) {
+        Choice::None(reason) => ("none".into(), none_note(&reason, &found)),
+        choice => (choice.name().into(), String::new()),
+    }
+}
+
 /// Starts watching the edges in whichever way this session allows.
 pub fn spawn(shared: Arc<Shared>) {
-    let forced = std::env::var("FLOCKSWITCH_EDGE_BACKEND").ok().map(|s| s.trim().to_lowercase()).filter(|s| !s.is_empty());
+    let forced = forced_backend();
     if !session_is_wayland() && forced.is_none() {
         // An X11 session: the watcher in edge.rs, exactly as before.
         if std::env::var_os("DISPLAY").is_some() {
@@ -74,7 +103,7 @@ pub fn spawn(shared: Arc<Shared>) {
     let started = std::thread::Builder::new().name("edges".into()).spawn(move || {
         let mut tries = 0;
         let (probe, choice) = loop {
-            let (probe, found) = probe(forced.clone());
+            let (probe, found) = probe(forced.clone(), PORTAL_WAIT);
             let choice = logic::choose(&probe);
             // A portal or compositor that is still starting (flockswitch started at
             // login) answers a little later: look again for a few minutes.
@@ -83,11 +112,7 @@ pub fn spawn(shared: Arc<Shared>) {
                 log::info!("edge backend: none ({})", reason.explain());
                 // What was found, for the settings window: a screenshot of it then says
                 // why without the log.
-                let code = match reason {
-                    Reason::NoSupport | Reason::NoWayland => format!("{}:{found}", reason.code()),
-                    _ => reason.code(),
-                };
-                set_status(&shared, choice.name(), &code);
+                set_status(&shared, choice.name(), &none_note(reason, &found));
             }
             if !again {
                 break (probe, choice);
@@ -139,9 +164,11 @@ pub async fn within<T>(limit: Duration, fut: impl Future<Output = T>) -> Option<
 
 const PROBE_RETRIES: u32 = 10;
 const PROBE_RETRY: Duration = Duration::from_secs(30);
+/// How long the watcher waits for the desktop portal (it may still be starting at login).
+const PORTAL_WAIT: Duration = Duration::from_secs(25);
 
 /// What this session offers, logged step by step, and a one-line summary of it.
-fn probe(forced: Option<String>) -> (Probe, String) {
+fn probe(forced: Option<String>, portal_limit: Duration) -> (Probe, String) {
     let mut found = Vec::new();
     let wayland = session_is_wayland();
     let mut p = Probe { wayland, x11_display: std::env::var_os("DISPLAY").is_some(), forced, ..Probe::default() };
@@ -186,7 +213,7 @@ fn probe(forced: Option<String>) -> (Probe, String) {
             found.push(format!("GNOME {}", p.gnome.map(|v| v.to_string()).unwrap_or_else(|| "?".into())));
         }
         if want_portal {
-            match within(Duration::from_secs(25), crate::edge_portal::probe()).await {
+            match within(portal_limit, crate::edge_portal::probe()).await {
                 Some(Ok((version, caps))) => {
                     log::info!("edge probe: portal InputCapture v{version}, capabilities {caps}");
                     if caps.contains("pointer") {
@@ -200,7 +227,7 @@ fn probe(forced: Option<String>) -> (Probe, String) {
                     found.push(format!("InputCapture: {e}"));
                 }
                 None => {
-                    log::info!("edge probe: portal InputCapture: no answer in 25 s");
+                    log::info!("edge probe: portal InputCapture: no answer in {} s", portal_limit.as_secs());
                     found.push("InputCapture: no answer".into());
                 }
             }

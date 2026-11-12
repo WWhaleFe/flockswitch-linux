@@ -29,9 +29,9 @@ flockswitch는 **MX Master 3**와 **MX Master 4**를 바탕으로 만들고 시�
 - 창의 **한글 표시**: 한글 글꼴. 예: `fonts-noto-cjk`(Debian/Ubuntu), `google-noto-sans-cjk-fonts`(Fedora)
 - **Wayland에서 키보드 단축키**: GlobalShortcuts를 제공하는 데스크톱 포털(GNOME 48 이상과 KDE Plasma에는 있고, sway의 포털에는 없음)과 앱 메뉴의 flockswitch 항목(`flockswitch.desktop`: install.sh가 추가하고, Homebrew 설치는 설치·설정 점검이 추가)이 필요합니다. 확인: `busctl --user get-property org.freedesktop.portal.Desktop /org/freedesktop/portal/desktop org.freedesktop.portal.GlobalShortcuts version`에 숫자가 나오면 됩니다. 없으면 데스크톱의 사용자 단축키에 `flockswitch switch N`과 `flockswitch locate`를 지정해 씁니다
 - **Wayland에서 화면 모서리 전환**: KDE Plasma·sway·Hyprland는 따로 필요한 것이 없습니다. GNOME은 45 이상과 입력 캡처를 지원하는 데스크톱 포털(`xdg-desktop-portal` 1.17 이상, `xdg-desktop-portal-gnome` 45 이상, 보통 이미 설치됨)이 필요합니다. 확인: `busctl --user get-property org.freedesktop.portal.Desktop /org/freedesktop/portal/desktop org.freedesktop.portal.InputCapture version`에 숫자가 나오면 됩니다. GNOME 44 이하는 X11(Xorg) 세션에서 쓰세요
-- 설치 명령을 단계별로 정리한 안내는 [릴리스](../../releases/latest) 페이지의 "설치 전에 준비할 것"에 있습니다
+- 항목별 명령은 아래 [직접 설정하기](#직접-설정하기)에 있고, `flockswitch setup`이 대신 실행해 줍니다
 
-이 항목들은 flockswitch가 직접 확인합니다. 빠진 것이 있으면 시작한 뒤 알림을 한 번 보내고(트레이 아이콘이 빠진 기본 GNOME에서 유용), 트레이 메뉴에 **설정 필요 항목 N개…**가 생기며, 설정 → 일반 맨 위에 **설치·설정 점검** 카드가 나옵니다. 빠진 항목마다 필요한 이유와 **설치**·**나중에** 버튼이 있습니다. 설치를 누르면 실행할 명령을 그대로 먼저 보여 주고, **실행**을 눌러야 시작합니다. 관리자 권한이 필요한 명령은 `pkexec`로 실행해 데스크톱이 비밀번호를 묻습니다. 그렇게 할 수 없으면(pkexec가 없거나 취소함) 같은 명령을 `sudo`를 붙여 보여 주고 **명령 복사** 버튼으로 터미널에 붙여 넣을 수 있게 합니다. 할 수 있는 일:
+이 항목들은 flockswitch가 직접 확인합니다. 터미널에서는 `flockswitch setup`([설치](#설치) 참고), 앱에서는 다음과 같습니다. 빠진 것이 있으면 시작한 뒤 알림을 한 번 보내고(트레이 아이콘이 빠진 기본 GNOME에서 유용. 맨 처음 실행할 때는 알림 대신 설정 창이 설치·설정 점검을 연 채로 한 번 뜹니다), 트레이 메뉴에 **설정 필요 항목 N개…**가 생기며, 설정 → 일반 맨 위에 **설치·설정 점검** 카드가 나옵니다. 빠진 항목마다 필요한 이유와 **설치**·**나중에** 버튼이 있고, 두 개 이상이면 **모두 설치**가 관리자 권한 명령을 한데 모아 실행해 비밀번호를 한 번만 묻습니다. 설치를 누르면 실행할 명령을 그대로 먼저 보여 주고, **실행**을 눌러야 시작합니다. 관리자 권한이 필요한 명령은 `pkexec`로 실행해 데스크톱이 비밀번호를 묻습니다. 그렇게 할 수 없으면(pkexec가 없거나 취소함) 같은 명령을 `sudo`를 붙여 보여 주고 **명령 복사** 버튼으로 터미널에 붙여 넣을 수 있게 합니다. 할 수 있는 일:
 
 | 항목 | 알려 주는 경우 | 실행하는 것 |
 |---|---|---|
@@ -42,39 +42,68 @@ flockswitch는 **MX Master 3**와 **MX Master 4**를 바탕으로 만들고 시�
 | 앱 메뉴 항목 | Homebrew로 설치했고 앱 메뉴 항목이 없을 때 | `~/.local/share/applications`에 링크 만들기 (비밀번호 없음) |
 | 새 버전 | Homebrew로 설치했고 새 릴리스가 있을 때 | `brew trust --formula wwhalefe/tap/flockswitch`(Homebrew 6 이상), `brew update`, `brew upgrade --formula wwhalefe/tap/flockswitch` 후 새 버전으로 다시 시작 (비밀번호 없음) |
 
-**나중에**를 누른 항목은 이 컴퓨터에서 다시 알리지 않으며(`config.toml`의 `[setup] snoozed`, 설정 백업에는 넣지 않음) **다시 보기**로 되돌릴 수 있습니다. 실행 중 출력은 모두 로그에 남습니다. 확인할 때는 파일을 읽고 세션 버스, `fc-list`, `dpkg-query`·`rpm -q`·`pacman -Q`에 물어볼 뿐 비밀번호나 네트워크가 필요하지 않습니다. 아래의 직접 설치 명령도 그대로 쓸 수 있습니다.
+**나중에**를 누른 항목은 이 컴퓨터에서 다시 알리지 않으며(`config.toml`의 `[setup] snoozed`, 설정 백업에는 넣지 않음) **다시 보기**로 되돌릴 수 있습니다. 실행 중 출력은 모두 로그에 남습니다. 확인할 때는 파일을 읽고 세션 버스, `fc-list`, `dpkg-query`·`rpm -q`·`pacman -Q`에 물어볼 뿐 비밀번호나 네트워크가 필요하지 않습니다.
 
 ## 설치
+
+**명령 한 줄**이면 됩니다(한 번 묻고, 비밀번호도 한 번).
+
+```sh
+curl -fsSL https://github.com/WWhaleFe/flockswitch-linux/releases/latest/download/get.sh | sh
+```
+
+이 컴퓨터에 맞는 최신 릴리스(x86_64 또는 arm64)를 받아 릴리스의 `SHA256SUMS.txt`와 맞을 때만 진행하고, 프로그램을 `~/.local/bin`에 넣고 앱 메뉴에 flockswitch를 추가한 뒤 `flockswitch setup`(아래)을 실행하고 flockswitch를 시작합니다. 묻지 않고 설치하려면 `… | sh -s -- --yes`. sudo를 붙이지 말고 내 계정으로 실행하세요. 다시 실행하면 최신 버전으로 다시 설치합니다.
+
+**`flockswitch setup`**은 이 컴퓨터에 더 필요한 것과 그 이유를 목록으로 보여 줍니다. 장치를 열게 해 주는 udev 규칙(항상), 그리고 해당할 때 한글 글꼴, 트레이 아이콘 확장(기본 GNOME), 화면 모서리 전환용 데스크톱 포털(Wayland의 GNOME), 앱 메뉴 항목(Homebrew)입니다. 실행할 명령을 그대로 보여 주고 `지금 설치할까요? [Y/n]`을 물은 뒤, 관리자 권한 명령은 모두 `sudo` 한 번으로(비밀번호 한 번, 터미널이 없으면 데스크톱의 비밀번호 창), 나머지는 내 권한으로 실행하고, 끝으로 남은 일("로그아웃 후 다시 로그인", "수신기 뺐다 꽂기" 등)을 알려 줍니다. `--yes`는 묻지 않고, `--dry-run`은 보여 주기만 하고, `--check`는 빠진 것이 있으면 1로 끝납니다(종료 코드는 `flockswitch setup --help`). 실행한 내용은 `~/.config/flockswitch/setup.log`에 남습니다. 언제든 다시 실행해도 되며, 앱의 설치·설정 점검(위)도 같은 일을 합니다.
 
 [Homebrew](https://brew.sh)를 쓰면:
 
 ```sh
-brew install --formula wwhalefe/tap/flockswitch
-
-# 최초 1회: udev 규칙 설치(sudo) 및 앱 메뉴 추가. 설정 창의 설치·설정 점검이
-# 둘 다 대신 해 줄 수 있습니다.
-sudo install -m 644 "$(brew --prefix)/opt/flockswitch/share/flockswitch/70-flockswitch.rules" /etc/udev/rules.d/
-sudo udevadm control --reload-rules
-sudo udevadm trigger --subsystem-match=hidraw
-mkdir -p ~/.local/share/applications
-ln -sf "$(brew --prefix)/opt/flockswitch/share/applications/flockswitch.desktop" ~/.local/share/applications/
+brew install --formula wwhalefe/tap/flockswitch && flockswitch setup
 ```
 
-업데이트는 `brew update && brew upgrade --formula wwhalefe/tap/flockswitch`입니다. Homebrew로 설치한 flockswitch는 묻지 않고 업데이트하지 않습니다: 새 버전이 나오면 트레이 메뉴에 **업데이트 가능 (x.y.z)…**가 생기고, 설정 → 일반의 **지금 업데이트**가 이 명령을 보여 준 뒤 실행을 누르면 실행합니다('새 버전 자동 설치'가 켜져 있으면 알림으로 묻습니다). 이 탭에는 같은 이름의 macOS용 cask가 함께 있어서, `--formula`와 `wwhalefe/tap/`을 빼면 Homebrew가 cask까지 읽으려다 멈춥니다.
+그다음 앱 메뉴에서 flockswitch를 실행하세요. 업데이트는 `brew update && brew upgrade --formula wwhalefe/tap/flockswitch`입니다. Homebrew로 설치한 flockswitch는 묻지 않고 업데이트하지 않습니다: 새 버전이 나오면 트레이 메뉴에 **업데이트 가능 (x.y.z)…**가 생기고, 설정 → 일반의 **지금 업데이트**가 이 명령을 보여 준 뒤 실행을 누르면 실행합니다('새 버전 자동 설치'가 켜져 있으면 알림으로 묻습니다). 이 탭에는 같은 이름의 macOS용 cask가 함께 있어서, `--formula`와 `wwhalefe/tap/`을 빼면 Homebrew가 cask까지 읽으려다 멈춥니다.
 
 Homebrew 6 이상에서 `Refusing to load … from untrusted tap wwhalefe/tap` 오류가 나면(그 전 버전에서 설치한 경우), 한 번만 실행하세요: `brew trust --formula wwhalefe/tap/flockswitch`
 
-또는 [Releases](../../releases)에서 `flockswitch-linux-<x86_64|aarch64>-<버전>.tar.gz`를 받은 뒤:
+직접 받으려면 [Releases](../../releases)에서 `flockswitch-linux-<x86_64|aarch64>-<버전>.tar.gz`를 받은 뒤:
 
 ```sh
 tar xzf flockswitch-linux-x86_64-<버전>.tar.gz
 cd flockswitch-linux-x86_64-<버전>
-./install.sh
+./install.sh      # 한 줄 설치가 내려받은 뒤에 하는 일과 같음. --yes는 묻지 않음
 ```
 
-`install.sh`는 프로그램을 `~/.local/bin`에 넣고, 앱 메뉴에 flockswitch를 추가하고, udev 규칙 `/etc/udev/rules.d/70-flockswitch.rules`를 설치한 뒤(sudo가 비밀번호를 한 번 묻습니다) flockswitch를 실행합니다. 수신기가 꽂혀 있었다면 규칙이 적용되도록 한 번 뺐다 꽂아 주세요(블루투스는 다시 연결).
-
 업데이트는 저절로 설치됩니다: 하루 한 번 확인할 때 새 버전을 찾으면(또는 **지금 업데이트**를 누르면) 내려받아 릴리스의 SHA256SUMS.txt와 비교한 뒤, `~/.local/bin`의 프로그램과 앱 메뉴 항목·아이콘을 바꾸고 flockswitch를 다시 시작합니다. 설정 → 일반에서 끌 수 있습니다(`flockswitch set auto_update false`). 꺼 두어도 **지금 확인** 뒤 **지금 업데이트**를 누르면 언제든 설치합니다. 비밀번호는 묻지 않으며, 새 릴리스에서 udev 규칙이 바뀌었으면 설치·설정 점검이 새 규칙 설치를 권합니다. 쓸 수 없는 폴더(예: `/usr/bin`)에 있는 프로그램은 내려받기만 합니다.
+
+### 직접 설정하기
+
+`flockswitch setup`이 실행하는 것과 같은 명령입니다. 직접 입력하고 싶을 때 쓰세요(`flockswitch setup --dry-run`이 이 컴퓨터에 필요한 것만 보여 줍니다).
+
+```sh
+# udev 규칙(항상). 압축을 푼 릴리스 폴더에서 실행. Homebrew는 파일이
+# "$(brew --prefix)/opt/flockswitch/share/flockswitch/70-flockswitch.rules". 끝나면 수신기를 뺐다 꽂기
+sudo install -m 644 70-flockswitch.rules /etc/udev/rules.d/
+sudo udevadm control --reload-rules
+sudo udevadm trigger --subsystem-match=hidraw
+
+# 한글 글꼴(창이 한국어일 때). Fedora: google-noto-sans-cjk-fonts, openSUSE: noto-sans-cjk-fonts, Arch: noto-fonts-cjk
+sudo apt-get install -y fonts-noto-cjk
+
+# 기본 GNOME(Fedora, Debian. Ubuntu·KDE는 필요 없음)의 트레이 아이콘. 끝나면 로그아웃 후 다시 로그인
+sudo dnf install -y gnome-shell-extension-appindicator      # Debian: sudo apt-get install -y …
+gnome-extensions enable appindicatorsupport@rgcjonas.gmail.com
+
+# GNOME 45 이상(Wayland)에서 입력 캡처가 없을 때 화면 모서리 전환용. 끝나면 로그아웃 후 다시 로그인.
+# GNOME 44 이하는 설치 대신 로그인 화면에서 "GNOME on Xorg"(또는 "Ubuntu on Xorg") 선택
+sudo apt-get install -y xdg-desktop-portal xdg-desktop-portal-gnome   # Fedora: sudo dnf install -y …
+
+# 앱 메뉴 항목(Homebrew만. install.sh는 직접 만듦)
+mkdir -p ~/.local/share/applications
+ln -sf "$(brew --prefix)/opt/flockswitch/share/applications/flockswitch.desktop" ~/.local/share/applications/
+```
+
+최소 설치 환경에서 설정 창이 열리지 않으면: `sudo apt-get install -y libxkbcommon0 libgl1 libegl1` (Fedora: `libxkbcommon mesa-libGL mesa-libEGL`).
 
 ## 사용
 
@@ -94,7 +123,7 @@ cd flockswitch-linux-x86_64-<버전>
 | 일반 | 마우스 찾기 | 단축키, 다른 컴퓨터에서 도착, `flockswitch locate` 명령, 마우스 흔들기로 커서 주변에 펄스 링·레이더·스포트라이트·랜덤 효과를 고른 색과 크기로 표시 (X11에서는 컴포지터 필요). 흔들기는 0.5~2초 동안 쉬지 않고 흔들어야 하며, Ctrl·Alt·Shift를 누른 동안에만 반응하게 할 수 있음. Wayland에서는 흔들기를 쓸 수 없음: 아래 [Wayland에서 마우스 찾기와 단축키](#wayland에서-마우스-찾기와-단축키) 참고 |
 | 일반 | 설정 백업 | 저장(문서/flockswitch 폴더에 파일로, 10개까지), 불러오기(저장한 파일을 최신순으로 고르고 확인한 뒤 모든 설정을 바꿈), 관리(이름 바꾸기·삭제), 폴더 열기 |
 | 일반 | 초기화 | 언어를 뺀 모든 설정을 처음 상태로 되돌리기 |
-| 일반 | 설치·설정 점검 | 빠진 것이 있을 때만 맨 위에 표시. 항목마다 이유, 설치(명령을 먼저 보여 주고 실행을 눌러야 시작), 나중에 (위 참고) |
+| 일반 | 설치·설정 점검 | 빠진 것이 있을 때만 맨 위에 표시. 항목마다 이유, 설치(명령을 먼저 보여 주고 실행을 눌러야 시작), 나중에. 두 개 이상이면 모두 설치(비밀번호 한 번) (위 참고) |
 | 일반 | 시작하기 전에 | Solaar와 함께 쓸 때의 주의, udev 규칙 안내 |
 | 일반 | 업데이트 | 새 버전 확인(자동/지금), 자동 설치 또는 **지금 업데이트** |
 | 일반 | 개발자에게 | 메일 앱 열기(버전·장치 정보 자동 기입), 주소 복사, GitHub 신고 |
@@ -104,7 +133,7 @@ cd flockswitch-linux-x86_64-<버전>
 
 리눅스에는 Logi Options+가 없어서 버튼을 미리 비워 둘 필요가 없습니다. **Solaar**를 쓴다면 flockswitch에서 켠 버튼에는 Solaar의 버튼 설정이나 규칙을 걸지 마세요. 그 밖에는 두 앱을 함께 설치해 두어도 됩니다. flockswitch를 끄거나 버튼을 끄면 그 버튼은 원래 상태로 돌아갑니다.
 
-명령줄: `flockswitch help` (`list`, `switch <N>`, `locate`, `set <key> <value>`, `run`, `quit`)
+명령줄: `flockswitch help` (`setup`, `list`, `switch <N>`, `locate`, `set <key> <value>`, `run`, `quit`)
 
 설정 위치: `~/.config/flockswitch/`
 
@@ -155,7 +184,7 @@ flockswitch는 이 PC에 연결된 Logitech 장치와 통신합니다. 인터넷
 - 배포판, 데스크톱(GNOME, KDE 등)과 세션(X11 / Wayland), 연결 방식(Bolt / Unifying / 블루투스)
 - `~/.config/flockswitch/flockswitch.log`
 
-설정 창에 "장치에 접근할 권한이 없습니다"가 보이면 udev 규칙이 없는 것입니다. 일반 탭의 설치·설정 점검에서 설치하거나(직접 하려면 `./install.sh`를 다시 실행, Homebrew로 설치했다면 `brew info --formula wwhalefe/tap/flockswitch`에 나오는 udev 명령) 수신기를 뺐다 꽂아 주세요.
+설정 창에 "장치에 접근할 권한이 없습니다"가 보이면 udev 규칙이 없는 것입니다. `flockswitch setup`이나 일반 탭의 설치·설정 점검으로 설치한 뒤 수신기를 뺐다 꽂아 주세요.
 
 ## 시험 현황
 

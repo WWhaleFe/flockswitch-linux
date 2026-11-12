@@ -13,7 +13,7 @@ use crate::hotkey::LOCATE;
 use crate::i18n::{texts, Texts};
 use crate::locate_logic::{self as logic, LocatePath, NoLocate, PortalState};
 use crate::setup;
-use crate::setup_logic::{self, After, Item, ItemId, State as SetupState, Why};
+use crate::setup_logic::{self, After, Item, ItemId, State as SetupState};
 use crate::shared::{self, DeviceInfo, HapticPreview, StatusFile};
 use crate::update::{self, Release};
 use crate::window_size::SizeGuard;
@@ -388,8 +388,8 @@ struct SetupUi {
     stale: Arc<AtomicBool>,
     /// The fixes run from this window and how they went, shown until it closes.
     runs: Arc<Mutex<HashMap<ItemId, SetupRun>>>,
-    /// The item whose commands wait for Run or Cancel.
-    confirm: Option<Item>,
+    /// The items whose commands wait for Run or Cancel: one, or all for "Install all".
+    confirm: Option<Vec<Item>>,
     /// Whose commands were just copied ("Copied" for a moment).
     copied: Option<(ItemId, Instant)>,
     /// The Korean font installed from here was loaded.
@@ -414,6 +414,8 @@ enum SetupRun {
 /// What a row of the setup card asks for.
 enum SetupAction {
     Install(Item),
+    /// Every missing item that can be installed, with one password.
+    InstallAll(Vec<Item>),
     Later(Item),
     ShowAgain,
     Copy(ItemId, String),
@@ -547,6 +549,11 @@ impl SettingsApp {
             to_general,
         };
         app.refresh();
+        // Open before the tray app's first setup check (a new settings file): that check
+        // need not open it again.
+        if app.cfg.setup.first_check {
+            app.apply(|c| c.setup.first_check = false);
+        }
         if opening == Opening::Update || app.cfg.check_updates {
             app.check_update(ctx);
         }
@@ -1904,7 +1911,7 @@ impl SettingsApp {
                                 if let Some(item) = brew_item.clone() {
                                     ui.add_enabled_ui(!brew_running, |ui| {
                                         if button(ui, p, t.update_now, ButtonKind::Primary).clicked() {
-                                            self.setup.confirm = Some(item);
+                                            self.setup.confirm = Some(vec![item]);
                                         }
                                     });
                                 }
@@ -2363,6 +2370,13 @@ impl SettingsApp {
         let hidden = setup_logic::snoozed_count(&not_run, &snoozed);
         let copied = self.setup.copied.filter(|(_, at)| at.elapsed() < Duration::from_secs(2)).map(|(id, _)| id);
         let busy = runs.values().any(|r| *r == SetupRun::Running);
+        // Two or more to install (not run from here yet, or to try again): all of them
+        // with one password.
+        let all: Vec<Item> = setup_logic::installable(rows.iter().copied())
+            .into_iter()
+            .filter(|i| matches!(runs.get(&i.id), None | Some(SetupRun::NoAdmin(_) | SetupRun::Failed { .. })))
+            .cloned()
+            .collect();
         let mut action = None;
         if rows.is_empty() {
             if hidden > 0 {
@@ -2373,6 +2387,13 @@ impl SettingsApp {
             }
         } else {
             section_with_info(ui, p, t.setup_title, Some(t.setup_info), |ui| {
+                if all.len() >= 2 {
+                    let title = t.setup_all_title.replace("{n}", &all.len().to_string());
+                    if titled_row(ui, p, &title, t.setup_all_text, &[(t.setup_all, ButtonKind::Primary)], !busy).is_some() {
+                        action = Some(SetupAction::InstallAll(all.clone()));
+                    }
+                    divider(ui, p);
+                }
                 for (i, item) in rows.iter().enumerate() {
                     if i > 0 {
                         divider(ui, p);
@@ -2391,7 +2412,8 @@ impl SettingsApp {
             });
         }
         match action {
-            Some(SetupAction::Install(item)) => self.setup.confirm = Some(item),
+            Some(SetupAction::Install(item)) => self.setup.confirm = Some(vec![item]),
+            Some(SetupAction::InstallAll(items)) => self.setup.confirm = Some(items),
             Some(SetupAction::Later(item)) => {
                 log::info!("setup {}: set aside", item.snooze_key());
                 self.apply(|c| setup_logic::snooze(&mut c.setup.snoozed, &item));
@@ -2410,15 +2432,36 @@ impl SettingsApp {
         }
     }
 
-    /// The commands of the item chosen, for approval: what runs as administrator (the
-    /// system asks for the password) and what runs as the user. Nothing runs before Run.
+    /// The commands of the items chosen (one, or all of them for "Install all"), for
+    /// approval: what runs as administrator (the system asks for the password, once) and
+    /// what runs as the user. Nothing runs before Run.
     fn setup_confirm_ui(&mut self, ctx: &egui::Context, p: Palette) {
-        let Some(item) = self.setup.confirm.clone() else { return };
-        let Some(fix) = item.fix.clone() else {
+        let Some(chosen) = self.setup.confirm.clone() else { return };
+        let items: Vec<Item> = chosen.into_iter().filter(|i| i.fix.is_some()).collect();
+        if items.is_empty() {
             self.setup.confirm = None;
             return;
+        }
+        let fixes: Vec<&setup_logic::Fix> = items.iter().filter_map(|i| i.fix.as_ref()).collect();
+        let admin: Vec<&Item> = items.iter().filter(|i| i.needs_admin()).collect();
+        let admin_script = match admin.as_slice() {
+            [] => None,
+            [one] => one.fix.as_ref().map(setup_logic::Fix::admin_script),
+            many => Some(setup_logic::combined_admin_script(many)),
         };
+        // Each item's own user steps run on their own, after the administrator steps.
+        let user_script: Vec<String> = items
+            .iter()
+            .filter_map(|i| Some((i, i.fix.as_ref().filter(|f| !f.user.is_empty())?)))
+            .map(|(i, f)| if items.len() == 1 { f.user_script() } else { format!("# {}\n{}", i.id.key(), f.user_script()) })
+            .collect();
         let t = if setup::korean_unreadable(&self.setup_items()) { crate::i18n::english() } else { texts() };
+        let mut notes: Vec<&str> = Vec::new();
+        for note in fixes.iter().filter_map(|f| after_note(t, f.after)) {
+            if !notes.contains(&note) {
+                notes.push(note);
+            }
+        }
         let (mut run, mut cancel) = (false, false);
         let frame = egui::Frame::new()
             .fill(p.bg)
@@ -2427,24 +2470,36 @@ impl SettingsApp {
             .inner_margin(Margin::symmetric(20, 16));
         let shown = egui::Modal::new(egui::Id::unique("setup-confirm")).frame(frame).show(ctx, |ui| {
             ui.set_width(640.0);
-            ui.label(RichText::new(setup_title(t, &item)).font(bold(16.0)).color(p.text));
-            ui.add_space(4.0);
-            ui.label(RichText::new(setup_why(t, &item)).size(12.5).color(p.muted));
+            if let [item] = items.as_slice() {
+                ui.label(RichText::new(setup::title(t, item)).font(bold(16.0)).color(p.text));
+                ui.add_space(4.0);
+                ui.label(RichText::new(setup::why(t, item)).size(12.5).color(p.muted));
+            } else {
+                ui.label(RichText::new(t.setup_all_title.replace("{n}", &items.len().to_string())).font(bold(16.0)).color(p.text));
+                ui.add_space(4.0);
+                for item in &items {
+                    ui.label(RichText::new(format!("• {}", setup::title(t, item))).size(13.0).color(p.text));
+                }
+                ui.add_space(4.0);
+                ui.label(RichText::new(t.setup_all_text).size(12.5).color(p.muted));
+            }
             ui.add_space(10.0);
-            if fix.needs_admin() {
+            // Several items: shorter boxes, so the dialog fits the smallest window.
+            let (admin_height, user_height) = if items.len() == 1 { (300.0, 160.0) } else { (230.0, 110.0) };
+            if let Some(script) = &admin_script {
                 ui.label(RichText::new(t.setup_as_admin).size(13.0).color(p.text));
                 ui.add_space(4.0);
-                command_box(ui, p, "setup-confirm-admin", &format!("# pkexec /bin/sh -c\n{}", fix.admin_script()), 300.0);
+                command_box(ui, p, "setup-confirm-admin", &format!("# pkexec /bin/sh -c\n{script}"), admin_height);
                 ui.add_space(10.0);
             }
-            if !fix.user.is_empty() {
+            if !user_script.is_empty() {
                 ui.label(RichText::new(t.setup_as_user).size(13.0).color(p.text));
                 ui.add_space(4.0);
-                command_box(ui, p, "setup-confirm-user", &format!("# /bin/sh -c\n{}", fix.user_script()), 160.0);
+                command_box(ui, p, "setup-confirm-user", &format!("# /bin/sh -c\n{}", user_script.join("\n")), user_height);
                 ui.add_space(10.0);
             }
-            if let Some(note) = after_note(t, fix.after) {
-                ui.label(RichText::new(note).size(12.5).color(p.amber));
+            for note in &notes {
+                ui.label(RichText::new(*note).size(12.5).color(p.amber));
                 ui.add_space(4.0);
             }
             ui.add_space(8.0);
@@ -2454,38 +2509,47 @@ impl SettingsApp {
                 run = button(ui, p, t.setup_run, ButtonKind::Primary).clicked();
             });
         });
+        let keys = items.iter().map(|i| i.id.key()).collect::<Vec<_>>().join("+");
         if cancel || shown.should_close() {
-            log::info!("setup {}: not approved", item.id.key());
+            log::info!("setup {keys}: not approved");
             self.setup.confirm = None;
         } else if run {
             self.setup.confirm = None;
-            self.start_setup_run(ctx, item);
+            self.start_setup_run(ctx, items);
         }
     }
 
-    /// Runs an approved fix in the background; its row shows how it goes. Afterwards
-    /// the check runs again here and in the tray app.
-    fn start_setup_run(&mut self, ctx: &egui::Context, item: Item) {
+    /// Runs approved fixes in the background (several: one pkexec for all their
+    /// administrator steps); each row shows how its own went. Afterwards the check runs
+    /// again here and in the tray app.
+    fn start_setup_run(&mut self, ctx: &egui::Context, items: Vec<Item>) {
         let (runs, stale, update, ctx) = (self.setup.runs.clone(), self.setup.stale.clone(), self.update.clone(), ctx.clone());
-        runs.lock().unwrap().insert(item.id, SetupRun::Running);
+        for item in &items {
+            runs.lock().unwrap().insert(item.id, SetupRun::Running);
+        }
         std::thread::spawn(move || {
-            let terminal = item.fix.as_ref().map(setup_logic::Fix::terminal).unwrap_or_default();
-            let after = item.fix.as_ref().map_or(After::Menu, |f| f.after);
-            let next = match setup::run(&item) {
-                setup::Outcome::Done => match after {
-                    After::Restart => brew_restart(&update),
-                    After::Replug => {
-                        // Let udev apply the rule, then the engine looks for the devices again.
-                        std::thread::sleep(Duration::from_secs(2));
-                        shared::request_rescan();
-                        SetupRun::Done(after)
-                    }
-                    _ => SetupRun::Done(after),
-                },
-                setup::Outcome::NoAdmin => SetupRun::NoAdmin(terminal),
-                setup::Outcome::Failed { code, tail } => SetupRun::Failed { code, tail, terminal },
-            };
-            runs.lock().unwrap().insert(item.id, next);
+            let refs: Vec<&Item> = items.iter().collect();
+            let outcomes = setup::run_all(&refs, setup_logic::AdminTool::Pkexec, false);
+            // Let udev apply a new rule, then the engine looks for the devices again.
+            let replugged = outcomes.iter().any(|(id, o)| {
+                *o == setup::Outcome::Done && items.iter().any(|i| i.id == *id && i.fix.as_ref().is_some_and(|f| f.after == After::Replug))
+            });
+            if replugged {
+                std::thread::sleep(Duration::from_secs(2));
+                shared::request_rescan();
+            }
+            for (id, outcome) in outcomes {
+                let Some(item) = items.iter().find(|i| i.id == id) else { continue };
+                let terminal = item.fix.as_ref().map(setup_logic::Fix::terminal).unwrap_or_default();
+                let after = item.fix.as_ref().map_or(After::Menu, |f| f.after);
+                let next = match outcome {
+                    setup::Outcome::Done if after == After::Restart => brew_restart(&update),
+                    setup::Outcome::Done => SetupRun::Done(after),
+                    setup::Outcome::NoAdmin => SetupRun::NoAdmin(terminal),
+                    setup::Outcome::Failed { code, tail } => SetupRun::Failed { code, tail, terminal },
+                };
+                runs.lock().unwrap().insert(id, next);
+            }
             stale.store(true, Ordering::Relaxed);
             shared::request_setup_recheck();
             ctx.request_repaint();
@@ -2514,44 +2578,6 @@ fn brew_restart(update: &Mutex<UpdateUi>) -> SetupRun {
     };
     *update.lock().unwrap() = if restarting { UpdateUi::Restarting } else { UpdateUi::Installed };
     if restarting { SetupRun::Done(After::Restart) } else { SetupRun::BrewInstalled }
-}
-
-fn setup_title(t: &Texts, item: &Item) -> String {
-    match item.id {
-        ItemId::UdevRule => t.setup_udev.into(),
-        ItemId::Portal => t.setup_portal.into(),
-        ItemId::KoreanFont => t.setup_font.into(),
-        ItemId::TrayIcon => t.setup_tray.into(),
-        ItemId::MenuEntry => t.setup_menu.into(),
-        ItemId::BrewUpdate => {
-            let version = match &item.why {
-                Some(Why::BrewUpdate { version } | Why::BrewNotFound { version }) => version.as_str(),
-                _ => "",
-            };
-            t.setup_brew.replace("{version}", version)
-        }
-    }
-}
-
-fn setup_why(t: &Texts, item: &Item) -> String {
-    let Some(why) = &item.why else { return String::new() };
-    match why {
-        Why::UdevMissing => t.setup_udev_missing.into(),
-        Why::UdevOutdated => t.setup_udev_outdated.into(),
-        Why::UdevDenied => t.setup_udev_denied.into(),
-        Why::PortalPackages { gnome, packages } => {
-            t.setup_portal_packages.replace("{version}", &gnome.to_string()).replace("{packages}", &packages.join(", "))
-        }
-        Why::PortalRelogin { .. } => t.setup_portal_relogin.into(),
-        Why::PortalX11 { gnome } => t.setup_portal_x11.replace("{version}", &gnome.to_string()),
-        Why::FontMissing => t.setup_font_missing.into(),
-        Why::TrayInstall => t.setup_tray_install.into(),
-        Why::TrayEnable => t.setup_tray_enable.into(),
-        Why::TrayRelogin => t.setup_tray_relogin.into(),
-        Why::MenuMissing => t.setup_menu_missing.into(),
-        Why::BrewUpdate { .. } => t.setup_brew_update.into(),
-        Why::BrewNotFound { .. } => t.setup_brew_not_found.into(),
-    }
 }
 
 /// The word on an item's button: 설치 / Install, 추가 / Add, 켜기 / Turn on, 업데이트 / Update.
@@ -2606,7 +2632,7 @@ fn setup_row(ui: &mut Ui, p: Palette, t: &Texts, item: &Item, run: Option<&Setup
             actions.push(SetupAction::Later(item.clone()));
         }
     }
-    let mut action = titled_row(ui, p, &setup_title(t, item), &setup_why(t, item), &labels, !busy).and_then(|i| actions.into_iter().nth(i));
+    let mut action = titled_row(ui, p, &setup::title(t, item), &setup::why(t, item), &labels, !busy).and_then(|i| actions.into_iter().nth(i));
     let copy_label = if copied { t.setup_copied } else { t.setup_copy };
     let mut commands = |ui: &mut Ui, note: &str, color: Color32, text: &str, copy: Option<&str>| {
         ui.label(RichText::new(note).size(12.5).color(color));

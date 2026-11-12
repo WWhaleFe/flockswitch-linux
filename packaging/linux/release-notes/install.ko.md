@@ -12,109 +12,52 @@
 >
 > 0.11.0부터는 새 버전이 나오면 앱이 설치할지 묻고(트레이 메뉴 "업데이트 가능", 설정 → 일반의 **지금 업데이트**), 승인하면 위 명령을 대신 실행한 뒤 다시 시작합니다. 0.11.0으로 넘어가는 이번 한 번은 위 명령을 직접 실행해 주세요.
 
-### 설치 전에 준비할 것
-
-**flockswitch가 빠진 것을 찾아 설치를 권합니다.** 실행하면 알림과 트레이 메뉴(**설정 필요 항목 N개…**)가 설정 → 일반 → **설치·설정 점검**으로 안내합니다. 빠진 항목(udev 규칙, 한글 글꼴, 트레이 아이콘 확장, 데스크톱 포털, Homebrew의 앱 메뉴 항목과 업데이트)마다 **설치**와 **나중에**가 있습니다. 설치를 누르면 실행할 명령을 그대로 먼저 보여 주고, **실행**을 눌러야 시작하며, 관리자 권한이 필요하면 데스크톱이 비밀번호를 묻습니다. 아래 명령은 같은 내용이니 직접 하고 싶거나 비밀번호 창이 뜨지 않을 때 쓰세요.
-
-| 항목 | 필요한 경우 | 설치 |
-|---|---|---|
-| Homebrew | Homebrew로 설치할 때 (아래 1) | 없으면 아래 "Homebrew 없이 설치" |
-| 한글 글꼴 | 설정 창의 한글 표시 | `sudo apt-get install -y fonts-noto-cjk` (Fedora: `google-noto-sans-cjk-fonts`) |
-| 트레이 아이콘 확장 | Fedora·Debian의 기본 GNOME (Ubuntu·KDE는 필요 없음) | `gnome-shell-extension-appindicator` (아래 3) |
-| 데스크톱 포털 | GNOME Wayland에서 화면 모서리 전환 | `xdg-desktop-portal`, `xdg-desktop-portal-gnome` (보통 이미 설치됨, 아래 4) |
-| udev 규칙 | 항상 (장치를 열 권한) | 설치 명령에 포함 (또는 설치·설정 점검) |
-
-**1. Homebrew** (이미 있으면 건너뛰기)
+### 빠른 설치 (한 줄)
 
 ```sh
-# Ubuntu / Debian
-sudo apt-get install -y build-essential procps curl file git
-# Fedora
-sudo dnf group install -y development-tools && sudo dnf install -y procps-ng curl file git
-
-# Homebrew 설치 후, 지금 터미널과 새 터미널에서 brew를 쓸 수 있게 등록
-/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
-echo 'eval "$(/home/linuxbrew/.linuxbrew/bin/brew shellenv)"' >> ~/.bashrc
-eval "$(/home/linuxbrew/.linuxbrew/bin/brew shellenv)"
+curl -fsSL https://github.com/WWhaleFe/flockswitch-linux/releases/latest/download/get.sh | sh
 ```
 
-**2. 한글 글꼴**
+이 컴퓨터에 맞는 파일(x86_64 또는 arm64)을 받아 아래 SHA256SUMS.txt와 비교하고, 프로그램을 `~/.local/bin`에, 앱 메뉴에 flockswitch를 넣습니다. 이어서 `flockswitch setup`이 이 컴퓨터에 더 필요한 것과 이유(udev 규칙, 그리고 해당하면 한글 글꼴·GNOME 트레이 아이콘 확장·데스크톱 포털)를 목록으로 보여 주고, 실행할 명령을 보여 준 뒤 한 번 묻습니다. 관리자 권한이 필요한 것은 모두 `sudo` 한 번으로 실행하므로 비밀번호도 한 번만 입력합니다. 끝으로 남은 일("로그아웃 후 다시 로그인" 등)을 알려 주고 flockswitch를 실행합니다. 묻지 않고 설치하려면 `… | sh -s -- --yes`. sudo를 붙이지 말고 내 계정으로 실행하세요. 그 뒤 업데이트는 flockswitch가 스스로 합니다.
+
+### Homebrew
 
 ```sh
-sudo apt-get install -y fonts-noto-cjk            # Ubuntu / Debian
-sudo dnf install -y google-noto-sans-cjk-fonts    # Fedora
+brew install --formula wwhalefe/tap/flockswitch && flockswitch setup
 ```
 
-**3. 트레이 아이콘** — KDE, Ubuntu, Cinnamon, XFCE는 할 일 없음. 기본 GNOME(Fedora, Debian)이면 확장을 설치하고 로그아웃 → 다시 로그인한 뒤 켭니다.
+`flockswitch setup`이 앱 메뉴 항목도 추가하니, 그다음 앱 메뉴에서 flockswitch를 실행하세요. 업데이트(또는 설정 → 일반 → **지금 업데이트**: 승인하면 이 명령을 실행): `brew update && brew upgrade --formula wwhalefe/tap/flockswitch`. 제거: `flockswitch uninstall && brew uninstall --formula wwhalefe/tap/flockswitch`. Homebrew가 없다면 위의 한 줄 설치는 Homebrew 없이 됩니다(Homebrew 설치: [brew.sh](https://brew.sh)).
 
-```sh
-sudo dnf install -y gnome-shell-extension-appindicator      # Fedora
-sudo apt-get install -y gnome-shell-extension-appindicator  # Debian
-# 다시 로그인한 뒤
-gnome-extensions enable appindicatorsupport@rgcjonas.gmail.com
-```
-
-**4. Wayland에서 화면 모서리 전환** — 내 환경을 먼저 확인하세요.
-
-```sh
-echo $XDG_SESSION_TYPE $XDG_CURRENT_DESKTOP   # 예: wayland ubuntu:GNOME
-gnome-shell --version                          # GNOME일 때만
-# GNOME: 입력 캡처 포털이 있는지 ("u 1" 같은 숫자가 나오면 있음)
-busctl --user get-property org.freedesktop.portal.Desktop /org/freedesktop/portal/desktop org.freedesktop.portal.InputCapture version
-```
-
-| 결과 | 할 일 |
-|---|---|
-| `x11` | 없음 |
-| KDE Plasma, sway, Hyprland | 없음 |
-| GNOME 45 이상 (Ubuntu 24.04 이상, Fedora 39 이상) | 처음 켤 때(GNOME 45~50은 켤 때마다) "입력 캡처" 허용 창에서 **허용** |
-| GNOME 45 이상인데 `busctl`이 오류를 냄 | 포털 설치·업데이트 후 다시 로그인: `sudo apt-get install -y xdg-desktop-portal xdg-desktop-portal-gnome` (Fedora: `sudo dnf install -y xdg-desktop-portal xdg-desktop-portal-gnome`) |
-| GNOME 44 이하 (Ubuntu 22.04, Debian 12) | Wayland에서는 쓸 수 없음. 로그아웃 → 로그인 화면 오른쪽 아래 ⚙에서 "Ubuntu on Xorg" 또는 "GNOME on Xorg"를 고르고 로그인 |
-
-설정 → 전환 → 모서리에 빨간 안내가 나오면 그 아래 "확인한 내용" 줄에 GNOME 버전과 포털의 답이 나옵니다. 문제를 알릴 때 이 줄을 함께 보내 주세요.
-
-**5. (최소 설치 환경만) 설정 창이 열리지 않으면**
-
-```sh
-sudo apt-get install -y libxkbcommon0 libgl1 libegl1          # Ubuntu / Debian
-sudo dnf install -y libxkbcommon mesa-libGL mesa-libEGL       # Fedora
-```
-
-### Homebrew 설치 (Linux)
-
-```sh
-# 설치
-brew install --formula wwhalefe/tap/flockswitch
-
-# 초기 설정 (최초 1회 — udev 규칙 및 앱 메뉴 등록). 설치·설정 점검이 대신 해 줄 수 있음
-sudo install -m 644 "$(brew --prefix)/opt/flockswitch/share/flockswitch/70-flockswitch.rules" /etc/udev/rules.d/
-sudo udevadm control --reload-rules
-sudo udevadm trigger --subsystem-match=hidraw
-mkdir -p ~/.local/share/applications
-ln -sf "$(brew --prefix)/opt/flockswitch/share/applications/flockswitch.desktop" ~/.local/share/applications/
-
-# Homebrew 6 이상에서 'untrusted tap' 오류가 나면 한 번만 (예전에 설치한 경우)
-brew trust --formula wwhalefe/tap/flockswitch
-
-# 업데이트 (또는 설정 → 일반 → 지금 업데이트: 승인하면 이 명령을 실행) / 제거
-brew update && brew upgrade --formula wwhalefe/tap/flockswitch
-flockswitch uninstall && brew uninstall --formula wwhalefe/tap/flockswitch
-```
-
-설치 후: 수신기를 한 번 뺐다 꽂고(블루투스는 다시 연결) 앱 메뉴에서 flockswitch를 실행하세요. `flockswitch list`에 마우스·키보드가 보이면 준비가 끝난 것입니다.
-
-### Homebrew 없이 설치
+### 직접 설치
 
 아래 Assets에서 `flockswitch-linux-<x86_64|aarch64>-@VERSION@.tar.gz`를 받은 뒤:
 
 ```sh
 tar xzf flockswitch-linux-x86_64-@VERSION@.tar.gz
 cd flockswitch-linux-x86_64-@VERSION@
-./install.sh      # ~/.local/bin 설치, 앱 메뉴, udev 규칙(sudo 비밀번호 한 번), 실행
+./install.sh      # ~/.local/bin 설치, 앱 메뉴, flockswitch setup(비밀번호 한 번), 실행
 ```
+
+<details>
+<summary>설정 명령을 직접 실행하려면 (<code>flockswitch setup</code>이 실행하는 것)</summary>
+
+`flockswitch setup --dry-run`은 이 컴퓨터에 필요한 것만 보여 줍니다.
+
+| 항목 | 필요한 경우 | 명령 |
+|---|---|---|
+| udev 규칙 | 항상 (장치를 열 권한). 끝나면 수신기를 뺐다 꽂기 | `sudo install -m 644 70-flockswitch.rules /etc/udev/rules.d/` (Homebrew: `"$(brew --prefix)/opt/flockswitch/share/flockswitch/70-flockswitch.rules"`), `sudo udevadm control --reload-rules`, `sudo udevadm trigger --subsystem-match=hidraw` |
+| 한글 글꼴 | 설정 창의 한글 표시 | `sudo apt-get install -y fonts-noto-cjk` (Fedora: `google-noto-sans-cjk-fonts`) |
+| 트레이 아이콘 | Fedora·Debian의 기본 GNOME (Ubuntu·KDE는 필요 없음). 끝나면 로그아웃 후 다시 로그인 | `sudo dnf install -y gnome-shell-extension-appindicator` (Debian: `apt-get`), `gnome-extensions enable appindicatorsupport@rgcjonas.gmail.com` |
+| 데스크톱 포털 | Wayland의 GNOME 45 이상에서 입력 캡처가 없을 때 화면 모서리 전환. 끝나면 로그아웃 후 다시 로그인 | `sudo apt-get install -y xdg-desktop-portal xdg-desktop-portal-gnome` (Fedora: `dnf`) |
+| 앱 메뉴 항목 | Homebrew만 | `mkdir -p ~/.local/share/applications && ln -sf "$(brew --prefix)/opt/flockswitch/share/applications/flockswitch.desktop" ~/.local/share/applications/` |
+| 창 라이브러리 | 최소 설치 환경에서 설정 창이 열리지 않을 때 | `sudo apt-get install -y libxkbcommon0 libgl1 libegl1` (Fedora: `libxkbcommon mesa-libGL mesa-libEGL`) |
+
+Wayland에서 화면 모서리 전환: KDE Plasma·sway·Hyprland는 할 일 없음. GNOME 45 이상은 처음 켤 때(GNOME 45~50은 켤 때마다) "입력 캡처" 허용 창에서 **허용**. GNOME 44 이하(Ubuntu 22.04, Debian 12)는 입력 캡처가 없으니 로그아웃 → 로그인 화면 오른쪽 아래 ⚙에서 "Ubuntu on Xorg" 또는 "GNOME on Xorg"를 고르고 로그인.
+
+</details>
 
 ### 설치 후 이런 화면이 보이면
 
-- **상단에 "장치를 찾는 중…"**: 마우스·키보드가 지금 이 컴퓨터에 연결되어 있지 않습니다. 이 컴퓨터의 채널로 돌려놓고(블루투스면 연결될 때까지 몇 초) 기다리세요. 계속 그대로면 `flockswitch list` 결과를 확인하고, "장치에 접근할 권한이 없습니다"가 보이면 일반 탭의 설치·설정 점검에서 udev 규칙을 설치하고(또는 위의 udev 명령을 실행하고) 수신기를 뺐다 꽂으세요.
-- **모서리 페이지의 빨간 안내**: 위 4번 표대로 하세요.
+- **상단에 "장치를 찾는 중…"**: 마우스·키보드가 지금 이 컴퓨터에 연결되어 있지 않습니다. 이 컴퓨터의 채널로 돌려놓고(블루투스면 연결될 때까지 몇 초) 기다리세요. 계속 그대로면 `flockswitch list` 결과를 확인하고, "장치에 접근할 권한이 없습니다"가 보이면 `flockswitch setup`을 실행하고(또는 일반 탭의 설치·설정 점검) 수신기를 뺐다 꽂으세요.
+- **모서리 페이지의 빨간 안내**: `flockswitch setup`을 실행하거나 위의 "Wayland에서 화면 모서리 전환"을 보세요. 그 아래 "확인한 내용" 줄에 GNOME 버전과 포털의 답이 나오니, 문제를 알릴 때 함께 보내 주세요.
 - **마우스 찾기 "Wayland에서는…"**: 마우스 찾기는 커서 위치가 필요해서 X11 세션에서만 동작합니다.

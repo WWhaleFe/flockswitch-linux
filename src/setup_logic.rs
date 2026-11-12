@@ -441,11 +441,24 @@ impl Step {
         Step { command: command.into(), input: Some(input.to_string()) }
     }
 
-    fn text(&self, sudo: bool) -> String {
+    /// The line as typed in a terminal (with its here-document), with `sudo` in front if
+    /// asked.
+    pub fn text(&self, sudo: bool) -> String {
         let cmd = if sudo { format!("sudo {}", self.command) } else { self.command.clone() };
         match &self.input {
             Some(body) => format!("{cmd} <<'{HEREDOC_END}'\n{}\n{HEREDOC_END}", body.trim_end_matches('\n')),
             None => cmd,
+        }
+    }
+
+    /// The line followed by `op` (`&&` or `||`), for a chain of steps: the operator
+    /// goes on the command's own line, before a here-document's text.
+    fn chained(&self, op: &str) -> String {
+        match &self.input {
+            Some(body) => format!("{} <<'{HEREDOC_END}' {op}\n{}\n{HEREDOC_END}\n", self.command, body.trim_end_matches('\n')),
+            // "apt-get update || true" stays one step in a chain.
+            None if self.command.contains("||") => format!("{{ {}; }} {op}\n", self.command),
+            None => format!("{} {op}\n", self.command),
         }
     }
 }
@@ -791,6 +804,217 @@ pub fn offered_update(items: &[Item], snoozed: &[String]) -> Option<String> {
     })
 }
 
+// ---- Several at once ("Install all", `flockswitch setup`) ------------------------------
+
+/// Printed last by a combined administrator script: the keys of the items whose steps
+/// failed ("[flockswitch] failed: korean-font"), nothing after the colon when all went
+/// through.
+pub const FAILED_MARKER: &str = "[flockswitch] failed:";
+
+/// What became of one item's fix.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Outcome {
+    Done,
+    /// The administrator steps did not run: no pkexec or sudo, the password was wrong
+    /// or the dialog cancelled, or there is no agent to show one.
+    NoAdmin,
+    Failed { code: Option<i32>, tail: Vec<String> },
+}
+
+/// How the administrator steps get their rights.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdminTool {
+    /// The desktop's own password dialog (or pkexec's text prompt in a terminal).
+    Pkexec,
+    /// In a terminal: `sudo` asks there.
+    Sudo,
+}
+
+impl AdminTool {
+    pub fn program(self) -> &'static str {
+        match self {
+            AdminTool::Pkexec => "pkexec",
+            AdminTool::Sudo => "sudo",
+        }
+    }
+}
+
+/// sudo where there is a terminal to type the password in, else the desktop's dialog;
+/// None when neither can ask.
+pub fn admin_tool(tty: bool, sudo: bool, pkexec: bool) -> Option<AdminTool> {
+    if tty && sudo {
+        Some(AdminTool::Sudo)
+    } else if pkexec {
+        Some(AdminTool::Pkexec)
+    } else {
+        None
+    }
+}
+
+/// What "Install all" and `flockswitch setup` install: the items that are missing and
+/// have something to install, in the order given. A Homebrew update is not setup (it
+/// restarts flockswitch) and keeps its own button.
+pub fn installable<'a>(items: impl IntoIterator<Item = &'a Item>) -> Vec<&'a Item> {
+    items.into_iter().filter(|i| i.actionable() && i.id != ItemId::BrewUpdate).collect()
+}
+
+/// One administrator script for the fixes of several items, run through a single pkexec
+/// or sudo so the password is asked once. Each item's steps run in order and stop at the
+/// first that fails, but one item failing does not keep the next from running; the
+/// last line printed names the items that failed (`FAILED_MARKER`), and the script
+/// fails if any did.
+pub fn combined_admin_script(items: &[&Item]) -> String {
+    let mut script = format!("echo '{ADMIN_MARKER}'\nexport PATH=/usr/sbin:/usr/bin:/sbin:/bin\nfailed=\n");
+    for item in items {
+        let Some(fix) = item.fix.as_ref().filter(|f| f.needs_admin()) else { continue };
+        let key = item.id.key();
+        script.push_str(&format!("# {key}\n"));
+        let last = fix.admin.len() - 1;
+        for (i, step) in fix.admin.iter().enumerate() {
+            script.push_str(&step.chained(if i == last { "||" } else { "&&" }));
+        }
+        script.push_str(&format!("failed=\"$failed {key}\"\n"));
+    }
+    script.push_str(&format!("echo \"{FAILED_MARKER}$failed\"\n[ -z \"$failed\" ]"));
+    script
+}
+
+/// The keys `combined_admin_script` printed as failed; None when it never got that far.
+pub fn failed_keys(lines: &[String]) -> Option<Vec<String>> {
+    let line = lines.iter().rev().find_map(|l| l.trim().strip_prefix(FAILED_MARKER))?;
+    Some(line.split_whitespace().map(str::to_string).collect())
+}
+
+/// Something left to do by hand once the fixes ran.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Left {
+    /// Replug the receiver or reconnect Bluetooth.
+    Replug,
+    /// Log out and in again.
+    Relogin,
+    /// Only if the tray icon does not show: log out and in again.
+    MaybeRelogin,
+    /// GNOME older than 45 on Wayland: an X11 session for the screen edges.
+    X11Session(u32),
+}
+
+/// What is left after the fixes of `done` went through, each once: what those fixes
+/// need afterwards, and what the missing items with nothing to install ask for.
+pub fn left_to_do(items: &[Item], done: &[ItemId]) -> Vec<Left> {
+    let mut left = Vec::new();
+    for item in items.iter().filter(|i| i.state == State::Missing) {
+        let thing = if done.contains(&item.id) {
+            match item.fix.as_ref().map(|f| f.after) {
+                Some(After::Replug) => Some(Left::Replug),
+                Some(After::Relogin) => Some(Left::Relogin),
+                Some(After::MaybeRelogin) => Some(Left::MaybeRelogin),
+                _ => None,
+            }
+        } else if item.fix.is_none() {
+            match item.why {
+                Some(Why::TrayRelogin | Why::PortalRelogin { .. }) => Some(Left::Relogin),
+                Some(Why::PortalX11 { gnome }) => Some(Left::X11Session(gnome)),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        if let Some(thing) = thing.filter(|t| !left.contains(t)) {
+            left.push(thing);
+        }
+    }
+    // Logging in again covers "if the icon does not show".
+    if left.contains(&Left::Relogin) {
+        left.retain(|l| *l != Left::MaybeRelogin);
+    }
+    let rank = |l: &Left| match l {
+        Left::Replug => 0,
+        Left::Relogin | Left::MaybeRelogin => 1,
+        Left::X11Session(_) => 2,
+    };
+    left.sort_by_key(rank);
+    left
+}
+
+// ---- `flockswitch setup` -------------------------------------------------------------
+
+/// The exit status of `flockswitch setup`.
+pub mod exit {
+    /// Nothing (more) to install. Notes such as "log out and in" may remain.
+    pub const OK: i32 = 0;
+    /// Something is still missing: found by --check or --dry-run, not approved, or it
+    /// cannot be installed here (unknown package manager).
+    pub const MISSING: i32 = 1;
+    /// Wrong arguments, or run as root.
+    pub const USAGE: i32 = 2;
+    /// A step failed.
+    pub const FAILED: i32 = 3;
+    /// No administrator rights: wrong password, cancelled, or neither sudo nor pkexec.
+    pub const NO_ADMIN: i32 = 4;
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CliOptions {
+    /// Install without asking.
+    pub yes: bool,
+    /// Show what would run, install nothing.
+    pub dry_run: bool,
+    /// Only the exit status (and the list): 0 nothing to install, 1 something.
+    pub check: bool,
+    pub help: bool,
+}
+
+/// `flockswitch setup [--yes | --dry-run | --check]`.
+pub fn parse_cli(args: &[String]) -> Result<CliOptions, String> {
+    let mut o = CliOptions::default();
+    for arg in args {
+        match arg.as_str() {
+            "-y" | "--yes" => o.yes = true,
+            "-n" | "--dry-run" => o.dry_run = true,
+            "--check" => o.check = true,
+            "-h" | "--help" | "help" => o.help = true,
+            other => return Err(format!("unknown option '{other}'")),
+        }
+    }
+    if [o.yes, o.dry_run, o.check].iter().filter(|b| **b).count() > 1 {
+        return Err("use only one of --yes, --dry-run and --check".into());
+    }
+    Ok(o)
+}
+
+/// The answer to "Install these now? [Y/n]": Enter is yes; None asks again.
+pub fn answer(line: &str) -> Option<bool> {
+    match line.trim().to_lowercase().as_str() {
+        "" | "y" | "yes" | "예" | "네" | "응" | "ㅇ" => Some(true),
+        "n" | "no" | "아니오" | "아니요" | "아니" | "ㄴ" => Some(false),
+        _ => None,
+    }
+}
+
+/// The language of the terminal output: the one chosen in the settings (`language`
+/// in config.toml), else the system's (`ko…` locale).
+pub fn korean(configured: Option<&str>, system_locale: Option<&str>) -> bool {
+    match configured.map(str::trim) {
+        Some("ko") => true,
+        Some("en") => false,
+        _ => system_locale.is_some_and(|l| l.to_lowercase().starts_with("ko")),
+    }
+}
+
+/// How `flockswitch setup` ends after running: a failed step outweighs missing rights,
+/// and either outweighs something left that cannot be installed here.
+pub fn exit_after(outcomes: &[Outcome], manual_left: bool) -> i32 {
+    if outcomes.iter().any(|o| matches!(o, Outcome::Failed { .. })) {
+        exit::FAILED
+    } else if outcomes.contains(&Outcome::NoAdmin) {
+        exit::NO_ADMIN
+    } else if manual_left {
+        exit::MISSING
+    } else {
+        exit::OK
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1119,5 +1343,170 @@ mod tests {
         let items = evaluate(&x11);
         assert_eq!(shown(&items, &[]).len(), 1);
         assert_eq!(pending(&items, &[]), 0);
+    }
+
+    /// Stock GNOME on Fedora in Korean, nothing set up, installed with Homebrew and an
+    /// update out: every kind of item at once.
+    fn everything_missing() -> Vec<Item> {
+        let f = Facts {
+            gnome_shell: true,
+            sni_watcher: Some(false),
+            korean: true,
+            korean_font: Some(false),
+            package_manager: Some(PackageManager::Dnf),
+            homebrew: Some(Brew {
+                brew: Some("/b/bin/brew".into()),
+                desktop_source: Some("/b/opt/flockswitch/share/applications/flockswitch.desktop".into()),
+                apps_dir: "/home/me/.local/share/applications".into(),
+                newer: Some("0.14.1".into()),
+                ..Brew::default()
+            }),
+            ..Facts::default()
+        };
+        evaluate(&f)
+    }
+
+    #[test]
+    fn install_all_takes_what_can_be_installed() {
+        let items = everything_missing();
+        let all = installable(&items);
+        // Not the Homebrew update: it restarts flockswitch and keeps its own button.
+        let ids: Vec<ItemId> = all.iter().map(|i| i.id).collect();
+        assert_eq!(ids, [ItemId::UdevRule, ItemId::TrayIcon, ItemId::KoreanFont, ItemId::MenuEntry]);
+        // Info-only items (GNOME too old) have nothing to install.
+        let x11 = evaluate(&Facts { wayland: true, gnome_shell: true, edge_backend: "none".into(), edge_note: "gnome-old:42".into(), ..Facts::default() });
+        assert_eq!(installable(&x11).iter().map(|i| i.id).collect::<Vec<_>>(), [ItemId::UdevRule]);
+    }
+
+    #[test]
+    fn one_script_for_every_administrator_step() {
+        let items = everything_missing();
+        let all = installable(&items);
+        let script = combined_admin_script(&all);
+        // Asked for once, so the password is too.
+        assert!(script.starts_with("echo '[flockswitch] running as administrator'\nexport PATH=/usr/sbin:/usr/bin:/sbin:/bin\nfailed=\n# udev-rule\n"), "{script}");
+        assert_eq!(script.matches(ADMIN_MARKER).count(), 1);
+        assert!(!script.contains("set -e"));
+        assert!(script.contains(
+            "# udev-rule\nmkdir -p /etc/udev/rules.d &&\ntee /etc/udev/rules.d/70-flockswitch.rules > /dev/null <<'FLOCKSWITCH_EOF' &&\n# flockswitch"
+        ));
+        assert!(script.contains(
+            "\nFLOCKSWITCH_EOF\nchmod 644 /etc/udev/rules.d/70-flockswitch.rules &&\nudevadm control --reload-rules &&\nudevadm trigger --subsystem-match=hidraw ||\nfailed=\"$failed udev-rule\"\n"
+        ));
+        assert!(script.contains("# tray-icon\ndnf install -y gnome-shell-extension-appindicator ||\nfailed=\"$failed tray-icon\"\n"));
+        assert!(script.contains("# korean-font\ndnf install -y google-noto-sans-cjk-fonts ||\nfailed=\"$failed korean-font\"\n"));
+        assert!(script.ends_with("echo \"[flockswitch] failed:$failed\"\n[ -z \"$failed\" ]"));
+        // The steps run as the user stay out of it.
+        assert!(!script.contains("gnome-extensions") && !script.contains("menu-entry") && !script.contains("ln -sf"));
+        // apt's refresh may fail without failing the item.
+        let apt = Item::missing(ItemId::KoreanFont, Why::FontMissing, Some(Fix { admin: package_steps(PackageManager::Apt, &["fonts-noto-cjk"], &[]), user: vec![], after: After::Fonts }));
+        assert!(combined_admin_script(&[&apt]).contains("# korean-font\n{ apt-get update || true; } &&\napt-get install -y fonts-noto-cjk ||\nfailed=\"$failed korean-font\"\n"));
+    }
+
+    /// The script really runs that way: here-documents inside a chain, a failing item
+    /// that does not stop the next, and the list of what failed.
+    #[test]
+    fn combined_script_in_a_real_shell() {
+        let dir = std::env::temp_dir().join(format!("flockswitch-setup-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let d = dir.to_string_lossy().to_string();
+        let item = |id, admin: Vec<Step>| Item::missing(id, Why::UdevMissing, Some(Fix { admin, user: vec![], after: After::Replug }));
+        let a = item(ItemId::UdevRule, vec![Step::with_input(format!("cat > {d}/a"), "line 1\n$HOME `x`\n"), Step::new("true")]);
+        let b = item(ItemId::KoreanFont, vec![Step::new("false"), Step::new(format!("touch {d}/never"))]);
+        let c = item(ItemId::TrayIcon, vec![Step::new("false || true"), Step::new(format!("touch {d}/c"))]);
+        let out = std::process::Command::new("/bin/sh").arg("-c").arg(combined_admin_script(&[&a, &b, &c])).output().unwrap();
+        let lines: Vec<String> = String::from_utf8_lossy(&out.stdout).lines().map(str::to_string).collect();
+        assert!(!out.status.success());
+        assert_eq!(lines.first().map(String::as_str), Some(ADMIN_MARKER));
+        assert_eq!(failed_keys(&lines), Some(vec!["korean-font".to_string()]));
+        assert_eq!(std::fs::read_to_string(dir.join("a")).unwrap(), "line 1\n$HOME `x`\n");
+        assert!(!dir.join("never").exists() && dir.join("c").exists());
+        // All through: nothing listed, and the script succeeds.
+        let ok = item(ItemId::TrayIcon, vec![Step::new("true")]);
+        let out = std::process::Command::new("/bin/sh").arg("-c").arg(combined_admin_script(&[&a, &ok])).output().unwrap();
+        let lines: Vec<String> = String::from_utf8_lossy(&out.stdout).lines().map(str::to_string).collect();
+        assert!(out.status.success());
+        assert_eq!(failed_keys(&lines), Some(vec![]));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn failed_marker() {
+        let lines = |l: &[&str]| l.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(failed_keys(&lines(&[ADMIN_MARKER, "[flockswitch] failed: udev-rule korean-font"])), Some(vec!["udev-rule".into(), "korean-font".into()]));
+        assert_eq!(failed_keys(&lines(&[ADMIN_MARKER, "[flockswitch] failed:"])), Some(vec![]));
+        // pkexec was cancelled: the script never ran.
+        assert_eq!(failed_keys(&lines(&["Error executing command as another user: Not authorized"])), None);
+    }
+
+    #[test]
+    fn what_is_left_afterwards() {
+        let items = everything_missing();
+        let all: Vec<ItemId> = installable(&items).iter().map(|i| i.id).collect();
+        // Replug for the rule, a new login for the tray extension; the font and the
+        // menu entry need nothing more.
+        assert_eq!(left_to_do(&items, &all), [Left::Replug, Left::Relogin]);
+        assert_eq!(left_to_do(&items, &[ItemId::KoreanFont, ItemId::MenuEntry]), []);
+        assert_eq!(left_to_do(&items, &[]), []);
+        // The extension only switched on: "if the icon does not show".
+        let mut f = Facts { gnome_shell: true, sni_watcher: Some(false), appindicator_installed: true, udev: Udev { devices_open: true, ..Udev::default() }, ..Facts::default() };
+        assert_eq!(left_to_do(&evaluate(&f), &[ItemId::TrayIcon]), [Left::MaybeRelogin]);
+        // Things nothing installs: a new login, or an X11 session for GNOME 44 or older.
+        f.appindicator_enabled = Some(true);
+        f.wayland = true;
+        f.edge_backend = "none".into();
+        f.edge_note = "gnome-old:44".into();
+        assert_eq!(left_to_do(&evaluate(&f), &[]), [Left::Relogin, Left::X11Session(44)]);
+    }
+
+    #[test]
+    fn command_line() {
+        let parse = |a: &[&str]| parse_cli(&a.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+        assert_eq!(parse(&[]), Ok(CliOptions::default()));
+        assert_eq!(parse(&["--yes"]), Ok(CliOptions { yes: true, ..CliOptions::default() }));
+        assert_eq!(parse(&["-y"]), Ok(CliOptions { yes: true, ..CliOptions::default() }));
+        assert_eq!(parse(&["--dry-run"]), Ok(CliOptions { dry_run: true, ..CliOptions::default() }));
+        assert_eq!(parse(&["--check"]), Ok(CliOptions { check: true, ..CliOptions::default() }));
+        assert_eq!(parse(&["--help"]).map(|o| o.help), Ok(true));
+        assert!(parse(&["--yes", "--check"]).is_err());
+        assert!(parse(&["--dry-run", "--check"]).is_err());
+        assert_eq!(parse(&["--force"]), Err("unknown option '--force'".into()));
+        for yes in ["", "y", "Y", "yes", " YES \n", "예", "네"] {
+            assert_eq!(answer(yes), Some(true), "{yes:?}");
+        }
+        for no in ["n", "N", "no", "아니오"] {
+            assert_eq!(answer(no), Some(false), "{no:?}");
+        }
+        assert_eq!(answer("maybe"), None);
+    }
+
+    #[test]
+    fn terminal_language() {
+        // The settings' language first, then the system's.
+        assert!(korean(Some("ko"), Some("en-US")));
+        assert!(!korean(Some("en"), Some("ko-KR")));
+        assert!(korean(None, Some("ko-KR")) && korean(None, Some("ko_KR.UTF-8")));
+        assert!(!korean(None, Some("en_US.UTF-8")) && !korean(None, None));
+        assert!(korean(Some("auto"), Some("ko")));
+    }
+
+    #[test]
+    fn password_where_it_can_be_asked() {
+        assert_eq!(admin_tool(true, true, true), Some(AdminTool::Sudo));
+        assert_eq!(admin_tool(true, false, true), Some(AdminTool::Pkexec));
+        // No terminal (started from the desktop, or piped): the desktop's dialog.
+        assert_eq!(admin_tool(false, true, true), Some(AdminTool::Pkexec));
+        assert_eq!(admin_tool(false, true, false), None);
+        assert_eq!(admin_tool(true, false, false), None);
+    }
+
+    #[test]
+    fn exit_status() {
+        let failed = Outcome::Failed { code: Some(100), tail: vec![] };
+        assert_eq!(exit_after(&[Outcome::Done, Outcome::Done], false), exit::OK);
+        assert_eq!(exit_after(&[Outcome::Done], true), exit::MISSING);
+        assert_eq!(exit_after(&[Outcome::NoAdmin, Outcome::Done], false), exit::NO_ADMIN);
+        assert_eq!(exit_after(&[Outcome::NoAdmin, failed], true), exit::FAILED);
+        assert_eq!(exit_after(&[], false), exit::OK);
     }
 }
