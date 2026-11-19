@@ -8,7 +8,8 @@ flockswitch는 MX Master 마우스의 **휠 모드 전환 버튼, 제스처 버�
 
 이 저장소는 리눅스 버전입니다. 다른 버전은 [flockswitch-mac](https://github.com/WWhaleFe/flockswitch-mac), [flockswitch-windows](https://github.com/WWhaleFe/flockswitch-windows), [flockswitch-android](https://github.com/WWhaleFe/flockswitch-android)에 있으며, 모두 같은 방식으로 전환되어 섞어 쓸 수 있습니다.
 
-> **Ubuntu 26.04(GNOME 50, Wayland)에서 시험했습니다.** X11(Xorg) 세션과 KDE Plasma·sway·Hyprland에서는 아직 시험하지 않았습니다. 써 보신 결과를 알려 주시면 큰 도움이 됩니다.
+> [!WARNING]
+> **베타 버전입니다.** Linux 버전은 아직 완전하지 않습니다. Ubuntu 26.04(GNOME 50, Wayland)에서만 시험했고, X11(Xorg) 세션과 KDE Plasma·sway·Hyprland에서는 아직 시험하지 않았습니다. 써 보신 결과를 알려 주시면 큰 도움이 됩니다.
 
 > Logitech과 관계없는 개인 오픈소스입니다. "Logitech", "MX Master", "Easy-Switch", "Bolt", "Unifying"은 Logitech의 상표입니다.
 
