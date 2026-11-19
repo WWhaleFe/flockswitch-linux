@@ -6,7 +6,7 @@
 //! of receivers / Bluetooth devices changes. Rebuilding everything on every link change
 //! used to drop a slow-waking keyboard from the list, so it stayed behind.
 
-use crate::config::{button_name, Config, Gesture, BUTTONS};
+use crate::config::{button_name, Config, Gesture, BUTTONS, BUTTON_WHEEL_MODE};
 use crate::device::{self, Device, DeviceKind, Pairing, Reporting, FEATURE_CHANGE_HOST, FEATURE_REPROG_V4};
 use crate::hidpp::{self, Endpoint, REPORT_SHORT};
 use crate::shared::{self, DeviceInfo, Shared};
@@ -34,6 +34,12 @@ const MAX_BACKOFF: Duration = Duration::from_secs(60);
 const CONFIG_CHECK: Duration = Duration::from_millis(700);
 /// A haptic pulse takes a moment to play; Change Host right after would cut it short.
 const HAPTIC_SETTLE: Duration = Duration::from_millis(150);
+/// The master mouse linked again: take its buttons this soon, before the slot is read
+/// again. Until then a press does what the mouse does by itself (the mode-shift button
+/// flips the wheel).
+const QUICK_DIVERT: Duration = Duration::from_millis(250);
+/// The mouse did not confirm a divert: try again this soon instead of at the next check.
+const DIVERT_RETRY: Duration = Duration::from_secs(2);
 
 pub struct Engine {
     shared: Arc<Shared>,
@@ -57,6 +63,12 @@ pub struct Engine {
     trigger_haptics: Option<u32>,
     /// The master mouse was switched away from here; a pulse greets it when it is back.
     away_by_switch: bool,
+    /// The wheel mode each master mouse has on this computer, by device key.
+    wheel_modes: HashMap<String, u8>,
+    /// The master mouse linked again: its wheel mode is put back before it is read.
+    wheel_back: bool,
+    /// When to try diverting the buttons again, sooner than the next health check.
+    divert_due: Option<Instant>,
     /// Trigger buttons held down right now (a press counts once until released).
     held: HashSet<u16>,
     /// A button with gestures is held: (button, total dx, total dy) of the mouse since.
@@ -94,6 +106,9 @@ impl Engine {
             trigger_buttons: Vec::new(),
             trigger_haptics: None,
             away_by_switch: false,
+            wheel_modes: shared::load_wheel_modes(),
+            wheel_back: false,
+            divert_due: None,
             held: HashSet::new(),
             gesture: None,
             pending: HashMap::new(),
@@ -269,6 +284,7 @@ impl Engine {
         }
         if self.cfg.enabled {
             self.ensure_diverted()?;
+            self.sync_wheel_mode();
         } else {
             log::info!("paused: the button is back to normal");
         }
@@ -450,6 +466,46 @@ impl Engine {
         }
     }
 
+    /// Keeps this computer's wheel mode (ratchet or free-spinning) on the master mouse,
+    /// with `keep_wheel_mode` and the wheel mode-shift button switching. While the button
+    /// is diverted a press cannot flip the wheel, so a change seen then was made on
+    /// purpose (in Solaar) and is remembered. Elsewhere the button may not be
+    /// taken yet (another device, in the moments after the mouse arrives there), and a
+    /// press then flips the wheel; so when the mouse is back, the remembered mode is put
+    /// back first.
+    fn sync_wheel_mode(&mut self) {
+        if !self.cfg.enabled || !self.cfg.keep_wheel_mode || !self.cfg.button(BUTTON_WHEEL_MODE).on {
+            return;
+        }
+        let Some(d) = self.trigger.clone() else { return };
+        if !self.online.contains(&(d.endpoint, d.index)) {
+            return;
+        }
+        let Some(ep) = self.endpoints.get_mut(d.endpoint) else { return };
+        // Until the button is ours, a press may still flip the wheel.
+        if !matches!(d.control_reporting(ep, BUTTON_WHEEL_MODE), Ok(Some(r)) if r.diverted) {
+            return;
+        }
+        let Ok(Some(now)) = d.wheel_mode(ep) else { return };
+        let back = std::mem::take(&mut self.wheel_back);
+        let name = |m: u8| if m == device::WHEEL_FREE { "free-spinning" } else { "ratchet" };
+        match self.wheel_modes.get(&d.key()).copied() {
+            Some(kept) if kept == now => {}
+            Some(kept) if back => match d.set_wheel_mode(ep, kept) {
+                Ok(true) => log::info!("wheel of {} put back to {} (it came back {})", d.label(), name(kept), name(now)),
+                _ => {
+                    log::warn!("{} did not take its wheel mode; trying again", d.label());
+                    self.wheel_back = true;
+                }
+            },
+            _ => {
+                log::info!("wheel of {} is {} on this computer", d.label(), name(now));
+                self.wheel_modes.insert(d.key(), now);
+                shared::save_wheel_modes(&self.wheel_modes);
+            }
+        }
+    }
+
     /// Plays what the haptics window asks to feel, at the strength chosen there; the
     /// mouse's own strength is put back afterwards. Quiet without a mouse with a motor.
     fn feel(&mut self, what: shared::HapticPreview, intensity: u8) {
@@ -518,7 +574,14 @@ impl Engine {
             }
             let ep = &mut self.endpoints[d.endpoint];
             // None: the mouse lacks this button, or is not on this computer right now.
-            let Some(now) = d.control_reporting(ep, cid)? else { continue };
+            let Some(now) = d.control_reporting(ep, cid)? else {
+                // A button it has not answering: the others would not either (each one
+                // waits out its timeout). The next attempt takes them all.
+                if self.trigger_buttons.contains(&cid) {
+                    break;
+                }
+                continue;
+            };
             if !wanted {
                 // Left diverted by an earlier run that used this button and was killed.
                 if let Some(orig) = shared::saved_original_divert(&d.key(), cid) {
@@ -543,7 +606,8 @@ impl Engine {
                     let how = if want.raw_xy { " with gestures" } else { "" };
                     log::info!("{} button diverted{how} on {}", button_name(cid), d.label());
                 } else {
-                    log::warn!("{} did not confirm the button setting; retrying later", d.label());
+                    log::warn!("{} did not confirm the button setting; retrying soon", d.label());
+                    self.divert_due = Some(Instant::now() + DIVERT_RETRY);
                 }
             }
         }
@@ -584,6 +648,8 @@ impl Engine {
     /// Followers go first so the mouse — the thing the user just pressed — leaves last.
     /// Stale pairing slots answer with an error and are skipped on their own.
     pub fn switch_to(&mut self, channel: u8) -> Result<()> {
+        // The wheel mode as it leaves, to put back when it returns.
+        self.sync_wheel_mode();
         // A pulse on the mouse as it goes, felt before Change Host takes it away.
         if self.cfg.haptics.on_switch && self.buzz(self.cfg.haptics.switch_waveform) {
             std::thread::sleep(HAPTIC_SETTLE);
@@ -704,6 +770,10 @@ impl Engine {
             if self.is_trigger(endpoint, slot) {
                 self.held.clear();
                 self.gesture = None;
+                if up {
+                    self.wheel_back = true;
+                    self.divert_due = Some(Instant::now() + QUICK_DIVERT);
+                }
             }
             if up {
                 self.pending.insert((endpoint, slot), (Instant::now() + SLOT_SETTLE, SLOT_RETRIES));
@@ -788,6 +858,7 @@ impl Engine {
                 }
                 if self.is_trigger(endpoint, slot) {
                     self.read_channel();
+                    self.sync_wheel_mode();
                     self.apply_haptic_intensity();
                     self.greet_trigger();
                 }
@@ -820,6 +891,7 @@ impl Engine {
         self.scan()?;
         self.describe();
         self.ensure_diverted()?;
+        self.sync_wheel_mode();
 
         let mut last_scan = Instant::now();
         let mut last_config = Instant::now();
@@ -873,6 +945,7 @@ impl Engine {
                 if rescan {
                     log::info!("devices changed, rescanning");
                 }
+                let was_here = self.trigger.as_ref().is_some_and(|t| self.online.contains(&(t.endpoint, t.index)));
                 if let Err(e) = self.scan() {
                     log::warn!("rescan failed: {e:#}");
                 }
@@ -880,6 +953,11 @@ impl Engine {
                     if let Err(e) = self.ensure_diverted() {
                         log::warn!("{e:#}");
                     }
+                    // A Bluetooth mouse coming back shows up as a new endpoint.
+                    if !was_here {
+                        self.wheel_back = true;
+                    }
+                    self.sync_wheel_mode();
                 }
                 self.backoff = if self.endpoints.iter().any(|e| e.dead) {
                     (self.backoff * 5).min(MAX_BACKOFF)
@@ -902,6 +980,12 @@ impl Engine {
                 }
             }
 
+            if self.divert_due.is_some_and(|due| due <= Instant::now()) {
+                self.divert_due = None;
+                if let Err(e) = self.ensure_diverted() {
+                    log::warn!("divert failed: {e:#}");
+                }
+            }
             if let Err(e) = self.process_pending() {
                 log::warn!("refresh failed: {e:#}");
             }
@@ -911,6 +995,7 @@ impl Engine {
                 if let Err(e) = self.queue_unlisted().and_then(|_| self.ensure_diverted()) {
                     log::warn!("health check failed: {e:#}");
                 }
+                self.sync_wheel_mode();
             }
         }
         self.release();

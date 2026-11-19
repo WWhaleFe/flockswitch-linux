@@ -14,13 +14,14 @@ const PREFIX: &str = "flockswitch-settings-";
 /// A settings file is a few KB; anything this large is something else.
 const MAX_SIZE: u64 = 1 << 20;
 /// The top-level settings; a file with none of them is not a flockswitch settings file.
-const KNOWN_KEYS: [&str; 11] = [
+const KNOWN_KEYS: [&str; 12] = [
     "enabled",
     "trigger_device",
     "follow",
     "language",
     "check_updates",
     "auto_update",
+    "keep_wheel_mode",
     "buttons",
     "hotkeys",
     "edges",

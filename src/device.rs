@@ -1,6 +1,7 @@
 //! HID++ 2.0 devices reachable through an endpoint, and the features flockswitch uses:
-//! device name (0x0005), Change Host (0x1814), Reprogrammable Controls v4 (0x1B04) and
-//! Haptic Feedback (0x19B0, the MX Master 4's vibration motor).
+//! device name (0x0005), Change Host (0x1814), Reprogrammable Controls v4 (0x1B04),
+//! Haptic Feedback (0x19B0, the MX Master 4's vibration motor) and SmartShift (0x2110 /
+//! 0x2111, the wheel's ratchet).
 
 use crate::hidpp::{Endpoint, EndpointKind, Reply, DIRECT_INDEX};
 use anyhow::Result;
@@ -14,6 +15,14 @@ pub const FEATURE_REPROG_V4: u16 = 0x1B04;
 /// Haptic feedback: not in Logitech's public documents; reverse-engineered by Solaar,
 /// OpenLogi and others. Function 0 lists the waveforms the device has, 4 plays one.
 pub const FEATURE_HAPTIC: u16 = 0x19B0;
+/// SmartShift wheel (MX Master 3): function 0 reads the wheel mode, 1 sets it.
+pub const FEATURE_SMART_SHIFT: u16 = 0x2110;
+/// Enhanced SmartShift (MX Master 3S and 4): function 1 reads the wheel mode, 2 sets it.
+pub const FEATURE_SMART_SHIFT_ENHANCED: u16 = 0x2111;
+
+/// Wheel modes of SmartShift: spinning freely, or clicking (ratchet).
+pub const WHEEL_FREE: u8 = 1;
+pub const WHEEL_RATCHET: u8 = 2;
 
 /// Haptic waveform IDs of feature 0x19B0 (the names Logi Options+ uses). The MX Master 4
 /// offers 0-14 and 27; see `Device::haptic_waveforms`. Kept whole as the reference for
@@ -195,6 +204,33 @@ impl Device {
         Ok(matches!(ep.request(self.index, fi, 4, &[waveform, 0, 0], Duration::from_millis(300))?, Reply::Ok(_)))
     }
 
+    /// The SmartShift feature index and its read function; the write function is the next.
+    fn smart_shift(&self) -> Option<(u8, u8)> {
+        (self.feature(FEATURE_SMART_SHIFT_ENHANCED).map(|fi| (fi, 1)))
+            .or_else(|| self.feature(FEATURE_SMART_SHIFT).map(|fi| (fi, 0)))
+    }
+
+    /// The wheel mode (`WHEEL_FREE` or `WHEEL_RATCHET`); None without SmartShift or
+    /// when the mouse is away.
+    pub fn wheel_mode(&self, ep: &mut Endpoint) -> Result<Option<u8>> {
+        let Some((fi, read)) = self.smart_shift() else { return Ok(None) };
+        for _ in 0..2 {
+            match ep.request(self.index, fi, read, &[], FAST_TIMEOUT)? {
+                Reply::Ok(r) => return Ok(Some(r[0]).filter(|&m| m == WHEEL_FREE || m == WHEEL_RATCHET)),
+                Reply::Error => return Ok(None),
+                Reply::Timeout => continue,
+            }
+        }
+        Ok(None)
+    }
+
+    /// Sets the wheel mode. The other values (SmartShift sensitivity, torque) are sent as
+    /// 0, "leave as it is", so what Logi Options+ set for them stays.
+    pub fn set_wheel_mode(&self, ep: &mut Endpoint, mode: u8) -> Result<bool> {
+        let Some((fi, read)) = self.smart_shift() else { return Ok(false) };
+        Ok(matches!(ep.request(self.index, fi, read + 1, &[mode, 0, 0], FAST_TIMEOUT)?, Reply::Ok(_)))
+    }
+
     /// Reads how a control reports right now; None when the device lacks it (or is away).
     pub fn control_reporting(&self, ep: &mut Endpoint, cid: u16) -> Result<Option<Reporting>> {
         let Some(fi) = self.feature(FEATURE_REPROG_V4) else { return Ok(None) };
@@ -339,7 +375,14 @@ pub fn probe_slot(
         return Ok(None);
     }
     let mut features = HashMap::new();
-    for f in [FEATURE_NAME, FEATURE_CHANGE_HOST, FEATURE_REPROG_V4, FEATURE_HAPTIC] {
+    for f in [
+        FEATURE_NAME,
+        FEATURE_CHANGE_HOST,
+        FEATURE_REPROG_V4,
+        FEATURE_HAPTIC,
+        FEATURE_SMART_SHIFT,
+        FEATURE_SMART_SHIFT_ENHANCED,
+    ] {
         if let Some(fi) = feature_index(ep, index, f, SLOW_TIMEOUT)? {
             features.insert(f, fi);
         }

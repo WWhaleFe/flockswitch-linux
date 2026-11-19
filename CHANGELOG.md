@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.15.0 - 2026-11-19
+
+- **Restore the wheel mode on return**: when the master mouse comes back, flockswitch puts its wheel back to the ratchet or free-spinning mode it had on this computer. After switching to another device with the wheel mode-shift button, a press there before flockswitch had taken the button (in the moments after the mouse arrives, for example on Android) made the mouse flip its wheel by itself, and the mouse came back that way. The mode is remembered while flockswitch holds the button, so a change made in Solaar is kept as the new one, and it is kept on disk (`wheel-mode.toml`) for after a restart. Only the wheel mode is written (SmartShift 0x2110 / 0x2111), not the SmartShift sensitivity. On by default, with a switch in Settings → Switching → wheel mode-shift button and `set keep_wheel_mode true|false`; it acts only while that button switches
+- **Buttons taken back sooner**: when the master mouse links again, its buttons are taken 0.25 s later instead of after 1.5 s; a divert the mouse does not confirm is tried again 2 s later instead of at the next 30-second check; and a mouse that does not answer no longer makes each of the other buttons wait out its own timeout
+
 ## 0.14.0 — 2026-11-12
 
 Installing takes one command and one password; every feature stays as it was.

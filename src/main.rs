@@ -68,6 +68,8 @@ USAGE:
                               set follow all        devices that move along (all, none, or B366,MX Keys)
                               set trigger_device auto
                               set enabled true|false
+                              set keep_wheel_mode true         put the wheel back (ratchet or free) when the
+                                                    mouse comes back (with the wheel_mode button)
                               set hotkeys true      keyboard shortcuts on (any keyboard)
                               set hotkey.2 ctrl+alt+2          shortcut for channel 2 (none = off)
                               set edges true        switch when the cursor rests at a screen edge

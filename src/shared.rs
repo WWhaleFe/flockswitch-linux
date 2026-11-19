@@ -342,6 +342,35 @@ pub fn forget_original_divert(key: &str, cid: u16) {
     save_divert_records(&r);
 }
 
+/// The wheel mode (SmartShift: 1 free-spinning, 2 ratchet) each master mouse had on this
+/// computer, by device key; kept on disk so it is put back even after a restart.
+#[derive(Default, Serialize, Deserialize)]
+struct WheelModes {
+    #[serde(default)]
+    mode: std::collections::BTreeMap<String, u8>,
+}
+
+fn wheel_mode_path() -> std::path::PathBuf {
+    Config::path().with_file_name("wheel-mode.toml")
+}
+
+pub fn load_wheel_modes() -> std::collections::HashMap<String, u8> {
+    std::fs::read_to_string(wheel_mode_path())
+        .ok()
+        .and_then(|t| toml::from_str::<WheelModes>(&t).ok())
+        .map(|w| w.mode.into_iter().collect())
+        .unwrap_or_default()
+}
+
+pub fn save_wheel_modes(modes: &std::collections::HashMap<String, u8>) {
+    let w = WheelModes { mode: modes.iter().map(|(k, &v)| (k.clone(), v)).collect() };
+    if let Ok(text) = toml::to_string_pretty(&w) {
+        if let Err(e) = std::fs::write(wheel_mode_path(), text) {
+            log::warn!("cannot save the wheel mode: {e}");
+        }
+    }
+}
+
 pub struct Shared {
     config: Mutex<Config>,
     /// Modification time of config.toml as last read or written by us.

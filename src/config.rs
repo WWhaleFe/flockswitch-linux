@@ -779,6 +779,10 @@ pub struct Config {
     /// Install a new version found by that check (after its SHA-256 check) and restart
     /// into it. Not for a Homebrew install, which `brew upgrade` updates.
     pub auto_update: bool,
+    /// When the master mouse comes back, put its wheel (ratchet or free-spinning) back
+    /// the way it was here. Only while the wheel mode-shift button switches: a press of
+    /// it on another device before flockswitch there takes the button flips the wheel.
+    pub keep_wheel_mode: bool,
     /// Per-button settings. (Tables last: TOML writes tables after plain values.)
     pub buttons: Buttons,
     /// Keyboard shortcuts, one per channel.
@@ -856,6 +860,7 @@ impl Default for Config {
             language: crate::i18n::system_language().into(),
             check_updates: true,
             auto_update: true,
+            keep_wheel_mode: true,
             buttons: Buttons::default(),
             hotkeys: Hotkeys::default(),
             edges: Edges::default(),
@@ -1214,6 +1219,7 @@ impl Config {
             "language" => self.language = value.trim().to_lowercase(),
             "check_updates" => self.check_updates = value.parse().context("check_updates must be true or false")?,
             "auto_update" => self.auto_update = value.parse().context("auto_update must be true or false")?,
+            "keep_wheel_mode" => self.keep_wheel_mode = value.parse().context("keep_wheel_mode must be true or false")?,
             // Which buttons are on, e.g. "wheel_mode,gesture" or "0x00C4,0x00C3".
             // `triggers` / `trigger_cid` are the names older versions used.
             "buttons" | "triggers" | "trigger_cid" => {
@@ -1375,6 +1381,19 @@ mod tests {
     }
 
     #[test]
+    fn keep_wheel_mode() {
+        let mut c = Config::default();
+        assert!(c.keep_wheel_mode);
+        c.set("keep_wheel_mode", "false").unwrap();
+        assert!(!c.keep_wheel_mode);
+        assert!(c.set("keep_wheel_mode", "maybe").is_err());
+        let back = Config::parse(&toml::to_string_pretty(&c).unwrap()).unwrap();
+        assert!(!back.keep_wheel_mode);
+        // Settings written before it existed keep it on.
+        assert!(Config::parse("enabled = true").unwrap().keep_wheel_mode);
+    }
+
+    #[test]
     fn cycle_wraps_like_the_hardware_button() {
         let b = button(&[1, 2, 3]);
         assert_eq!(press(&b, 0, 3), Some(2));
@@ -1447,7 +1466,7 @@ mod tests {
         c.buttons.gesture = ButtonSetting { on: true, channels: vec![3], ..ButtonSetting::default() };
         let text = toml::to_string_pretty(&c).unwrap();
         assert!(text.contains("[buttons.gesture]"), "{text}");
-        assert!(!text.contains("mode =") && !text.contains("target"), "{text}");
+        assert!(!text.lines().any(|l| l.starts_with("mode =")) && !text.contains("target"), "{text}");
         let back = Config::parse(&text).unwrap();
         assert_eq!(back.buttons, c.buttons);
         assert_eq!(back.triggers(), vec![BUTTON_WHEEL_MODE, BUTTON_GESTURE]);

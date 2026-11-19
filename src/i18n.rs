@@ -101,6 +101,8 @@ pub struct Texts {
     pub hotkey_taken: &'static str,
     pub hotkey_duplicate: &'static str,
     pub buttons_hint: &'static str,
+    pub keep_wheel_mode: &'static str,
+    pub keep_wheel_mode_help: &'static str,
     pub notice_title: &'static str,
     pub notice: &'static str,
     pub hid_denied_title: &'static str,
@@ -422,6 +424,8 @@ const KO: Texts = Texts {
     hotkey_taken: "다른 앱이 쓰는 조합이라 등록하지 못했습니다. 다른 조합으로 바꿔 주세요.",
     hotkey_duplicate: "이미 다른 채널에 쓰는 조합입니다.",
     buttons_hint: "휠 클릭을 켜면 휠을 눌러도 원래 동작(링크 새 탭 열기 등) 대신 전환만 합니다.",
+    keep_wheel_mode: "돌아오면 휠 모드 되돌리기",
+    keep_wheel_mode_help: "이 컴퓨터에서 쓰던 휠 모드(걸림·무한 회전)를 기억해 두었다가, 마우스가 돌아오면 그 모드로 되돌립니다.\n\n마우스가 다른 기기(예: Android)에 막 도착했을 때는 그쪽 flockswitch가 아직 버튼을 가져가기 전이라, 그때 이 버튼을 누르면 마우스가 스스로 휠 모드를 바꿉니다. 이 설정은 그렇게 바뀐 휠 모드를 돌아왔을 때 바로잡습니다.\n\nSolaar에서 휠 모드를 바꾸면 그 모드를 새로 기억합니다.",
     notice_title: "시작하기 전에",
     notice: "리눅스에는 Logi Options+가 없어서 버튼을 따로 비워 둘 필요가 없습니다. Solaar를 쓴다면 전환 탭에서 켤 버튼(휠 모드 전환·제스처·휠 클릭)에 Solaar의 버튼 설정이나 규칙을 걸지 마세요. 장치에 접근하려면 udev 규칙이 한 번 필요합니다(install.sh가 설치하며, 없으면 위의 설치·설정 점검이 알려 줍니다).
 
@@ -744,6 +748,8 @@ const EN: Texts = Texts {
     hotkey_taken: "Another app uses this combination, so it could not be registered. Choose another.",
     hotkey_duplicate: "Already used for another channel.",
     buttons_hint: "With wheel click on, pressing the wheel switches instead of its usual action (e.g. opening a link in a new tab).",
+    keep_wheel_mode: "Restore the wheel mode on return",
+    keep_wheel_mode_help: "Remembers the wheel mode used on this computer (ratchet or free-spinning) and puts it back when the mouse returns.\n\nRight after the mouse arrives on another device (for example Android), flockswitch there has not taken the button yet, so a press then makes the mouse change its wheel mode by itself. This setting puts that right when the mouse is back.\n\nA wheel mode changed in Solaar is remembered as the new one.",
     notice_title: "Before you start",
     notice: "Linux has no Logi Options+, so no button needs to be set aside first. If you use Solaar, give the buttons you turn on in the Switching tab (wheel mode-shift, gesture, wheel click) no Solaar setting or rule. Reaching the devices needs a udev rule, set once by install.sh (if it is missing, the setup check above offers it).
 
