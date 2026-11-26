@@ -103,7 +103,7 @@ impl X11 {
                     (x.XDisplayWidth)(d, screen) / 2,
                     (x.XDisplayHeight)(d, screen) / 2,
                 );
-                let bits = [0i8];
+                let bits: [std::os::raw::c_char; 1] = [0];
                 let bitmap = (x.XCreateBitmapFromData)(d, root, bits.as_ptr(), 1, 1);
                 let mut color: xlib::XColor = std::mem::zeroed();
                 let blank =
@@ -152,7 +152,7 @@ impl X11 {
                                         let mut e = std::mem::zeroed();
                                         (x.XNextEvent)(d, &mut e);
                                     }
-                                    let mut keys = [0i8; 32];
+                                    let mut keys: [std::os::raw::c_char; 32] = [0; 32];
                                     (x.XQueryKeymap)(d, keys.as_mut_ptr());
                                     for code in [29u32, 42, 54, 56, 97, 100, 125, 126] {
                                         let key = code + 8;
