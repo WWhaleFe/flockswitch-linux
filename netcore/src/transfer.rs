@@ -166,7 +166,7 @@ impl Outgoing {
                     None
                 } else {
                     let end = (*at + CHUNK).min(data.len());
-                    let piece = (0u32, data[*at..end].to_vec());
+                    let piece = (0u32, STANDARD.encode(&data[*at..end]), end - *at);
                     *at = end;
                     Some(piece)
                 }
@@ -178,24 +178,24 @@ impl Outgoing {
                 if file.is_none() {
                     *file = Some(File::open(&paths[*index]).with_context(|| format!("opening {}", paths[*index].display()))?);
                 }
-                let mut buf = vec![0u8; CHUNK];
+                let mut buf = [0u8; CHUNK];
                 let n = file.as_mut().unwrap().read(&mut buf)?;
                 if n == 0 {
                     *file = None;
                     *index += 1;
                     continue;
                 }
-                buf.truncate(n);
-                break Some((*index as u32, buf));
+                break Some((*index as u32, STANDARD.encode(&buf[..n]), n));
             },
         };
         match piece {
-            Some((file, data)) => {
-                self.sent += data.len() as u64;
-                Ok(Some(Msg::ClipChunk { id, file, data: STANDARD.encode(data) }))
+            Some((file, data, size)) => {
+                self.sent += size as u64;
+                Ok(Some(Msg::ClipChunk { id, file, data }))
             }
             None => {
                 self.done = true;
+                self.source = Source::Bytes(Vec::new(), 0);
                 Ok(Some(Msg::ClipDone { id }))
             }
         }
@@ -241,8 +241,8 @@ impl Incoming {
             .map(|f| safe_name(&f.name).map(|name| FileMeta { name, size: f.size }))
             .collect::<Option<Vec<_>>>()
             .context("bad file name")?;
-        let dir = work.join(format!("incoming-{id}"));
-        let _ = std::fs::remove_dir_all(&dir);
+        // A worker may still be finishing an older transfer with the same wire id.
+        let dir = unique_path(work, &format!("incoming-{id}"));
         std::fs::create_dir_all(&dir)?;
         let written = vec![0; files.len()];
         Ok(Self { id, kind, files, dir, written, total, received: 0 })
@@ -303,9 +303,57 @@ impl Incoming {
     }
 }
 
+impl Drop for Incoming {
+    fn drop(&mut self) {
+        // Also covers failed finish, superseded queued work and shutdown.
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reused_transfer_ids_do_not_remove_another_workers_files() {
+        let work = temp("reused-id");
+        let meta = vec![FileMeta { name: "text".into(), size: 3 }];
+        let mut old = Incoming::start(1, ClipKind::Text, meta.clone(), 100, &work).unwrap();
+        old.chunk(0, &STANDARD.encode(b"old")).unwrap();
+        let mut new = Incoming::start(1, ClipKind::Text, meta, 100, &work).unwrap();
+        new.chunk(0, &STANDARD.encode(b"new")).unwrap();
+        assert_ne!(old.dir, new.dir);
+        drop(old);
+        assert_eq!(new.finish(&work.join("dest")).unwrap(), Received::Text("new".into()));
+        assert_eq!(std::fs::read_dir(&work).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn sent_bytes_are_released_and_no_chunk_exceeds_the_wire_limit() {
+        let data = vec![7; CHUNK * 4 + 1];
+        let mut outgoing = Outgoing::bytes(99, ClipKind::Image, "image", data);
+        let mut chunks = 0;
+        while let Some(msg) = outgoing.next().unwrap() {
+            if let Msg::ClipChunk { data, .. } = &msg {
+                assert!(STANDARD.decode(data).unwrap().len() <= CHUNK);
+                chunks += 1;
+            }
+            let mut wire = Vec::new();
+            crate::proto::write_frame(&mut wire, &msg).unwrap();
+        }
+        assert_eq!(chunks, 5);
+        assert!(matches!(&outgoing.source, Source::Bytes(bytes, 0) if bytes.capacity() == 0));
+    }
+
+    #[test]
+    fn failed_finish_cleans_up_incomplete_files() {
+        let work = temp("incomplete-cleanup");
+        let mut incoming = Incoming::start(90, ClipKind::Text,
+            vec![FileMeta { name: "text".into(), size: 5 }], 100, &work).unwrap();
+        incoming.chunk(0, &STANDARD.encode(b"part")).unwrap();
+        assert!(incoming.finish(&work.join("dest")).is_err());
+        assert_eq!(std::fs::read_dir(&work).unwrap().count(), 0);
+    }
 
     fn temp(name: &str) -> PathBuf {
         let d = std::env::temp_dir().join(format!("flock-transfer-{name}-{}", std::process::id()));
