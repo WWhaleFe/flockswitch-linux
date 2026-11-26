@@ -772,17 +772,18 @@ fn draw_map(ui: &mut Ui, p: Palette, t: &Texts, grid: &[Option<MapCell>], picked
                         click = MapClick::Pick(cell.id.clone());
                     }
                 }
-                None if drop => {
-                    resp.widget_info(|| WidgetInfo::labeled(Role::Button, true, t.layout_empty));
-                    let fill = if resp.hovered() { p.card } else { p.card.gamma_multiply(0.45) };
-                    painter.rect_filled(r, 12, fill);
-                    painter.rect_stroke(r, 12, Stroke::new(1.2, if resp.hovered() { p.text } else { p.dash }), StrokeKind::Inside);
-                    painter.text(r.center(), Align2::CENTER_CENTER, t.layout_empty, FontId::proportional(12.0), p.muted);
+                None => {
+                    resp.widget_info(|| WidgetInfo::labeled(Role::Button, drop, t.layout_empty));
+                    if drop {
+                        painter.rect_filled(r, 12, p.text.gamma_multiply(if resp.hovered() { 0.14 } else { 0.07 }));
+                        painter.rect_stroke(r, 12, Stroke::new(1.5, p.muted), StrokeKind::Inside);
+                    } else {
+                        painter.rect_stroke(r, 12, Stroke::new(1.0, p.border), StrokeKind::Inside);
+                    }
                     if resp.clicked() {
                         click = MapClick::Place(col, row);
                     }
                 }
-                None => {}
             }
         }
     }

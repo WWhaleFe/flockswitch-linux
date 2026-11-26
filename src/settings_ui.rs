@@ -1553,64 +1553,45 @@ impl SettingsApp {
                 UpdateUi::Restarting => (version_line, t.update_restarting.to_string()),
                 UpdateUi::Installed => (version_line, t.update_installed.to_string()),
             };
-            let mut labels: Vec<(&str, ButtonKind)> = Vec::new();
-            match &state {
+            // The first button is the rightmost. "Update now" shows for every install kind;
+            // where this copy cannot install itself it downloads the file instead.
+            let labels: Vec<(&str, ButtonKind)> = match &state {
                 UpdateUi::Available(_) | UpdateUi::InstallFailed(..) if !brew_running => {
-                    match kind {
-                        update::InstallKind::SelfReplace(_) => labels.push((t.update_now, ButtonKind::Primary)),
-                        update::InstallKind::DownloadOnly => labels.push((t.update_download, ButtonKind::Primary)),
-                        update::InstallKind::Homebrew if brew_item.is_some() => labels.push((t.update_now, ButtonKind::Primary)),
-                        update::InstallKind::Homebrew => {}
+                    vec![(t.update_now, ButtonKind::Primary), (t.update_page, ButtonKind::Plain)]
+                }
+                UpdateUi::Downloaded(_) => vec![(t.update_show, ButtonKind::Plain)],
+                _ if busy => vec![],
+                _ => vec![(t.update_page, ButtonKind::Plain), (t.update_check, ButtonKind::Plain)],
+            };
+            let width = labels.iter().map(|(l, k)| button_width(ui, l, *k)).sum::<f32>() + 8.0 * labels.len().saturating_sub(1) as f32;
+            let mut clicked = None;
+            labeled_row_help(ui, p, &title, Some(&help).filter(|h| !h.is_empty()).map(String::as_str), width.max(10.0), |ui| {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.spacing_mut().item_spacing.x = 8.0;
+                    for (i, (label, kind)) in labels.iter().enumerate() {
+                        if button(ui, p, label, *kind).clicked() {
+                            clicked = Some(i);
+                        }
                     }
-                    labels.push((t.update_page, ButtonKind::Plain));
-                }
-                UpdateUi::Downloaded(_) => labels.push((t.update_show, ButtonKind::Plain)),
-                _ if busy => {}
-                _ => {
-                    labels.push((t.update_check, ButtonKind::Plain));
-                    labels.push((t.update_page, ButtonKind::Plain));
-                }
-            }
-            ui.add_space(10.0);
-            ui.label(RichText::new(&title).size(14.5).color(p.text));
-            if !help.is_empty() {
-                ui.add_space(3.0);
-                ui.label(RichText::new(&help).size(12.5).color(p.muted));
+                });
+                false
+            });
+            match (&state, clicked) {
+                (UpdateUi::Available(r) | UpdateUi::InstallFailed(r, _), Some(0)) if !brew_running => match (matches!(kind, update::InstallKind::Homebrew), brew_item.clone()) {
+                    (true, Some(item)) => self.setup.confirm = Some(vec![item]),
+                    _ => self.install_update(&ctx, r.clone()),
+                },
+                (UpdateUi::Available(r) | UpdateUi::InstallFailed(r, _), Some(_)) => update::open_url(&r.page),
+                (UpdateUi::Downloaded(path), Some(_)) => update::reveal(path),
+                (_, Some(0)) => update::open_url(update::RELEASES_PAGE),
+                (_, Some(_)) => self.check_update(&ctx),
+                _ => {}
             }
             match &state {
                 UpdateUi::Failed(why) => hint(ui, p, why),
                 UpdateUi::InstallFailed(_, why) => hint(ui, p, &format!("{}: {why}", t.update_install_failed)),
                 _ => {}
             }
-            if !labels.is_empty() {
-                ui.add_space(8.0);
-                let mut clicked = None;
-                ui.horizontal_wrapped(|ui| {
-                    ui.spacing_mut().item_spacing = Vec2::new(8.0, 6.0);
-                    for (i, (label, btn_kind)) in labels.iter().enumerate() {
-                        if compact_button(ui, p, label, *btn_kind).clicked() {
-                            clicked = Some(i);
-                        }
-                    }
-                });
-                match (&state, clicked) {
-                    (UpdateUi::Available(r) | UpdateUi::InstallFailed(r, _), Some(0)) if labels[0].1 == ButtonKind::Primary => match kind {
-                        update::InstallKind::SelfReplace(_) => self.install_update(&ctx, r.clone()),
-                        update::InstallKind::DownloadOnly => self.download_update(&ctx, r.clone()),
-                        update::InstallKind::Homebrew => {
-                            if let Some(item) = brew_item.clone() {
-                                self.setup.confirm = Some(vec![item]);
-                            }
-                        }
-                    },
-                    (UpdateUi::Available(r) | UpdateUi::InstallFailed(r, _), Some(_)) => update::open_url(&r.page),
-                    (UpdateUi::Downloaded(path), Some(_)) => update::reveal(path),
-                    (_, Some(0)) => self.check_update(&ctx),
-                    (_, Some(_)) => update::open_url(update::RELEASES_PAGE),
-                    _ => {}
-                }
-            }
-            ui.add_space(8.0);
             divider(ui, p);
             let mut on = self.cfg.check_updates;
             let (flipped, label) = switch_row_full(ui, p, t.update_auto, None, &mut on);
