@@ -4,6 +4,20 @@ use flock_net::{NetConfig, Role};
 use serde_json::{json, Value};
 use std::path::PathBuf;
 
+/// Apply the settings received from the master.
+pub fn apply_master_settings(config: &mut Config, settings: &flock_net::MasterSettings) {
+    settings.apply_to(&mut config.network);
+    if let Some(pending) = &config.pending_key_rules {
+        if *pending == config.network.all_rules() {
+            config.pending_key_rules = None;
+        } else {
+            // An older response must not consume a newer edit, or replace it locally.
+            config.network.keys = pending.clone();
+        }
+    }
+    apply_app_settings(config, &settings.app);
+}
+
 pub fn runtime_config(full: &Config, wayland: bool, config_dir: PathBuf) -> NetConfig {
     let mut config = full.network.clone();
     config.config_dir = config_dir;
@@ -14,6 +28,41 @@ pub fn runtime_config(full: &Config, wayland: bool, config_dir: PathBuf) -> NetC
         config.app_settings = app_settings(full);
     }
     config
+}
+
+#[cfg(test)]
+mod delivery_tests {
+    use super::*;
+
+    #[test]
+    fn offline_edit_survives_old_master_settings_and_restart() {
+        let mut sub = Config::default();
+        sub.network.role = Role::Sub;
+        let old = flock_net::MasterSettings::of(&sub.network, "master");
+        sub.network.keys = sub.network.all_rules();
+        sub.network.keys.get_mut("linux>mac").unwrap().capture = false;
+        sub.pending_key_rules = Some(sub.network.keys.clone());
+        let mut sub = Config::parse(&sub.to_text().unwrap()).unwrap();
+        apply_master_settings(&mut sub, &old);
+        assert!(!sub.network.keys["linux>mac"].capture);
+        assert!(sub.pending_key_rules.is_some());
+        let ack = flock_net::MasterSettings::of(&sub.network, "master");
+        apply_master_settings(&mut sub, &ack);
+        assert!(sub.pending_key_rules.is_none());
+    }
+
+    #[test]
+    fn old_ack_does_not_delete_a_newer_edit() {
+        let mut sub = Config::default();
+        sub.network.keys = sub.network.all_rules();
+        sub.network.keys.get_mut("linux>mac").unwrap().capture = false;
+        let old_ack = flock_net::MasterSettings::of(&sub.network, "master");
+        sub.network.keys.get_mut("mac>linux").unwrap().capture = false;
+        sub.pending_key_rules = Some(sub.network.keys.clone());
+        apply_master_settings(&mut sub, &old_ack);
+        assert!(sub.pending_key_rules.is_some());
+        assert!(!sub.network.keys["mac>linux"].capture);
+    }
 }
 
 /// The effect settings a master hands to its subs: the countdown look and the cursor

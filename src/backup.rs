@@ -69,8 +69,8 @@ fn export_to(dir: &Path, cfg: &Config, host: &str, stamp: &str, when: &str) -> R
 
 /// The file's content: a header saying where it came from, then the settings.
 pub fn export_text(cfg: &Config, host: &str, when: &str) -> Result<String> {
-    // What the setup check set aside is about this computer, not the settings.
-    let settings = Config { setup: Default::default(), ..cfg.clone() }.to_text()?;
+    // Setup choices and undelivered edits belong to this computer.
+    let settings = Config { setup: Default::default(), pending_key_rules: None, ..cfg.clone() }.to_text()?;
     Ok(format!(
         "# flockswitch settings\n\
          # Saved by flockswitch {} for Linux on {host}, {when}\n\
@@ -342,6 +342,7 @@ pub fn parse(text: &str) -> Result<Config> {
         bail!("no flockswitch settings in it");
     }
     let mut cfg = Config::parse(text)?;
+    cfg.pending_key_rules = None;
     drop_unusable_shortcuts(&mut cfg);
     cfg.validate()?;
     Ok(cfg)
@@ -410,6 +411,15 @@ mod tests {
         assert!(text.contains("[setup]") && text.contains("first_check = true") && !text.contains("snoozed"), "{text}");
         assert!(Config::parse(&text).unwrap().setup.first_check);
         assert!(!export_text(&c, "desk", "2026-11-11 10:00:00").unwrap().contains("first_check"));
+    }
+
+    #[test]
+    fn pending_key_edits_stay_on_this_computer() {
+        let mut cfg = Config::default();
+        cfg.pending_key_rules = Some(cfg.network.all_rules());
+        let text = export_text(&cfg, "desk", "2026-11-27 12:00:00").unwrap();
+        assert!(!text.contains("pending_key_rules"));
+        assert!(parse(&cfg.to_text().unwrap()).unwrap().pending_key_rules.is_none());
     }
 
     #[test]

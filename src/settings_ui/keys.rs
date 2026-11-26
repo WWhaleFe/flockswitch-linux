@@ -85,7 +85,8 @@ impl SettingsApp {
         // A sub may edit too: its change goes to the master, which hands it to everyone.
         if self.follows_master() {
             gap(ui);
-            note_box(ui, p, NoteKind::Info, t.keys_note_sub, None);
+            let note = if self.cfg.pending_key_rules.is_some() { t.keys_sync_pending } else { t.keys_note_sub };
+            note_box(ui, p, NoteKind::Info, note, None);
         }
         gap(ui);
         section_head(ui, p, t.keys_section, None, |ui| head_note(ui, t.keys_section_note, p.muted));
@@ -277,13 +278,12 @@ impl SettingsApp {
 
     /// Saves one change to the rules. A sub also sends the rules to its master.
     fn edit_key_rules(&mut self, src: Os, dst: Os, edit: KeyEdit) {
-        self.apply(|c| logic::edit_keys(&mut c.network, src, dst, edit));
-        if self.follows_master() {
-            let keys = self.cfg.network.keys.clone();
-            if let Err(e) = crate::net::request_key_rules(&keys) {
-                self.error = Some(format!("{e:#}"));
+        self.apply(|c| {
+            logic::edit_keys(&mut c.network, src, dst, edit);
+            if c.network.role == flock_net::Role::Sub && !c.network.peers.is_empty() {
+                c.pending_key_rules = Some(c.network.all_rules());
             }
-        }
+        });
     }
 
     /// "Compare keys by system": a window with the table of what each system calls what.

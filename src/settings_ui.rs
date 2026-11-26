@@ -587,14 +587,13 @@ enum UpdateUi {
     Available(Release),
     Failed(String),
     Downloading,
-    Downloaded(std::path::PathBuf),
     /// The download matched its checksum and the new program is being put in place.
     Installing,
     InstallFailed(Release, String),
     /// Installed and the tray app is restarting into it: this window closes, and the
     /// new version opens it again.
     Restarting,
-    /// Installed while no tray app runs: the next start is the new version.
+    /// Installed, but starting the new version failed; the next start uses it.
     Installed,
 }
 
@@ -689,32 +688,15 @@ impl SettingsApp {
         });
     }
 
-    /// Downloads the new version into Downloads and shows it in the file manager.
-    fn download_update(&self, ctx: &egui::Context, release: Release) {
-        let Some((name, url, sums)) = release.asset.clone() else {
-            update::open_url(&release.page);
-            return;
-        };
-        let (state, ctx) = (self.update.clone(), ctx.clone());
-        *state.lock().unwrap() = UpdateUi::Downloading;
-        std::thread::spawn(move || {
-            let next = match update::download(&name, &url, &sums) {
-                Ok(path) => {
-                    update::reveal(&path);
-                    UpdateUi::Downloaded(path)
-                }
-                Err(e) => UpdateUi::Failed(format!("{e:#}")),
-            };
-            *state.lock().unwrap() = next;
-            ctx.request_repaint();
-        });
-    }
-
     /// "Update now": downloads, checks and installs the new version, then has the tray
-    /// app restart into it. Where this copy cannot replace itself it downloads instead.
+    /// app restart into it. Protected folders use administrator authentication.
     fn install_update(&self, ctx: &egui::Context, release: Release) {
-        let update::InstallKind::SelfReplace(exe) = update::install_kind() else {
-            return self.download_update(ctx, release);
+        let exe = match update::manual_target(&update::install_kind()) {
+            Ok(exe) => exe,
+            Err(e) => {
+                *self.update.lock().unwrap() = UpdateUi::InstallFailed(release, format!("{e:#}"));
+                return;
+            }
         };
         // A release without a file for this computer: its page says what to do.
         if release.asset.is_none() {
@@ -733,14 +715,13 @@ impl SettingsApp {
             };
             let next = match update::install(&release, &exe, &phase) {
                 // The new tray app takes over from the running one and reopens this window.
-                Ok(()) if crate::main_instance_running() => match update::start_new_version(&exe, &["tray", "--settings"]) {
+                Ok(()) => match update::start_new_version(&exe, &["tray", "--settings"]) {
                     Ok(()) => UpdateUi::Restarting,
                     Err(e) => {
                         log::warn!("update {}: installed, but cannot start it: {e:#}", release.version);
                         UpdateUi::Installed
                     }
                 },
-                Ok(()) => UpdateUi::Installed,
                 Err(e) => {
                     log::warn!("update {}: not installed: {e:#}", release.version);
                     UpdateUi::InstallFailed(release, format!("{e:#}"))
@@ -772,12 +753,8 @@ impl SettingsApp {
 
     /// Applies one change on top of the file's current content, validates, saves.
     fn apply(&mut self, change: impl FnOnce(&mut Config)) {
-        let mut next = Config::load_or_create().unwrap_or_else(|_| self.cfg.clone());
-        let previous = next.clone();
-        change(&mut next);
-        next.resolve_edge_owner(&previous);
-        match next.validate().and_then(|_| next.save()) {
-            Ok(()) => {
+        match Config::update(change) {
+            Ok(next) => {
                 crate::i18n::set_language(&next.language);
                 self.cfg = next;
                 self.error = None;
@@ -1528,6 +1505,7 @@ impl SettingsApp {
         // A Homebrew copy: brew updates it once approved (the setup check's item).
         let brew_item = self.setup_item(ItemId::BrewUpdate).filter(Item::actionable);
         let brew_running = self.setup.runs.lock().unwrap().get(&ItemId::BrewUpdate) == Some(&SetupRun::Running);
+        let brew_waiting = matches!(kind, update::InstallKind::Homebrew) && brew_item.is_none() && !brew_running;
         section(ui, p, t.section_update, |ui| {
             let busy = brew_running
                 || matches!(
@@ -1541,6 +1519,7 @@ impl SettingsApp {
                 update::InstallKind::DownloadOnly => crate::i18n::fill(t.update_new_help_download, &[current]),
             };
             let (title, help) = match &state {
+                UpdateUi::Available(_) | UpdateUi::InstallFailed(..) if brew_waiting => (version_line, t.update_brew_preparing.to_string()),
                 UpdateUi::Available(_) if brew_running => (version_line, t.update_installing.to_string()),
                 UpdateUi::Available(r) | UpdateUi::InstallFailed(r, _) => (crate::i18n::fill(t.update_new, &[&r.version]), new_help),
                 UpdateUi::Idle => (version_line, String::new()),
@@ -1548,18 +1527,16 @@ impl SettingsApp {
                 UpdateUi::UpToDate => (version_line, t.update_up_to_date.to_string()),
                 UpdateUi::Failed(_) => (version_line, t.update_failed.to_string()),
                 UpdateUi::Downloading => (version_line, t.update_downloading.to_string()),
-                UpdateUi::Downloaded(_) => (version_line, t.update_downloaded.to_string()),
                 UpdateUi::Installing => (version_line, t.update_installing.to_string()),
                 UpdateUi::Restarting => (version_line, t.update_restarting.to_string()),
                 UpdateUi::Installed => (version_line, t.update_installed.to_string()),
             };
-            // The first button is the rightmost. "Update now" shows for every install kind;
-            // where this copy cannot install itself it downloads the file instead.
+            // The first button is the rightmost. Homebrew waits for its setup action.
             let labels: Vec<(&str, ButtonKind)> = match &state {
+                UpdateUi::Available(_) | UpdateUi::InstallFailed(..) if brew_waiting => vec![(t.update_page, ButtonKind::Plain)],
                 UpdateUi::Available(_) | UpdateUi::InstallFailed(..) if !brew_running => {
                     vec![(t.update_now, ButtonKind::Primary), (t.update_page, ButtonKind::Plain)]
                 }
-                UpdateUi::Downloaded(_) => vec![(t.update_show, ButtonKind::Plain)],
                 _ if busy => vec![],
                 _ => vec![(t.update_page, ButtonKind::Plain), (t.update_check, ButtonKind::Plain)],
             };
@@ -1577,12 +1554,12 @@ impl SettingsApp {
                 false
             });
             match (&state, clicked) {
-                (UpdateUi::Available(r) | UpdateUi::InstallFailed(r, _), Some(0)) if !brew_running => match (matches!(kind, update::InstallKind::Homebrew), brew_item.clone()) {
+                (UpdateUi::Available(r) | UpdateUi::InstallFailed(r, _), Some(0)) if !brew_running && !brew_waiting => match (matches!(kind, update::InstallKind::Homebrew), brew_item.clone()) {
                     (true, Some(item)) => self.setup.confirm = Some(vec![item]),
-                    _ => self.install_update(&ctx, r.clone()),
+                    (false, _) => self.install_update(&ctx, r.clone()),
+                    (true, None) => {},
                 },
                 (UpdateUi::Available(r) | UpdateUi::InstallFailed(r, _), Some(_)) => update::open_url(&r.page),
-                (UpdateUi::Downloaded(path), Some(_)) => update::reveal(path),
                 (_, Some(0)) => update::open_url(update::RELEASES_PAGE),
                 (_, Some(_)) => self.check_update(&ctx),
                 _ => {}

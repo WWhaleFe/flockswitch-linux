@@ -4,7 +4,7 @@ use crate::{
     shared::Shared,
 };
 use flock_net::{NetConfig, Platform, Service, Side};
-use crate::net_logic::apply_app_settings;
+use crate::net_logic::apply_master_settings;
 pub use crate::net_logic::NetState;
 use std::{
     path::PathBuf,
@@ -27,27 +27,6 @@ pub fn config_dir() -> PathBuf {
         .to_path_buf()
 }
 
-/// Where the settings window leaves key rules edited on a sub. The window is another
-/// process and cannot call the service; the network thread sends them to the master.
-fn key_rules_request_path() -> PathBuf {
-    Config::path().with_file_name("key-rules.request")
-}
-
-/// Asks the running app to send `keys` to the master (a sub's edit of "OS 전환 시").
-pub fn request_key_rules(keys: &std::collections::BTreeMap<String, flock_net::DirRules>) -> anyhow::Result<()> {
-    let path = key_rules_request_path();
-    let tmp = path.with_extension("tmp");
-    std::fs::write(&tmp, serde_json::to_vec(keys)?)?;
-    std::fs::rename(tmp, path)?;
-    Ok(())
-}
-
-fn take_key_rules_request() -> Option<std::collections::BTreeMap<String, flock_net::DirRules>> {
-    let path = key_rules_request_path();
-    let bytes = std::fs::read(&path).ok()?;
-    let _ = std::fs::remove_file(&path);
-    serde_json::from_slice(&bytes).ok()
-}
 /// The running service and the config it runs with, for the edge watcher.
 struct Live {
     service: Arc<Service>,
@@ -235,6 +214,7 @@ pub fn spawn(shared: Arc<Shared>) -> JoinHandle<()> {
             let mut previous = None;
             let mut attempted = false;
             let mut retry = Instant::now() - Duration::from_secs(5);
+            let mut key_retry = Instant::now() - Duration::from_secs(2);
             while !shared.stopped() {
                 shared.reload_if_edited();
                 let config = runtime_config(&shared);
@@ -270,6 +250,7 @@ pub fn spawn(shared: Arc<Shared>) -> JoinHandle<()> {
                             let unpaired = shared.clone();
                             let changed = shared.clone();
                             let master = shared.clone();
+                            let key_rules = shared.clone();
                             let hooks = flock_net::Hooks {
                                 switch_logitech: Box::new(|_| {}),
                                 on_paired: Box::new(move |peer| {
@@ -287,24 +268,28 @@ pub fn spawn(shared: Arc<Shared>) -> JoinHandle<()> {
                                         log::error!("save unpaired computer: {e:#}");
                                     }
                                 }),
-                            on_peer_changed: Box::new(move |peer| {
-                                if let Err(e) = changed.update_config(|c| {
-                                    match c.network.peers.iter_mut().find(|p| p.id == peer.id) {
-                                        Some(slot) => *slot = peer,
-                                        None => c.network.peers.push(peer),
+                                on_peer_changed: Box::new(move |peer| {
+                                    if let Err(e) = changed.update_config(|c| {
+                                        match c.network.peers.iter_mut().find(|p| p.id == peer.id) {
+                                            Some(slot) => *slot = peer,
+                                            None => c.network.peers.push(peer),
+                                        }
+                                    }) {
+                                        log::error!("save computer: {e:#}");
                                     }
-                                }) {
-                                    log::error!("save computer: {e:#}");
-                                }
-                            }),
-                            on_master_settings: Box::new(move |settings| {
-                                if let Err(e) = master.update_config(|c| {
-                                    settings.apply_to(&mut c.network);
-                                    apply_app_settings(c, &settings.app);
-                                }) {
-                                    log::error!("save master settings: {e:#}");
-                                }
-                            }),
+                                }),
+                                on_master_settings: Box::new(move |settings| {
+                                    if let Err(e) = master.update_config(|c| {
+                                        apply_master_settings(c, &settings);
+                                    }) {
+                                        log::error!("save master settings: {e:#}");
+                                    }
+                                }),
+                                on_key_rules: Box::new(move |keys| {
+                                    if let Err(e) = key_rules.update_config(|c| c.network.keys = keys) {
+                                        log::error!("save key rules from sub: {e:#}");
+                                    }
+                                }),
                                 ..flock_net::Hooks::default()
                             };
                             match Service::start(config.clone(), p.clone(), hooks) {
@@ -323,15 +308,14 @@ pub fn spawn(shared: Arc<Shared>) -> JoinHandle<()> {
                         }
                     }
                 }
-                // Key rules edited on a sub go to its master (see `request_key_rules`).
-                if let Some(keys) = take_key_rules_request() {
-                    match &service {
-                        Some(s) => {
-                            if let Err(e) = s.send_key_rules(keys) {
-                                log::warn!("send key rules to the master: {e:#}");
-                            }
+                // Keep the outbox on disk across disabled sharing, failed sends and restarts.
+                // Enqueueing is not an acknowledgement: only echoed master settings clear it.
+                if config.on && config.role == flock_net::Role::Sub && key_retry.elapsed() >= Duration::from_secs(2) {
+                    if let (Some(s), Some(keys)) = (&service, shared.config().pending_key_rules) {
+                        key_retry = Instant::now();
+                        if let Err(e) = s.send_key_rules(keys) {
+                            log::warn!("send key rules to the master (will retry): {e:#}");
                         }
-                        None => log::info!("key rules edited while sharing is off: kept on this computer only"),
                     }
                 }
                 // Woke from sleep or unlocked: look for the other computers again now.

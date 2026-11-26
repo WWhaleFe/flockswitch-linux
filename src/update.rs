@@ -12,7 +12,7 @@
 //! new version, which takes over from this one. A Homebrew install is updated by
 //! `brew upgrade` once the user approved it in the settings window (setup.rs; the
 //! automatic install only asks, with a notification), and a program in a folder this
-//! user cannot write is only downloaded.
+//! user cannot write requests administrator authentication for a manual install.
 
 use anyhow::{anyhow, bail, Context, Result};
 use serde::Deserialize;
@@ -100,7 +100,14 @@ pub fn install_into(shared: std::sync::Arc<crate::shared::Shared>, release: Rele
             log::info!("update {}: cannot replace the program here; download it from the menu", release.version);
             return;
         }
-        InstallKind::DownloadOnly => return download_into(shared, release),
+        InstallKind::DownloadOnly => match manual_target(&InstallKind::DownloadOnly) {
+            Ok(exe) => exe,
+            Err(e) => {
+                log::warn!("update {}: cannot install: {e:#}", release.version);
+                shared.set_status(|s| s.update = UpdateState::InstallFailed(release));
+                return;
+            }
+        },
     };
     if release.asset.is_none() {
         log::info!("update {}: the release has no file for this computer", release.version);
@@ -141,8 +148,17 @@ pub enum InstallKind {
     SelfReplace(PathBuf),
     /// Installed by Homebrew, which owns the file: `brew upgrade --formula wwhalefe/tap/flockswitch`.
     Homebrew,
-    /// The folder cannot be written (or the program's path is unknown): download only.
+    /// Automatic replacement is unavailable. Manual updates request authentication.
     DownloadOnly,
+}
+
+/// A manual update must install, or report why it cannot. Homebrew owns its path.
+pub fn manual_target(kind: &InstallKind) -> Result<PathBuf> {
+    match kind {
+        InstallKind::SelfReplace(exe) => Ok(exe.clone()),
+        InstallKind::DownloadOnly => running_exe().context("cannot find the installed program"),
+        InstallKind::Homebrew => bail!("Homebrew update is not ready"),
+    }
 }
 
 /// What a Homebrew install is updated with.
@@ -221,7 +237,14 @@ pub fn install(release: &Release, exe: &Path, phase: &dyn Fn(Phase)) -> Result<(
     let _lock = std::net::TcpListener::bind(("127.0.0.1", INSTALL_LOCK_PORT))
         .map_err(|_| anyhow!("another flockswitch is installing an update"))?;
     let dir = exe.parent().ok_or_else(|| anyhow!("{} has no folder", exe.display()))?;
-    let staging = Staging::new(dir)?;
+    let staging_dir = if dir_writable(dir) {
+        dir.to_path_buf()
+    } else {
+        let cache = dirs::cache_dir().context("no update cache folder")?.join("flockswitch");
+        std::fs::create_dir_all(&cache)?;
+        cache
+    };
+    let staging = Staging::new(&staging_dir)?;
 
     phase(Phase::Downloading);
     log::info!("update {}: downloading {name} into {}", release.version, staging.0.display());
@@ -251,8 +274,32 @@ fn unpack_and_replace(tarball: &Path, name: &str, staging: &Path, exe: &Path) ->
     log::info!("update: unpacked {} runs here", new_exe.display());
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(&new_exe, std::fs::Permissions::from_mode(0o755))?;
-    std::fs::rename(&new_exe, exe).with_context(|| format!("cannot replace {}", exe.display()))?;
+    if exe.parent().is_some_and(dir_writable) {
+        std::fs::rename(&new_exe, exe).with_context(|| format!("cannot replace {}", exe.display()))?;
+    } else {
+        let out = admin_replace_command(&new_exe, exe).output().context("cannot start pkexec for the update")?;
+        if !out.status.success() {
+            bail!("administrator update failed ({}): {}", out.status, String::from_utf8_lossy(&out.stderr).trim());
+        }
+    }
     Ok(files)
+}
+
+// Arguments are positional, including paths with spaces, quotes or shell syntax.
+// Stage beside the destination for an atomic replacement across filesystems.
+const ADMIN_REPLACE_SCRIPT: &str = r#"set -eu
+update_source=$1
+update_target=$2
+update_temp=$(mktemp "${update_target}.update.XXXXXX")
+trap 'rm -f -- "$update_temp"' EXIT
+install -m 755 -- "$update_source" "$update_temp"
+mv -f -- "$update_temp" "$update_target"
+"#;
+
+fn admin_replace_command(source: &Path, target: &Path) -> Command {
+    let mut command = Command::new("pkexec");
+    command.args(["/bin/sh", "-c", ADMIN_REPLACE_SCRIPT, "flockswitch-update"]).arg(source).arg(target);
+    command
 }
 
 /// The unpack folder; removed again when dropped, with whatever is left in it.
@@ -659,6 +706,43 @@ fn percent_encode(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn manual_update_never_falls_back_to_a_download() {
+        assert!(manual_target(&InstallKind::Homebrew).is_err());
+        assert_eq!(manual_target(&InstallKind::SelfReplace("/opt/app/flockswitch".into())).unwrap(), PathBuf::from("/opt/app/flockswitch"));
+        assert!(manual_target(&InstallKind::DownloadOnly).unwrap().is_file());
+    }
+
+    #[test]
+    fn administrator_install_keeps_paths_as_arguments() {
+        let source = Path::new("/tmp/source ' $(touch injected)");
+        let target = Path::new("/opt/program folder/flockswitch");
+        let command = admin_replace_command(source, target);
+        assert_eq!(command.get_program(), "pkexec");
+        let args: Vec<_> = command.get_args().collect();
+        assert_eq!(args, [std::ffi::OsStr::new("/bin/sh"), std::ffi::OsStr::new("-c"), std::ffi::OsStr::new(ADMIN_REPLACE_SCRIPT), std::ffi::OsStr::new("flockswitch-update"), source.as_os_str(), target.as_os_str()]);
+    }
+
+    #[test]
+    fn administrator_install_script_replaces_atomically_or_keeps_the_old_program() {
+        let root = std::env::temp_dir().join(format!("flockswitch-admin-install-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let source = root.join("source ' $(touch injected)");
+        let target = root.join("target program");
+        std::fs::write(&target, b"old").unwrap();
+        let run = || Command::new("/bin/sh").args(["-c", ADMIN_REPLACE_SCRIPT, "flockswitch-update"])
+            .arg(&source).arg(&target).current_dir(&root).output().unwrap();
+        assert!(!run().status.success());
+        assert_eq!(std::fs::read(&target).unwrap(), b"old");
+        std::fs::write(&source, b"new").unwrap();
+        let output = run();
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        assert_eq!(std::fs::read(&target).unwrap(), b"new");
+        assert!(!root.join("injected").exists());
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 2);
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn versions() {

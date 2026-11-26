@@ -442,14 +442,12 @@ impl Shared {
     /// changes, so the UI can simply redraw from the current config.
     pub fn update_config(&self, change: impl FnOnce(&mut Config)) -> Result<()> {
         let mut current = self.config.lock().unwrap();
-        let mut next = current.clone();
-        change(&mut next);
-        next.resolve_edge_owner(&current);
-        next.validate()?;
-        next.save()?;
+        let next = Config::update(change)?;
         crate::i18n::set_language(&next.language);
         *current = next;
-        *self.config_mtime.lock().unwrap() = config_mtime();
+        // Another process may have saved after our transaction released its lock.
+        // Recheck the file rather than marking that unseen write as already loaded.
+        *self.config_mtime.lock().unwrap() = None;
         self.version.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
@@ -457,17 +455,17 @@ impl Shared {
     /// Picks up edits made to config.toml by hand. An invalid edit is reported once and
     /// ignored, so the running settings stay as they were.
     pub fn reload_if_edited(&self) {
+        // Keep an older parsed snapshot from replacing a concurrent update_config.
+        let mut current = self.config.lock().unwrap();
         let now = config_mtime();
         if now.is_none() || now == *self.config_mtime.lock().unwrap() {
             return;
         }
-        // Read and parse without holding any lock.
         let parsed = std::fs::read_to_string(Config::path())
             .map_err(anyhow::Error::from)
             .and_then(|t| Config::parse(&t))
             .and_then(|c| c.validate().map(|_| c));
         // Lock order: config, then config_mtime - the same as update_config.
-        let mut current = self.config.lock().unwrap();
         let mut seen = self.config_mtime.lock().unwrap();
         if now == *seen {
             return; // our own save raced with this check

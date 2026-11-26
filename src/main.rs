@@ -190,9 +190,9 @@ fn real_main(args: &[String]) -> Result<()> {
             let first_start = !Config::path().exists();
             let mut cfg = load_config();
             if first_start {
-                cfg.setup.first_check = true;
-                if let Err(e) = cfg.save() {
-                    log::warn!("cannot save the settings: {e:#}");
+                match Config::update(|c| c.setup.first_check = true) {
+                    Ok(next) => cfg = next,
+                    Err(e) => log::warn!("cannot save the settings: {e:#}"),
                 }
             }
             tray::run(Arc::new(Shared::new(cfg)), args.get(1).map(String::as_str) == Some("--settings"))
@@ -280,9 +280,7 @@ fn real_main(args: &[String]) -> Result<()> {
             let (Some(key), Some(value)) = (args.get(1), args.get(2)) else {
                 bail!("usage: flockswitch set <key> <value>  (see 'flockswitch help')");
             };
-            let mut cfg = Config::load_or_create()?;
-            cfg.set(key, value)?;
-            cfg.save()?;
+            Config::try_update(|cfg| cfg.set(key, value))?;
             println!("{key} = {value}  ({})", Config::path().display());
             Ok(())
         }
