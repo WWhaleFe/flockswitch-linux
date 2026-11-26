@@ -8,11 +8,12 @@ use std::path::PathBuf;
 pub fn apply_master_settings(config: &mut Config, settings: &flock_net::MasterSettings) {
     settings.apply_to(&mut config.network);
     if let Some(pending) = &config.pending_key_rules {
-        if *pending == config.network.all_rules() {
+        // The master echoes its whole table: only the pairs we sent must match.
+        if pending.iter().all(|(pair, rule)| settings.keys.get(pair) == Some(rule)) {
             config.pending_key_rules = None;
         } else {
             // An older response must not consume a newer edit, or replace it locally.
-            config.network.keys = pending.clone();
+            config.network.keys.extend(pending.clone());
         }
     }
     apply_app_settings(config, &settings.app);
@@ -89,7 +90,7 @@ mod delivery_tests {
         let old = flock_net::MasterSettings::of(&sub.network, "master");
         sub.network.keys = sub.network.all_rules();
         sub.network.keys.get_mut("linux>mac").unwrap().capture = false;
-        sub.pending_key_rules = Some(sub.network.keys.clone());
+        sub.pending_key_rules = Some([("linux>mac".to_string(), sub.network.keys["linux>mac"].clone())].into());
         let mut sub = Config::parse(&sub.to_text().unwrap()).unwrap();
         apply_master_settings(&mut sub, &old);
         assert!(!sub.network.keys["linux>mac"].capture);
@@ -106,10 +107,23 @@ mod delivery_tests {
         sub.network.keys.get_mut("linux>mac").unwrap().capture = false;
         let old_ack = flock_net::MasterSettings::of(&sub.network, "master");
         sub.network.keys.get_mut("mac>linux").unwrap().capture = false;
-        sub.pending_key_rules = Some(sub.network.keys.clone());
+        sub.pending_key_rules = Some([("mac>linux".to_string(), sub.network.keys["mac>linux"].clone())].into());
         apply_master_settings(&mut sub, &old_ack);
         assert!(sub.pending_key_rules.is_some());
         assert!(!sub.network.keys["mac>linux"].capture);
+    }
+
+    #[test]
+    fn only_the_pending_pairs_are_checked_against_the_echo() {
+        let mut sub = Config::default();
+        sub.network.keys = sub.network.all_rules();
+        sub.network.keys.get_mut("linux>mac").unwrap().capture = false;
+        sub.pending_key_rules = Some([("linux>mac".to_string(), sub.network.keys["linux>mac"].clone())].into());
+        let mut echo = flock_net::MasterSettings::of(&sub.network, "master");
+        let other = echo.keys.get_mut("mac>windows").unwrap();
+        other.capture = !other.capture;
+        apply_master_settings(&mut sub, &echo);
+        assert!(sub.pending_key_rules.is_none());
     }
 }
 

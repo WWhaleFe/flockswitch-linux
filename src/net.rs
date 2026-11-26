@@ -235,6 +235,8 @@ pub fn spawn(shared: Arc<Shared>) -> JoinHandle<()> {
                 }
                 let config = cached.as_ref().expect("initial network settings");
                 EDGES_ALLOWED.store(edges_allowed, Ordering::Release);
+                // Looking for computers again also asks the portal again after a cancel or deny.
+                let reconnect_asked = crate::shared::take_reconnect_file();
                 if !config.on {
                     if previous.as_ref().is_none_or(|c: &NetConfig| c.on) {
                         LIVE.lock().unwrap().take();
@@ -251,7 +253,7 @@ pub fn spawn(shared: Arc<Shared>) -> JoinHandle<()> {
                     }
                 } else {
                     // Changed settings are a new request: ask again at once.
-                    if previous.as_ref() != Some(config) && platform.is_none() {
+                    if (reconnect_asked || previous.as_ref() != Some(config)) && platform.is_none() {
                         platform_blocked = false;
                         platform_wait = PLATFORM_RETRY_MIN;
                         platform_retry = Instant::now() - PLATFORM_RETRY_MIN;

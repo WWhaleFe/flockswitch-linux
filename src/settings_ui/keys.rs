@@ -279,9 +279,16 @@ impl SettingsApp {
     /// Saves one change to the rules. A sub also sends the rules to its master.
     fn edit_key_rules(&mut self, src: Os, dst: Os, edit: KeyEdit) {
         self.apply(|c| {
+            let before = c.network.all_rules();
             logic::edit_keys(&mut c.network, src, dst, edit);
             if c.network.role == flock_net::Role::Sub && !c.network.peers.is_empty() {
-                c.pending_key_rules = Some(c.network.all_rules());
+                // Only the pairs this edit changed go to the master, which merges them per pair.
+                let changed: Vec<_> = c.network.all_rules().into_iter()
+                    .filter(|(pair, rule)| before.get(pair) != Some(rule))
+                    .collect();
+                if !changed.is_empty() {
+                    c.pending_key_rules.get_or_insert_with(Default::default).extend(changed);
+                }
             }
         });
     }

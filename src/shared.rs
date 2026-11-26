@@ -197,6 +197,20 @@ pub fn take_rescan_file() -> bool {
     std::fs::remove_file(rescan_request_path()).is_ok()
 }
 
+/// "연결 다시 찾기" in the settings window: the supervisor also lets the input portal ask
+/// again after the user cancelled or denied it.
+fn reconnect_request_path() -> std::path::PathBuf {
+    Config::path().with_file_name("reconnect.request")
+}
+
+pub fn request_reconnect() {
+    let _ = std::fs::write(reconnect_request_path(), b"");
+}
+
+pub fn take_reconnect_file() -> bool {
+    std::fs::remove_file(reconnect_request_path()).is_ok()
+}
+
 /// The channel asked for through the request file, if any; the file is removed.
 pub fn take_switch_file() -> Option<u8> {
     let path = switch_request_path();

@@ -162,6 +162,7 @@ impl SettingsApp {
             card(right, p, |ui| self.paired_rows(ui, t, p, live));
         });
         if rescan {
+            crate::shared::request_reconnect();
             self.net_request(flock_net::Request::Action { action: "reconnect".into() });
             self.rescan_at = Some(Instant::now());
         }
