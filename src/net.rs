@@ -147,13 +147,7 @@ pub fn network_side_ready(edge: Edge) -> bool {
     let live = LIVE.lock().unwrap();
     let Some(live) = live.as_ref() else { return false };
     let side = side(edge);
-    let status = live.service.status();
-    // The computer in the neighbouring cell of the layout (a master's sub or, on a sub,
-    // another sub), as long as its link is up.
-    let next = flock_net::layout::neighbour(&status.layout, &status.me.id, side);
-    status.running
-        && status.state.mode == "local"
-        && next.is_some_and(|id| status.peers.iter().any(|s| s.id == id && s.connected))
+    crate::net_logic::side_ready(&live.service.status(), side)
 }
 
 /// Moves control to the computer on `edge`, entering at the spot matching (x, y).
@@ -188,6 +182,7 @@ fn publish_error(config: &NetConfig, error: String) {
                 name: config.name.clone(),
                 port: config.port,
                 error: Some(error),
+                can_send: true,
             },
             discovered: vec![],
             peers: vec![],
@@ -293,9 +288,7 @@ pub fn spawn(shared: Arc<Shared>) -> JoinHandle<()> {
                                     }
                                 }),
                                 on_unpaired: Box::new(move |id| {
-                                    if let Err(e) = unpaired
-                                        .update_config(|c| c.network.peers.retain(|p| p.id != id))
-                                    {
+                                    if let Err(e) = unpaired.update_config(|c| crate::net_logic::forget_peer(c, &id)) {
                                         log::error!("save unpaired computer: {e:#}");
                                     }
                                 }),
@@ -339,11 +332,25 @@ pub fn spawn(shared: Arc<Shared>) -> JoinHandle<()> {
                 }
                 // Keep the outbox on disk across disabled sharing, failed sends and restarts.
                 // Enqueueing is not an acknowledgement: only echoed master settings clear it.
-                if config.on && config.role == flock_net::Role::Sub && key_retry.elapsed() >= Duration::from_secs(2) {
-                    if let (Some(s), Some(keys)) = (&service, shared.read_config(|c| c.pending_key_rules.clone())) {
-                        key_retry = Instant::now();
-                        if let Err(e) = s.send_key_rules(keys) {
-                            log::warn!("send key rules to the master (will retry): {e:#}");
+                // It goes when it can never be delivered: no master, not a sub, or a 2.0
+                // master that ignores key rule edits.
+                if shared.read_config(|c| c.pending_key_rules.is_some()) {
+                    let status = service.as_ref().map(|s| s.status());
+                    if shared.read_config(|c| crate::net_logic::keys_undeliverable(c, status.as_ref())) {
+                        if let Err(e) = shared.update_config(|c| {
+                            if crate::net_logic::keys_undeliverable(c, status.as_ref()) { c.pending_key_rules = None; }
+                        }) {
+                            log::warn!("drop undeliverable key rules: {e:#}");
+                        }
+                    } else if config.on && config.role == flock_net::Role::Sub && key_retry.elapsed() >= Duration::from_secs(2) {
+                        // netcore holds edits back until the master's settings arrived.
+                        if let (Some(s), Some(status), Some(keys)) = (&service, &status, shared.read_config(|c| c.pending_key_rules.clone())) {
+                            if status.following.is_some() {
+                                key_retry = Instant::now();
+                                if let Err(e) = s.send_key_rules(keys) {
+                                    log::warn!("send key rules to the master (will retry): {e:#}");
+                                }
+                            }
                         }
                     }
                 }

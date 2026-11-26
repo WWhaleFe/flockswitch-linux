@@ -322,6 +322,13 @@ impl KeyMapper {
         self.restored.extend(cx.lifted.take());
         out
     }
+    /// A modifier that was already down when the capture began counts as used: letting go
+    /// of it alone is masked like one pressed again after a chord.
+    pub(crate) fn carry(&mut self, usage: u16) {
+        if self.held.contains(&usage) {
+            self.restored.insert(usage);
+        }
+    }
     /// The held modifiers the receiver really has: a swallowed key never went out.
     fn live(&self) -> HashSet<u16> {
         self.held.difference(&self.swallow).copied().collect()
@@ -375,6 +382,10 @@ impl KeyMapper {
         }
         self.rewritten.remove(&usage);
         self.sent.insert(usage);
+        if !(LCTRL..=0xe7).contains(&usage) {
+            // A key went out between the modifier and its release, so no mask is needed.
+            self.restored.clear();
+        }
         if shared_target { vec![] } else { vec![key(cx.map_mod(usage), true)] }
     }
     /// A duration measured by capture for this release, including collapsed down/up pairs.
@@ -907,6 +918,25 @@ mod rules_tests {
         r.hangul_dst = HangulKey::RightAlt;
         let out = run_at(Os::Mac, Os::Windows, &r, vec![k(LCTRL, true), k(LGUI, true), k(LALT, true), k(LANG1, true)]);
         assert_eq!(&out[..7], &[k(LCTRL, true), k(LALT, true), k(LCTRL, false), k(LCTRL, true), k(LCTRL, false), k(LALT, false), k(RALT, true)]);
+    }
+
+    #[test]
+    fn modifier_held_at_capture_start_is_masked_and_a_later_key_cancels_the_mask() {
+        let rules = DirRules { mod_mode: ModMode::Function, ..DirRules::default_for(Os::Mac, Os::Windows) };
+        let now = Instant::now();
+        // Control carried over the edge: its lone release must not open the Start menu.
+        let mut m = KeyMapper::default();
+        m.map(k(LCTRL, true), Os::Mac, Os::Windows, &rules, now);
+        m.carry(LCTRL);
+        let out = m.map(k(LCTRL, false), Os::Mac, Os::Windows, &rules, now);
+        assert_eq!(out, vec![k(LCTRL, true), k(LCTRL, false), k(LGUI, false)]);
+        // A key typed in between makes the mask pointless.
+        let mut m = KeyMapper::default();
+        m.map(k(LCTRL, true), Os::Mac, Os::Windows, &rules, now);
+        m.carry(LCTRL);
+        m.map(k(4, true), Os::Mac, Os::Windows, &rules, now);
+        m.map(k(4, false), Os::Mac, Os::Windows, &rules, now);
+        assert_eq!(m.map(k(LCTRL, false), Os::Mac, Os::Windows, &rules, now), vec![k(LGUI, false)]);
     }
 
     #[test]

@@ -131,6 +131,26 @@ mod net {
         let restarted = Config::parse(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(restarted.network.keys, keys);
     }
+
+    #[test]
+    fn unpairing_from_the_other_side_forgets_the_peer_its_cell_and_pending_rules() {
+        use crate::shared::Wake;
+        let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let path = std::env::temp_dir().join(format!("flockswitch-unpair-{}-{stamp}.toml", std::process::id()));
+        let shared = Arc::new(Shared::new(Wake::Unchanged, path.clone()));
+        shared.update_config(|c| {
+            c.network.role = flock_net::Role::Sub;
+            c.network.peers.push(flock_net::PeerConfig { id: "master".into(), role: flock_net::Role::Master, ..Default::default() });
+            c.network.layout.push(flock_net::Cell { id: "master".into(), col: 0, row: 0 });
+            c.pending_key_rules = Some(c.network.all_rules());
+        }).unwrap();
+        let hooks = hooks(shared.clone());
+        (hooks.on_unpaired)("master".into());
+        let after = shared.config();
+        let _ = std::fs::remove_file(&path);
+        assert!(after.network.peers.is_empty() && after.network.layout.is_empty());
+        assert!(after.pending_key_rules.is_none());
+    }
 }
 
 mod edge {

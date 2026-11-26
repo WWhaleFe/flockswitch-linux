@@ -89,6 +89,7 @@ impl Service {
                 name,
                 port,
                 error: None,
+                can_send: true,
             },
             discovered: vec![],
             peers: vec![],
@@ -509,6 +510,7 @@ impl Control {
         if self.workers.len() >= 64 {
             return;
         }
+        let addr = canonical(addr);
         if !crate::is_local_network(addr.ip()) {
             log::warn!("refused {addr}: not on the local network");
             self.status.lock().unwrap().me.error =
@@ -711,6 +713,10 @@ impl Control {
             self.armed.clear();
             self.pairing = None;
         }
+        if config.on && config.share_clipboard && !config.receive_clipboard {
+            self.file_jobs.cancel_direction(1);
+            if let Some((_, incoming)) = self.incoming.take() { incoming.abandon(); }
+        }
         if !config.on || !config.share_clipboard {
             if self.file_jobs.busy() || self.outgoing.is_some() || self.incoming.is_some() {
                 self.fail_running_transfer();
@@ -787,6 +793,7 @@ impl Control {
             Request::Unpair { unpair } => {
                 let was_master = self.config.peers.iter().any(|p| p.id == unpair && p.role == Role::Master);
                 self.config.peers.retain(|p| p.id != unpair);
+                self.config.layout.retain(|c| c.id != unpair);
                 if was_master {
                     self.clear_group();
                 }
@@ -931,6 +938,12 @@ impl Control {
                 if let Some(old) = self.links.get(&id) {
                     let prefer_outgoing = self.identity.id < id;
                     if old.outgoing == prefer_outgoing || link.outgoing != prefer_outgoing {
+                        if pair {
+                            // The pairing was asked for on the link that lost the tie-break:
+                            // carry it out on the one that stays.
+                            old.send(Msg::PairRequest);
+                            self.begin_pair(&id);
+                        }
                         return;
                     }
                     self.disconnect(&id, "duplicate");
@@ -1087,8 +1100,10 @@ impl Control {
                         }
                     }
                     Msg::Clipboard { text } => {
-                        if self.config.share_clipboard {
+                        if self.config.receives_clipboard() {
                             if self.file_jobs.cancel_direction(1) { self.fail_running_transfer(); }
+                            self.drop_stale_sends();
+                            if let Some((_, old)) = self.incoming.take() { old.abandon(); }
                             let sig = clip_sig(b"text", &[text.as_bytes()]);
                             self.platform.set_clipboard_text(&text);
                             self.clip_received(&id, sig);
@@ -1117,7 +1132,25 @@ impl Control {
                             self.local(false);
                         }
                     }
-                    Msg::Bye { .. } => self.disconnect(&id, "bye"),
+                    Msg::Bye { reason } => {
+                        // The peer no longer knows this computer (it was unpaired while this
+                        // one was away): forget it here too, so it can be paired again.
+                        let forgotten = matches!(reason.as_str(), "unpaired" | "unpaired message")
+                            && self.config.peers.iter().any(|p| p.id == id && !p.via_master);
+                        if forgotten {
+                            let was_master = self.config.peers.iter().any(|p| p.id == id && p.role == Role::Master);
+                            self.config.peers.retain(|p| p.id != id);
+                            self.config.layout.retain(|c| c.id != id);
+                            if was_master {
+                                self.clear_group();
+                            }
+                            self.disconnect(&id, "bye");
+                            self.prune_peer_state();
+                            (self.hooks.on_unpaired)(id);
+                        } else {
+                            self.disconnect(&id, "bye");
+                        }
+                    }
                 }
             }
         }
@@ -1127,6 +1160,7 @@ impl Control {
         if self.state.peer() == Some(id) {
             self.local(false);
         }
+        self.told.remove(id);
         if let Some(l) = self.links.remove(id) {
             l.send(Msg::ReleaseAll);
             l.send(Msg::Bye {
@@ -1225,7 +1259,11 @@ impl Control {
         match &self.group {
             Some((cells, _)) if self.config.role == Role::Sub => cells.clone(),
             _ if self.config.role == Role::Master && !self.config.layout.is_empty() => {
-                layout::with_master(&self.config.layout, me)
+                // A cell whose computer is no longer paired is an orphan: never shown or handed on.
+                let live: Vec<Cell> = self.config.layout.iter()
+                    .filter(|c| c.id == *me || self.config.peers.iter().any(|p| p.id == c.id))
+                    .cloned().collect();
+                layout::with_master(&live, me)
             }
             _ => layout::cells_from_sides(me, &self.config.peers),
         }
@@ -1390,6 +1428,10 @@ impl Control {
                 self.local(true);
                 (self.hooks.on_key_rules)(keys);
             }
+        } else if self.master.is_none() {
+            // Nothing from the master yet: the rules here are factory defaults, and sending
+            // them would reset the master's. The app keeps the edit and sends it again.
+            log::debug!("key rules edit held back until the master's settings arrived");
         } else if let Some(l) = self
             .config
             .peers
@@ -1508,6 +1550,7 @@ impl Control {
             .filter(|d| d.id == peer.id && d.fingerprint == peer.fingerprint)
             .flat_map(|d| d.addresses.iter().copied())
             .chain(peer.last_addr.parse::<SocketAddr>().ok())
+            .map(canonical)
             .filter(|a| crate::is_local_network(a.ip()))
         {
             if !candidates.contains(&addr) {
@@ -1671,6 +1714,18 @@ impl Control {
         };
         self.captured_keys.clear();
         self.mapper = KeyMapper::default();
+        // Modifiers already held when the capture began were pressed before the crossing;
+        // releasing one alone must not open the target's Start menu or Activities view.
+        while let Ok(event) = self.captured.try_recv() {
+            let carried = match event {
+                InputEvent::Key { usage, down: true } if (0xe0..=0xe7).contains(&usage) => Some(usage),
+                _ => None,
+            };
+            self.capture_event(event);
+            if let Some(usage) = carried {
+                self.mapper.carry(usage);
+            }
+        }
         self.switch_channel(&peer);
     }
     fn cross_on_request(&mut self, side: Side, pos: f64) {
@@ -1820,6 +1875,8 @@ impl Control {
             let mut files = self.platform.clipboard_files();
             files.truncate(crate::transfer::MAX_FILES);
             files.shrink_to_fit();
+            // Android cannot use files: text and images still go.
+            if self.links[peer].os == Os::Android { files.clear(); }
             if !files.is_empty() {
                 let id = self.take_transfer_id();
                 self.file_jobs.submit(files::Job {
@@ -1974,9 +2031,20 @@ impl Control {
             self.outgoing = None;
         }
     }
+    /// The local clipboard is about to be replaced by what a peer sent: a send of the old
+    /// content, hashing or already streaming, would overwrite that peer's newer clipboard.
+    fn drop_stale_sends(&mut self) {
+        let hashing = self.file_jobs.cancel_direction(0);
+        if self.outgoing.take().is_some() || hashing {
+            self.fail_running_transfer();
+        }
+    }
     fn clip_start(&mut self, peer: &str, id: u32, kind: crate::transfer::ClipKind, files: Vec<crate::transfer::FileMeta>) {
         use crate::transfer::{ClipKind, Incoming};
         self.file_jobs.cancel_direction(1);
+        if self.config.share_clipboard {
+            self.drop_stale_sends();
+        }
         self.transfer_revision = self.transfer_revision.wrapping_add(1);
         if let Some((_, old)) = self.incoming.take() {
             old.abandon();
@@ -1986,7 +2054,11 @@ impl Control {
             ClipKind::Image => "image",
             ClipKind::Text => "text",
         };
-        if !self.config.share_clipboard {
+        if !self.config.receives_clipboard() {
+            return;
+        }
+        // Android has no place for files: refuse them without downloading.
+        if kind == ClipKind::Files && self.platform.os() == Os::Android {
             return;
         }
         let limit = u64::from(crate::transfer::LIMIT_MB) * 1024 * 1024;
@@ -2115,6 +2187,7 @@ impl Control {
             }
         }
         status.me.name = computer_name(&self.config);
+        status.me.can_send = self.me_can_send();
         status.state = match &self.state {
             State::Local => StateStatus {
                 mode: "local".into(),
@@ -2136,10 +2209,13 @@ impl Control {
             .chain(&self.trusted)
             .map(|p| PeerStatus {
                 id: p.id.clone(),
+                name: p.name.clone(),
+                os: Some(p.os),
                 connected: self.links.get(&p.id).is_some_and(|l| l.paired),
                 rtt_ms: self.links.get(&p.id).and_then(|l| l.rtt),
                 can_send: self.peer_can_send(&p.id),
                 via_master: p.via_master,
+                keyrules: self.links.get(&p.id).is_some_and(|l| l.paired && l.features.iter().any(|f| f == "keyrules")),
             })
             .collect();
         status.layout = self.my_cells();
@@ -2283,10 +2359,12 @@ impl Worker {
         let mut chunk = [0; 8192];
         loop {
             let cancelled = self.cancel.load(Ordering::Acquire);
-            write_link_batch(&mut conn, &mut socket, &rx, &mut queued, &bulk, &mut pending_clip)?;
             if cancelled {
-                conn.send_close_notify();
+                // The link is going away: still let ReleaseAll and Bye reach the peer,
+                // or its keys and buttons could stay held.
+                return flush_goodbye(&mut conn, &mut socket, &rx, &mut queued);
             }
+            write_link_batch(&mut conn, &mut socket, &rx, &mut queued, &bulk, &mut pending_clip)?;
             while conn.wants_write() {
                 match conn.write_tls(&mut socket) {
                     Ok(0) => anyhow::bail!("socket closed"),
@@ -2294,9 +2372,6 @@ impl Worker {
                     Err(e) if transient(&e) => break,
                     Err(e) => return Err(e.into()),
                 }
-            }
-            if cancelled {
-                return Ok(());
             }
             if !conn.wants_write() {
                 if let (Some(id), Some(peer)) = (pending_clip.take(), remote.as_ref()) {
@@ -2354,7 +2429,7 @@ impl Worker {
                     *remote = Some(id.clone());
                     let listen_port = listen_port.filter(|&port| port != 0);
                     // Keep the socket's real IP and the advertised listening port.
-                    let mut addr = self.addr;
+                    let mut addr = canonical(self.addr);
                     if !self.outgoing { addr.set_port(listen_port.unwrap_or(47160)); }
                     self.emit(Event::Connected(
                         id,
@@ -2396,6 +2471,38 @@ impl Worker {
         }
     }
 }
+/// How long a closing link may take to hand ReleaseAll and Bye to a slow socket.
+const GOODBYE: Duration = Duration::from_millis(250);
+/// Final flush of a cancelled link: only ReleaseAll and Bye are still sent, everything
+/// else queued is dropped, and a socket that stays full gives up after `GOODBYE`.
+fn flush_goodbye(
+    conn: &mut rustls::Connection,
+    socket: &mut impl std::io::Write,
+    rx: &queue::Receiver,
+    queued: &mut Option<Msg>,
+) -> Result<()> {
+    let deadline = Instant::now() + GOODBYE;
+    while let Some(msg) = queued.take().map(Ok).unwrap_or_else(|| rx.try_recv()).ok() {
+        if matches!(msg, Msg::ReleaseAll | Msg::Bye { .. }) {
+            proto::write_frame(conn.writer(), &msg)?;
+        }
+    }
+    conn.send_close_notify();
+    loop {
+        while conn.wants_write() {
+            match conn.write_tls(&mut *socket) {
+                Ok(0) => return Ok(()),
+                Ok(_) => {}
+                Err(e) if transient(&e) => break,
+                Err(_) => return Ok(()),
+            }
+        }
+        if !conn.wants_write() || Instant::now() >= deadline {
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(2));
+    }
+}
 /// Flush small frames in one wake, while bounding clipboard work and socket backlog.
 fn write_link_batch(
     conn: &mut rustls::Connection,
@@ -2434,6 +2541,11 @@ fn write_link_batch(
         }
     }
     Ok(())
+}
+/// A dual-stack listener reports an IPv4 peer as `::ffff:a.b.c.d`; keep the plain form,
+/// which every OS can dial.
+fn canonical(addr: SocketAddr) -> SocketAddr {
+    SocketAddr::new(addr.ip().to_canonical(), addr.port())
 }
 fn transient(e: &std::io::Error) -> bool {
     matches!(
@@ -2503,10 +2615,14 @@ mod tests {
         files: Mutex<Vec<std::path::PathBuf>>,
         stopped: AtomicUsize,
         mac: AtomicBool,
+        android: AtomicBool,
         on_files: Mutex<Option<Box<dyn Fn() + Send>>>,
     }
     impl Platform for TestPlatform {
-        fn os(&self) -> Os { if self.mac.load(Ordering::Relaxed) { Os::Mac } else { Os::Windows } }
+        fn os(&self) -> Os {
+            if self.android.load(Ordering::Relaxed) { Os::Android }
+            else if self.mac.load(Ordering::Relaxed) { Os::Mac } else { Os::Windows }
+        }
         fn displays(&self) -> Vec<Rect> { vec![Rect::new(0.0, 0.0, 100.0, 100.0)] }
         fn cursor(&self) -> Option<(f64, f64)> { Some((50.0, 50.0)) }
         fn warp(&self, _: f64, _: f64) {}
@@ -2552,6 +2668,7 @@ mod tests {
                 name,
                 port,
                 error: None,
+                can_send: true,
             },
             discovered: vec![],
             peers: vec![],
@@ -2872,6 +2989,61 @@ mod tests {
         release.send(()).unwrap();
         finish_file_jobs(&mut r.c);
         assert_eq!(r.c.outgoing.as_ref().map(|(peer, _)| peer.as_str()), Some(SUB));
+    }
+
+    #[test]
+    fn files_are_not_sent_to_android_but_text_is() {
+        let mut r = rig(Role::Master);
+        r.c.config.peers.push(peer(SUB, Role::Sub));
+        let rx = link(&mut r.c, SUB, Role::Sub);
+        r.c.links.get_mut(SUB).unwrap().os = Os::Android;
+        let path = r.dir.join("file");
+        std::fs::write(&path, b"clipboard").unwrap();
+        *r.p.files.lock().unwrap() = vec![path];
+        *r.p.text.lock().unwrap() = Some("hello".into());
+        rx.try_iter().for_each(drop);
+        r.c.send_clipboard(SUB);
+        finish_file_jobs(&mut r.c);
+        assert!(!r.c.file_jobs.busy() && r.c.outgoing.is_none());
+        let frames: Vec<_> = rx.try_iter().collect();
+        assert!(!frames.iter().any(|m| matches!(m, Msg::ClipStart { .. })));
+        assert!(frames.iter().any(|m| matches!(m, Msg::Clipboard { text } if text == "hello")));
+    }
+
+    #[test]
+    fn android_receiver_refuses_files_but_takes_text_and_images() {
+        use crate::transfer::{ClipKind, FileMeta};
+        let mut r = rig(Role::Master);
+        r.p.android.store(true, Ordering::Relaxed);
+        r.c.config.peers.push(peer(SUB, Role::Sub));
+        let _rx = link(&mut r.c, SUB, Role::Sub);
+        r.c.clip_start(SUB, 60, ClipKind::Files, vec![FileMeta { name: "a".into(), size: 3 }]);
+        assert!(r.c.incoming.is_none() && !r.c.file_jobs.busy());
+        r.c.clip_chunk(SUB, 60, 0, "AAAA");
+        r.c.clip_done(SUB, 60);
+        assert!(!r.c.file_jobs.busy() && r.p.files.lock().unwrap().is_empty());
+        r.c.clip_start(SUB, 61, ClipKind::Text, vec![FileMeta { name: "clipboard.txt".into(), size: 2 }]);
+        assert!(r.c.incoming.is_some());
+    }
+
+    #[test]
+    fn local_receive_switch_survives_master_settings() {
+        let mut r = rig(Role::Sub);
+        r.c.config.peers.push(peer(MASTER, Role::Master));
+        let _rx = link(&mut r.c, MASTER, Role::Master);
+        r.c.config.receive_clipboard = false;
+        let settings = MasterSettings::of(&NetConfig::default(), "master");
+        assert!(settings.share_clipboard);
+        message(&mut r.c, MASTER, Msg::MasterSettings(settings));
+        assert!(r.c.config.share_clipboard && !r.c.config.receives_clipboard());
+        message(&mut r.c, MASTER, Msg::Clipboard { text: "x".into() });
+        assert!(r.p.text.lock().unwrap().is_none());
+        r.c.update(r.c.config.clone());
+        assert!(!r.c.config.receives_clipboard());
+        let config = NetConfig { receive_clipboard: true, ..r.c.config.clone() };
+        r.c.update(config);
+        message(&mut r.c, MASTER, Msg::Clipboard { text: "y".into() });
+        assert_eq!(r.p.text.lock().unwrap().as_deref(), Some("y"));
     }
 
     fn queue_empty_receive(c: &mut Control) {
@@ -3410,4 +3582,121 @@ mod tests {
         assert_eq!(r.c.dial_address(&p), Some(a));
     }
 
+    #[test]
+    fn closing_link_flushes_release_all_and_bye_past_a_full_socket() {
+        struct Slow { writes: usize, out: Vec<u8> }
+        impl std::io::Write for Slow {
+            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                self.writes += 1;
+                if self.writes % 3 != 0 { return Err(std::io::ErrorKind::WouldBlock.into()); }
+                self.out.extend_from_slice(b);
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+        }
+        let identity = crate::identity::Identity::load_or_create(&std::env::temp_dir().join(format!("flock-goodbye-{}", std::process::id()))).unwrap();
+        let mut conn = rustls::Connection::Server(rustls::ServerConnection::new(crate::tls::server_config(&identity).unwrap()).unwrap());
+        let (tx, rx) = queue::channel();
+        tx.try_send(Msg::Input(InputEvent::Motion { dx: 1.0, dy: 1.0 })).unwrap();
+        tx.try_send(Msg::ReleaseAll).unwrap();
+        tx.try_send(Msg::Bye { reason: "test".into() }).unwrap();
+        let mut queued = None;
+        let mut socket = Slow { writes: 0, out: vec![] };
+        flush_goodbye(&mut conn, &mut socket, &rx, &mut queued).unwrap();
+        assert!(rx.try_recv().is_err() && queued.is_none());
+    }
+
+    #[test]
+    fn canonical_drops_the_ipv4_mapped_form() {
+        let mapped: SocketAddr = "[::ffff:192.168.1.7]:47160".parse().unwrap();
+        assert_eq!(canonical(mapped), "192.168.1.7:47160".parse().unwrap());
+        let v6: SocketAddr = "[fe80::1]:1".parse().unwrap();
+        assert_eq!(canonical(v6), v6);
+    }
+
+    #[test]
+    fn disconnect_forgets_what_the_sub_was_told() {
+        let mut r = rig(Role::Master);
+        r.c.config.peers.push(peer(SUB, Role::Sub));
+        let _rx = link(&mut r.c, SUB, Role::Sub);
+        r.c.told.insert(SUB.into(), (None, MasterSettings::of(&r.c.config, "m"), (vec![], vec![])));
+        r.c.disconnect(SUB, "test");
+        assert!(!r.c.told.contains_key(SUB));
+    }
+
+    #[test]
+    fn unpair_removes_the_orphan_layout_cell() {
+        let mut r = rig(Role::Master);
+        r.c.config.peers.push(peer(SUB, Role::Sub));
+        let me = r.c.identity.id.clone();
+        r.c.config.layout = vec![Cell { id: me.clone(), col: 2, row: 1 }, Cell { id: SUB.into(), col: 3, row: 1 }];
+        r.c.request(Request::Unpair { unpair: SUB.into() });
+        assert!(r.c.config.layout.iter().all(|c| c.id != SUB));
+        // Even if the app still hands over the old grid, the orphan is not shown.
+        r.c.config.layout.push(Cell { id: SUB.into(), col: 3, row: 1 });
+        assert!(r.c.my_cells().iter().all(|c| c.id != SUB));
+    }
+
+    #[test]
+    fn peer_that_forgot_us_makes_us_forget_it_too() {
+        let mut r = rig(Role::Sub);
+        r.c.config.peers.push(peer(MASTER, Role::Master));
+        let _rx = link(&mut r.c, MASTER, Role::Master);
+        assert!(r.c.links[MASTER].paired);
+        message(&mut r.c, MASTER, Msg::Bye { reason: "unpaired message".into() });
+        assert!(r.c.config.peers.is_empty());
+        assert!(!r.c.links.contains_key(MASTER));
+    }
+
+    #[test]
+    fn key_rules_wait_for_the_masters_settings() {
+        let mut r = rig(Role::Sub);
+        r.c.config.peers.push(peer(MASTER, Role::Master));
+        let rx = link(&mut r.c, MASTER, Role::Master);
+        let keys = r.c.config.all_rules();
+        r.c.key_rules_edited(keys.clone());
+        assert!(!rx.try_iter().any(|m| matches!(m, Msg::KeyRules(_))));
+        r.c.master = Some(MasterSettings::of(&r.c.config, "m"));
+        r.c.key_rules_edited(keys);
+        assert!(rx.try_iter().any(|m| matches!(m, Msg::KeyRules(_))));
+    }
+
+    #[test]
+    fn pair_request_on_a_losing_duplicate_link_still_reaches_the_kept_one() {
+        let mut r = rig(Role::Master);
+        // Our id is larger than SUB's, so the inbound link is the one kept.
+        r.c.identity.id = "ffffffffffffffff".into();
+        let rx = link_with(&mut r.c, SUB, Role::Sub, false);
+        let (tx, _rx2) = queue::channel();
+        r.c.event(Event::Connected(SUB.into(), Link {
+            token: 2, tx, cancel: Arc::new(AtomicBool::new(false)), name: SUB.into(), os: Os::Mac,
+            role: Role::Sub, features: proto::FEATURES.iter().map(|s| s.to_string()).collect(), fp: SUB.repeat(4),
+            addr: "127.0.0.1:47160".parse().unwrap(), listen_port: None, outgoing: true, paired: false,
+            last_rx: Instant::now(), last_ping: Instant::now(), ping: None, rtt: None,
+            bulk: Arc::new(AtomicUsize::new(0)),
+        }, true));
+        assert!(rx.try_iter().any(|m| matches!(m, Msg::PairRequest)));
+        assert!(r.c.pairing.is_some());
+    }
+    fn link_with(c: &mut Control, id: &str, role: Role, outgoing: bool) -> queue::Receiver {
+        let (tx, rx) = queue::channel();
+        c.event(Event::Connected(id.into(), Link {
+            token: 1, tx, cancel: Arc::new(AtomicBool::new(false)), name: id.into(), os: Os::Mac,
+            role, features: proto::FEATURES.iter().map(|s| s.to_string()).collect(), fp: id.repeat(4),
+            addr: "127.0.0.1:47160".parse().unwrap(), listen_port: None, outgoing, paired: false,
+            last_rx: Instant::now(), last_ping: Instant::now(), ping: None, rtt: None,
+            bulk: Arc::new(AtomicUsize::new(0)),
+        }, false));
+        rx
+    }
+
+    #[test]
+    fn incoming_clipboard_cancels_a_send_of_the_old_content() {
+        let mut r = rig(Role::Master);
+        r.c.config.peers.push(peer(SUB, Role::Sub));
+        let _rx = link(&mut r.c, SUB, Role::Sub);
+        r.c.outgoing = Some((SUB.into(), crate::transfer::Outgoing::bytes(8, crate::transfer::ClipKind::Text, "text", vec![1; 3])));
+        message(&mut r.c, SUB, Msg::Clipboard { text: "new".into() });
+        assert!(r.c.outgoing.is_none());
+    }
 }

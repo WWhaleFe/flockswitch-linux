@@ -337,8 +337,10 @@ impl SettingsApp {
             Some(cells) if !master => cells,
             _ => logic::effective_cells(&net, &me),
         };
-        let mouse_at = match self.mouse_at() {
-            MouseAt::There(name) => net.peers.iter().find(|p| p.name == name).map(|p| p.id.clone()),
+        // The dot follows the controlled computer by id, also when it is a sub reached
+        // through the master (the roster), not only a paired one.
+        let mouse_at = match (self.mouse_at(), running) {
+            (MouseAt::There(_), Some(s)) => s.state.peer.clone().or_else(|| Some(me.clone())),
             _ => Some(me.clone()),
         };
 
@@ -369,12 +371,15 @@ impl SettingsApp {
             let known = net.peers.iter().find(|x| x.id == cell.id);
             let found = discovered.iter().find(|d| d.id == cell.id);
             let connected = mine || running.is_some_and(|s| s.peers.iter().any(|x| x.id == cell.id && x.connected));
+            let live = running.and_then(|s| s.peers.iter().find(|x| x.id == cell.id));
             let name = if mine {
                 my_name.clone().unwrap_or_else(|| t.net_this_computer.to_string())
             } else {
-                known.map(|x| x.name.clone()).or_else(|| found.map(|d| d.name.clone())).unwrap_or_else(|| cell.id.chars().take(6).collect())
+                crate::net_logic::peer_name(&net, running, &cell.id)
+                    .or_else(|| found.map(|d| d.name.clone()))
+                    .unwrap_or_else(|| cell.id.chars().take(6).collect())
             };
-            let os = known.map(|x| x.os).or_else(|| found.map(|d| d.os));
+            let os = live.and_then(|x| x.os).or_else(|| known.map(|x| x.os)).or_else(|| found.map(|d| d.os));
             let os_text = os.map(os_label).unwrap_or_default();
             let detail = if mine {
                 t.net_this_computer.to_string()
@@ -403,7 +408,7 @@ impl SettingsApp {
             ui.horizontal_wrapped(|ui| {
                 ui.label(RichText::new(t.layout_unplaced).size(12.5).color(p.muted));
                 for id in &loose {
-                    let name = net.peers.iter().find(|x| x.id == *id).map_or(id.to_string(), |x| x.name.clone());
+                    let name = crate::net_logic::peer_name(&net, running, id).unwrap_or_else(|| id.to_string());
                     let kind = if picked.as_deref() == Some(*id) { ButtonKind::Primary } else { ButtonKind::Plain };
                     if button(ui, p, &name, kind).clicked() {
                         self.layout_pick = if picked.as_deref() == Some(*id) { None } else { Some(id.to_string()) };
@@ -427,7 +432,7 @@ impl SettingsApp {
 
         // What the map says, under it.
         let links = logic::direct_pairs(&cells, &me);
-        let name_of = |id: &str| net.peers.iter().find(|x| x.id == id).map_or_else(|| id.chars().take(6).collect::<String>(), |x| x.name.clone());
+        let name_of = |id: &str| crate::net_logic::peer_name(&net, running, id).unwrap_or_else(|| id.chars().take(6).collect::<String>());
         let help = if !master {
             t.layout_help_sub.to_string()
         } else if self.layout_pick.is_some() {
