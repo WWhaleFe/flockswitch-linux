@@ -40,6 +40,7 @@ jobs:
         run: bash .github/scripts/build-deps.sh
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo test --locked
+      - run: cargo test --locked --manifest-path netcore/Cargo.toml
       - run: cargo build --release --locked
       - name: Package
         # tar keeps the executable bits of the program and the scripts.
@@ -49,7 +50,7 @@ jobs:
           mkdir "$dir"
           cp target/release/flockswitch packaging/linux/install.sh packaging/linux/uninstall.sh \
              packaging/linux/70-flockswitch.rules packaging/linux/flockswitch.desktop \
-             packaging/icon/flockswitch.png README.md README.ko.md LICENSE "$dir/"
+             packaging/icon/flockswitch.png README.md README.ko.md PRIVACY.md LICENSE "$dir/"
           tar -czf "$dir.tar.gz" "$dir"
           readelf -d "$dir/flockswitch" | grep NEEDED
       - uses: actions/upload-artifact@v4
@@ -75,7 +76,7 @@ jobs:
       - name: Release notes from CHANGELOG.ko.md and CHANGELOG.md
         run: |
           version="${GITHUB_REF_NAME#v}"
-          # The lines under "## <version> — <date>", up to the next "## ".
+          # The lines under "## <version> - <date>", up to the next "## ".
           section() {
             awk -v v="$version" '
               /^## / { if (found) exit; if (index($0, "## " v " ") == 1) { found = 1; next } }

@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, v2]
   pull_request:
 
 permissions:
@@ -10,14 +10,24 @@ permissions:
 
 jobs:
   test:
-    # The oldest supported Ubuntu, so the binary runs on its glibc and newer.
-    runs-on: ubuntu-22.04
+    # The oldest supported Ubuntu, so the binary runs on its glibc and newer. Both
+    # architectures that are released: C types such as c_char differ between them.
+    strategy:
+      matrix:
+        runner: [ubuntu-22.04, ubuntu-22.04-arm]
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
       - name: Build dependencies
         run: bash .github/scripts/build-deps.sh
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo test --locked
+      - run: cargo test --locked --manifest-path netcore/Cargo.toml
+      - name: X11 smoke tests
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xvfb xauth libxtst6 libxi6 libxrandr2 libxcursor1 libxfixes3
+          xvfb-run -a cargo test --locked -- --ignored --test-threads=1
       - run: cargo build --release --locked
       - name: Shared libraries the binary links (the rest are loaded at run time)
         run: readelf -d target/release/flockswitch | grep NEEDED

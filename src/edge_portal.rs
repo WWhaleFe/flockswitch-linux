@@ -36,7 +36,7 @@ use futures_util::stream::{self, LocalBoxStream};
 use futures_util::StreamExt;
 use reis::ei;
 use reis::event::{DeviceCapability, EiEvent};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::os::unix::net::UnixStream;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -191,6 +191,7 @@ struct Live {
     zones: Vec<Zone>,
     /// The sides and margin the barriers were made for.
     made_for: ([bool; 4], i32),
+    network_owner: bool,
     /// XWayland coordinates = zone coordinates × this, when they line up.
     xwayland: Option<f64>,
     /// The libei devices that move the pointer and type.
@@ -201,6 +202,8 @@ struct Live {
 }
 
 struct Capture {
+    network: bool,
+    scroll: HashMap<reis::event::Device, flock_net::linux_input::ScrollFrame>,
     id: Option<u32>,
     cap: Captured,
     since: Instant,
@@ -213,6 +216,10 @@ struct Portal {
     reconfigure: bool,
     dwell: Dwell,
     ctrl: CtrlKeys,
+    held_keys: HashSet<u32>,
+    /// A Control held from before the capture (known only from libei's modifiers) was
+    /// sent to the other computer as a key press.
+    ctrl_sent: bool,
     capture: Option<Capture>,
     /// Motion that came over libei before the portal's "activated".
     early_motion: (f64, f64),
@@ -232,6 +239,8 @@ pub fn run(shared: Arc<Shared>, version: u32, gnome: Option<u32>) {
         reconfigure,
         dwell: Dwell::new(),
         ctrl: CtrlKeys::default(),
+        held_keys: HashSet::new(),
+        ctrl_sent: false,
         capture: None,
         early_motion: (0.0, 0.0),
         out: Vec::new(),
@@ -363,6 +372,11 @@ impl Portal {
             log::info!("input-capture: CreateSession (portal v1: the system asks every time a session is made)");
             ic.create_session(None, CreateSessionOptions::default().set_capabilities(wanted)).await?
         };
+        if self.watch.network_wanted() && (!caps.contains(Capabilities::Keyboard) || !caps.contains(Capabilities::Pointer)) {
+            let _ = session.close().await;
+            log::warn!("input-capture: network sending requires pointer and keyboard permission");
+            return Err(OpenError::Denied);
+        }
         let path = session_path(&session);
         log::info!("input-capture: session {path} allowed with {}", caps_text(caps));
         match self.connect(ic, session, path).await {
@@ -388,6 +402,7 @@ impl Portal {
                 barriers: HashMap::new(),
                 zones: Vec::new(),
                 made_for: ([false; 4], 0),
+                network_owner: self.watch.network_wanted(),
                 xwayland: None,
                 pointers: 0,
                 paused: false,
@@ -454,9 +469,11 @@ impl Portal {
             }
             live.enabled = false;
         }
+        live.network_owner = self.watch.network_wanted();
         let zones = live.ic.zones(&live.session, GetZonesOptions::default()).await.map_err(err)?.response().map_err(err)?;
         live.zones = zones.regions().iter().map(|r| Zone { x: r.x_offset(), y: r.y_offset(), w: r.width() as i32, h: r.height() as i32 }).collect();
         log::info!("input-capture: zones {:?} (zone set {})", live.zones, zones.zone_set());
+        *crate::net_wayland::zones().lock().unwrap() = live.zones.iter().map(|z| flock_net::Rect::new(z.x.into(), z.y.into(), z.w.into(), z.h.into())).collect();
         let sides = self.watch.sides();
         let margin = self.watch.margin();
         live.made_for = (sides, margin);
@@ -530,7 +547,7 @@ impl Portal {
                         if !self.watch.edges_wanted() {
                             return End::Inactive;
                         }
-                        let paused = !self.watch.cfg.enabled;
+                        let paused = !self.watch.cfg.enabled && !self.watch.network_wanted();
                         if paused != live.paused {
                             live.paused = paused;
                             self.end_capture(live, None, "paused").await;
@@ -550,7 +567,7 @@ impl Portal {
                                 log::info!("input-capture: resumed");
                             }
                         }
-                        if !live.paused && live.made_for != (self.watch.sides(), self.watch.margin()) {
+                        if !live.paused && (live.network_owner != self.watch.network_wanted() || live.made_for != (self.watch.sides(), self.watch.margin())) {
                             self.end_capture(live, None, "the edge settings changed").await;
                             if !self.reconfigure {
                                 return End::Changed("the edges with a channel changed".into());
@@ -560,6 +577,11 @@ impl Portal {
                             }
                         }
                     }
+                    if !live.paused && (live.network_owner != self.watch.network_wanted() || live.made_for != (self.watch.sides(), self.watch.margin())) {
+                        self.end_capture(live, None, "network edges changed").await;
+                        if !self.reconfigure { return End::Changed("network edges changed".into()); }
+                        if let Err(e) = self.arm(live).await { return End::Again(e); }
+                    }
                     self.follow(live).await;
                 }
                 Ev::Activated(a) => self.activated(live, a).await,
@@ -567,12 +589,18 @@ impl Portal {
                     if self.capture.as_ref().is_some_and(|c| id.is_none() || c.id == id) {
                         log::info!("input-capture: deactivated by the compositor (activation {id:?})");
                         self.capture = None;
+                        network_capture_ended();
+                        overlay::edge_end();
+                        self.forget_keys();
                         self.wait_step(live, None);
                     }
                 }
                 Ev::Disabled => {
                     log::info!("input-capture: disabled by the system");
                     self.capture = None;
+                    network_capture_ended();
+                    overlay::edge_end();
+                    self.forget_keys();
                     self.wait_step(live, None);
                     live.enabled = false;
                     if !self.reconfigure {
@@ -640,7 +668,7 @@ impl Portal {
         if early != (0.0, 0.0) {
             cap.motion(early.0, early.1);
         }
-        self.capture = Some(Capture { id, cap, since: Instant::now(), last_drawn: cap.edge_position() });
+        self.capture = Some(Capture { network: false, scroll: HashMap::new(), id, cap, since: Instant::now(), last_drawn: cap.edge_position() });
         let now = Instant::now();
         if live.pointers == 0 {
             self.end_capture(live, Some(cap.position()), "no pointer device over libei, so the pointer cannot be followed").await;
@@ -648,6 +676,58 @@ impl Portal {
         }
         if !cap.at_edge() {
             self.end_capture(live, Some(cap.position()), "in a corner").await;
+            return;
+        }
+        let net_side = crate::net::side(crate::edge_wayland::edge_of(seg.side));
+        let is_network = self.watch.network_wanted() && self.watch.network_sides().contains(&net_side);
+        if is_network && crate::net_wayland::remote_or_just_ended() {
+            // Another computer drives this pointer now: a barrier it touches is not a
+            // crossing from here, and holding the pointer would block its way back.
+            self.end_capture(live, Some(cap.position()), "controlled from another computer").await;
+            return;
+        }
+        if is_network && !crate::net_wayland::capture().lock().unwrap().sides.contains(&net_side) {
+            // Placed there but not connected (or the network service is not running):
+            // nothing to cross to, so the pointer is not held.
+            self.end_capture(live, Some(cap.position()), "no computer connected on that side").await;
+            return;
+        }
+        if is_network {
+            let control = self.ctrl.held() || self.held_keys.contains(&29) || self.held_keys.contains(&97);
+            let defer = self.watch.cfg.network.require_control && !control;
+            let dwell = Duration::from_millis(self.watch.cfg.network.cross_delay_ms);
+            // GNOME has no layer-shell. Draw through XWayland only when its screens
+            // line up with portal zones; otherwise retain the delay without a drawing.
+            if let Some(k) = live.xwayland.filter(|_| !dwell.is_zero() && !defer) {
+                let p = cap.edge_position();
+                overlay::edge_begin_at(&self.watch.cfg.edges, crate::edge_wayland::edge_of(seg.side), None,
+                    Some((p.0 * k, p.1 * k)), Duration::ZERO, dwell, false);
+            }
+            let (x, y) = cap.edge_position();
+            let displays = crate::net_wayland::zones().lock().unwrap().clone();
+            let pos = flock_net::geometry::edge_ratio(&displays, net_side, x, y);
+            if let Some(c) = self.capture.as_mut() { c.network = true; }
+            let mut bridge = crate::net_wayland::capture().lock().unwrap();
+            bridge.active = true;
+            bridge.control = control;
+            if defer {
+                bridge.deferred = Some((net_side, pos));
+                bridge.hit = None;
+            } else {
+                bridge.deferred = None;
+                bridge.hit = Some((net_side, pos));
+            }
+            bridge.release = None;
+            bridge.position = None;
+            bridge.pending.clear();
+            let mut held: Vec<u16> = self.held_keys.iter().filter_map(|code| flock_net::linux_input::evdev_to_hid(*code)).collect();
+            held.sort_by_key(|usage| (!matches!(usage, 0xe0..=0xe7), *usage));
+            for usage in held { bridge.pending.push(flock_net::InputEvent::Key {usage, down: true}); }
+            // libei may report a Control held from before only as modifiers, and before
+            // this activation: send it as a key too (ei_event keeps it in step after).
+            let key_ctrl = self.held_keys.contains(&29) || self.held_keys.contains(&97);
+            self.ctrl_sent = self.ctrl.held() && !key_ctrl;
+            if self.ctrl_sent { bridge.pending.push(flock_net::InputEvent::Key {usage: 0xE0, down: true}); }
             return;
         }
         if !self.dwell.would_switch(seg.side, &self.watch.dwell_config(), &self.watch.sit, now) {
@@ -698,6 +778,23 @@ impl Portal {
             self.wait_step(live, None);
             return;
         };
+        if c.network {
+            let release = {
+                let mut bridge = crate::net_wayland::capture().lock().unwrap();
+                let expired = bridge.sink.is_none() && c.since.elapsed() > Duration::from_millis(self.watch.cfg.network.cross_delay_ms.saturating_add(2000));
+                // "Hold Control to cross" without Control: libei reports a Control held
+                // beforehand within moments; after that the pointer is not kept here.
+                let no_control = bridge.deferred.is_some() && c.since.elapsed() > CONTROL_GRACE;
+                // Another computer took control while this one waited at the edge.
+                let taken = bridge.sink.is_none() && crate::net_wayland::remote_controlled();
+                if bridge.sink.is_some() { overlay::edge_end(); }
+                if bridge.release.is_some_and(|t| Instant::now() >= t) || !self.watch.network_wanted() || expired || no_control || taken {
+                    Some(bridge.position.take().or(Some(c.cap.position())))
+                } else { None }
+            };
+            if let Some(at) = release { self.end_capture(live, at, "network return").await; }
+            return;
+        }
         let cap = c.cap;
         let at = cap.at_edge().then_some(cap.seg.side);
         let switched = self.wait_step(live, at);
@@ -721,6 +818,7 @@ impl Portal {
     /// Gives the pointer back (at `at`, if given) and ends the wait.
     async fn end_capture(&mut self, live: &mut Live, at: Option<(f64, f64)>, why: &str) {
         let Some(c) = self.capture.take() else { return };
+        if c.network { overlay::edge_end(); network_capture_ended(); }
         self.release(live, c.id, c.since, at, why).await;
     }
 
@@ -734,11 +832,104 @@ impl Portal {
             Err(e) => log::info!("input-capture: release (activation {id:?}): {e}"),
         }
         self.wait_step(live, None);
-        self.ctrl.forget();
+        self.forget_keys();
         self.early_motion = (0.0, 0.0);
     }
 
+    /// The keys seen during a capture: their releases never come once it has ended,
+    /// however it ended (given back here, or by the compositor).
+    fn forget_keys(&mut self) {
+        self.ctrl.forget();
+        self.held_keys.clear();
+        self.ctrl_sent = false;
+        crate::net_wayland::capture().lock().unwrap().control = false;
+    }
+
     async fn ei_event(&mut self, live: &mut Live, event: EiEvent) -> Option<End> {
+        let keys_changed = match &event {
+            EiEvent::KeyboardKey(k) => {
+                let down = k.state == ei::keyboard::KeyState::Press;
+                if down { self.held_keys.insert(k.key); } else { self.held_keys.remove(&k.key); }
+                self.ctrl.key(k.key, down);
+                true
+            }
+            // A Control held before the capture began arrives only as modifiers.
+            EiEvent::KeyboardModifiers(m) => { self.ctrl.modifiers(m.depressed); true }
+            _ => false,
+        };
+        if keys_changed {
+            let control = self.ctrl.held() || self.held_keys.contains(&29) || self.held_keys.contains(&97);
+            let mut bridge = crate::net_wayland::capture().lock().unwrap();
+            bridge.control = control;
+            let promoted = control && bridge.deferred.take().map(|hit| bridge.hit = Some(hit)).is_some();
+            drop(bridge);
+            // A Control held since before the edge shows only in the modifiers; the other
+            // computer needs it as a key (shortcuts there, and "hold Control" on the way
+            // back). Its release follows the same way; netcore releases all on return.
+            let key_ctrl = self.held_keys.contains(&29) || self.held_keys.contains(&97);
+            if self.capture.as_ref().is_some_and(|c| c.network) && !key_ctrl && control != self.ctrl_sent {
+                self.ctrl_sent = control;
+                crate::net_wayland::captured_event(flock_net::InputEvent::Key { usage: 0xE0, down: control });
+            }
+            // Control came after the edge was reached: start the countdown drawing now.
+            let dwell = Duration::from_millis(self.watch.cfg.network.cross_delay_ms);
+            if let (true, Some(k), Some(c)) = (promoted && !dwell.is_zero(), live.xwayland, self.capture.as_ref()) {
+                let p = c.cap.edge_position();
+                overlay::edge_begin_at(&self.watch.cfg.edges, crate::edge_wayland::edge_of(c.cap.seg.side), None,
+                    Some((p.0 * k, p.1 * k)), Duration::ZERO, dwell, false);
+            }
+        }
+        if self.capture.as_ref().is_some_and(|c| c.network) {
+            // Before crossing, inward motion cancels the pending dwell. Once the
+            // network sink owns input, all relative motion goes to the peer instead.
+            let waiting = { let b = crate::net_wayland::capture().lock().unwrap(); b.sink.is_none() && b.release.is_none() };
+            if waiting {
+                if let EiEvent::PointerMotion(m) = &event {
+                    let c = self.capture.as_mut().unwrap();
+                    c.cap.motion(m.dx.into(), m.dy.into());
+                    if !c.cap.at_edge() {
+                        let at = c.cap.position();
+                        self.end_capture(live, Some(at), "network countdown cancelled").await;
+                        return None;
+                    }
+                    if let Some(k) = live.xwayland {
+                        let p = c.cap.edge_position();
+                        overlay::edge_cursor(p.0 * k, p.1 * k);
+                    }
+                    // Waiting at the edge: this motion stays here. Queued, it would
+                    // reach the other computer after crossing and could push the
+                    // cursor straight back, or fill the queue and drop a key release.
+                    return None;
+                }
+            }
+            use flock_net::{linux_input as input, InputEvent};
+            let captured = match &event {
+                EiEvent::PointerMotion(m) => Some(InputEvent::Motion { dx: m.dx.into(), dy: m.dy.into() }),
+                EiEvent::Button(b) => input::button(b.button).map(|button| InputEvent::Button {button, down: b.state == ei::button::ButtonState::Press}),
+                EiEvent::ScrollDiscrete(s) => {
+                    self.capture.as_mut().unwrap().scroll.entry(s.device.clone()).or_default().discrete(s.discrete_dx, s.discrete_dy);
+                    return None;
+                }
+                EiEvent::ScrollDelta(s) => {
+                    self.capture.as_mut().unwrap().scroll.entry(s.device.clone()).or_default().continuous(s.dx.into(), s.dy.into());
+                    return None;
+                }
+                EiEvent::Frame(f) => {
+                    if let Some(scroll) = self.capture.as_mut().unwrap().scroll.remove(&f.device) {
+                        crate::net_wayland::captured_event(scroll.event());
+                    }
+                    return None;
+                }
+                EiEvent::KeyboardKey(k) => input::evdev_to_hid(k.key).map(|usage| InputEvent::Key {usage, down: k.state == ei::keyboard::KeyState::Press}),
+                _ => None,
+            };
+            if let Some(event) = captured { crate::net_wayland::captured_event(event); return None; }
+            if matches!(event, EiEvent::KeyboardKey(_) | EiEvent::Button(_)) { return None; }
+            if matches!(event, EiEvent::DevicePaused(_) | EiEvent::DeviceStopEmulating(_)) {
+                self.end_capture(live, None, "captured device stopped").await;
+                return None;
+            }
+        }
         match event {
             EiEvent::SeatAdded(e) => {
                 e.seat.bind_capabilities(DeviceCapability::Pointer | DeviceCapability::Button | DeviceCapability::Scroll | DeviceCapability::Keyboard);
@@ -815,4 +1006,19 @@ fn distance(seg: &Segment, x: f64, y: f64) -> f64 {
     let (x1, y1, x2, y2) = seg.barrier();
     let (cx, cy) = (x.clamp(f64::from(x1.min(x2)), f64::from(x1.max(x2))), y.clamp(f64::from(y1.min(y2)), f64::from(y1.max(y2))));
     (x - cx).hypot(y - cy)
+}
+
+/// How long a network edge hit waits for libei to report a Control held beforehand.
+const CONTROL_GRACE: Duration = Duration::from_millis(250);
+
+fn network_capture_ended() {
+    let mut bridge=crate::net_wayland::capture().lock().unwrap();
+    bridge.active=false;
+    bridge.sink=None;
+    // netcore may already hold the hit and keep timing it; a non-finite position
+    // makes it drop that hit (and with no cursor here, stop) instead of crossing late.
+    bridge.hit=Some((flock_net::Side::Left, f64::NAN));
+    bridge.deferred=None;
+    bridge.release=None;
+    bridge.pending.clear();
 }

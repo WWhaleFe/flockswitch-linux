@@ -1,9 +1,14 @@
-//! flockswitch — use a spare Logitech mouse button as an Easy-Switch key that moves the
+//! flockswitch - use a spare Logitech mouse button as an Easy-Switch key that moves the
 //! mouse and its companion keyboard to another computer together.
 
 mod backup;
 mod config;
+mod clipboard;
 mod device;
+mod net;
+mod net_logic;
+mod net_x11;
+mod net_wayland;
 mod edge;
 mod edge_layer;
 mod edge_logic;
@@ -38,7 +43,7 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 const USAGE: &str = "\
-flockswitch — move your Logitech mouse and keyboard to another computer with one button
+flockswitch - move your Logitech mouse and keyboard to another computer with one button
 
 USAGE:
     flockswitch              start in the system tray (default)
@@ -111,6 +116,9 @@ Set RUST_LOG=debug for more detail.";
 const INSTANCE_PORT: u16 = 47_851;
 
 fn main() {
+    // Xlib serves both the edge watcher and the network adapter.
+    let _xlib_threads = x11_dl::xlib::Xlib::open().ok();
+    if let Some(x) = &_xlib_threads { unsafe { (x.XInitThreads)(); } }
     let args: Vec<String> = std::env::args().skip(1).collect();
     // The long-running modes take the single-instance lock before touching the log, so
     // a second copy does not wipe the running copy's log file.
@@ -291,7 +299,12 @@ fn run_headless() -> Result<()> {
     let s = shared.clone();
     ctrlc::set_handler(move || s.stop.store(true, Ordering::SeqCst))?;
     edge_wayland::spawn(shared.clone());
-    Engine::new(shared)?.run()
+    let mut engine = Engine::new(shared.clone())?;
+    let network = net::spawn(shared.clone());
+    let result = engine.run();
+    shared.stop.store(true, Ordering::SeqCst);
+    let _ = network.join();
+    result
 }
 
 fn list() -> Result<()> {

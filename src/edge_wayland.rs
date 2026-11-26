@@ -309,12 +309,27 @@ impl Watch {
     }
 
     pub fn active(&self) -> bool {
-        self.cfg.enabled && self.edges_wanted()
+        // Without a computer placed on a side there is nothing to arm: opening a
+        // capture session then would only report that no barrier could be made.
+        self.cfg.logitech_edges_allowed()
+            || (self.network_wanted() && !self.network_sides().is_empty())
+    }
+
+    /// The sides a paired computer is placed on, connected or not. Barriers follow the
+    /// placement, not the connection: a computer dropping and coming back must not
+    /// rebuild the capture session (GNOME before 49 would ask for permission again).
+    /// Pushing at a side whose computer is away is handed back by netcore at once.
+    pub fn network_sides(&self) -> Vec<flock_net::Side> {
+        self.cfg.network.peers.iter().filter_map(|p| p.side).collect()
+    }
+
+    pub fn network_wanted(&self) -> bool {
+        self.cfg.network_edges_allowed() && self.cfg.network.notice_accepted && std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_default().to_ascii_lowercase().contains("gnome")
     }
 
     /// Edge switching is set up, whether or not flockswitch is paused from the menu.
     pub fn edges_wanted(&self) -> bool {
-        self.cfg.edges.on && self.cfg.edges.any()
+        (self.cfg.edges.on && self.cfg.edges.any()) || self.network_wanted()
     }
 
     /// Which sides have a channel (and so a barrier or a strip), paused or not.
@@ -322,19 +337,23 @@ impl Watch {
         let on = self.edges_wanted();
         let mut sides = [false; 4];
         for edge in EDGES {
-            sides[side_of(edge).index()] = on && self.cfg.edges.channel(edge) != 0;
+            sides[side_of(edge).index()] = on && self.cfg.logitech_edges_allowed() && self.cfg.edges.channel(edge) != 0;
+            if self.network_wanted() && self.network_sides().contains(&crate::net::side(edge)) {
+                sides[side_of(edge).index()] = true;
+            }
         }
         sides
     }
 
     pub fn margin(&self) -> i32 {
-        i32::try_from(self.cfg.edges.corner_margin).unwrap_or(i32::MAX)
+        if self.network_wanted() { self.cfg.network.corner_margin.clamp(0.0, 1000.0) as i32 }
+        else { i32::try_from(self.cfg.edges.corner_margin).unwrap_or(i32::MAX) }
     }
 
     pub fn dwell_config(&self) -> DwellConfig {
         let mut channels = [0; 4];
         for edge in EDGES {
-            channels[side_of(edge).index()] = self.cfg.edges.channel(edge);
+            channels[side_of(edge).index()] = if !self.cfg.logitech_edges_allowed() {0} else {self.cfg.edges.channel(edge)};
         }
         DwellConfig {
             channels,
@@ -360,7 +379,6 @@ impl Watch {
             self.announced = false;
             changed = true;
         }
-        let active = self.active();
         if !std::mem::replace(&mut self.announced, true) {
             crate::edge::announce(&self.cfg);
         }
@@ -376,7 +394,7 @@ impl Watch {
                 self.last_switch_text = text;
             }
             let arrived = now_here && !self.sit.mouse_here && !first;
-            if arrived && active && self.cfg.edges.place_cursor {
+            if arrived && self.cfg.logitech_edges_allowed() && self.cfg.edges.place_cursor {
                 let edge = self.landing_channel.take().and_then(|c| self.cfg.edges.edge_for(c));
                 if let Some(edge) = edge.filter(|_| !std::mem::replace(&mut self.told_place, true)) {
                     log::info!("mouse is back: Wayland lets no app move the cursor, so it is not put at the {} edge", edge.name());

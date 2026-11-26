@@ -212,7 +212,7 @@ pub fn preview(edges: &Edges) {
 
 /// Logs which edges switch to which channel, when the edge settings are read.
 pub(crate) fn announce(cfg: &Config) {
-    let active = cfg.enabled && cfg.edges.on && cfg.edges.any();
+    let active = cfg.logitech_edges_allowed() || (cfg.network_edges_allowed() && cfg.network.notice_accepted);
     if active {
         let list: Vec<String> =
             EDGES.iter().filter(|&&e| cfg.edges.channel(e) != 0).map(|&e| format!("{} → {}", e.name(), cfg.edges.channel(e))).collect();
@@ -276,7 +276,7 @@ fn watch(shared: Arc<Shared>) {
             cfg = shared.config();
             announced = false;
         }
-        let active = cfg.enabled && cfg.edges.on && cfg.edges.any();
+        let active = cfg.logitech_edges_allowed() || (cfg.network_edges_allowed() && cfg.network.notice_accepted);
         if !std::mem::replace(&mut announced, true) {
             announce(&cfg);
         }
@@ -291,7 +291,7 @@ fn watch(shared: Arc<Shared>) {
                 last_switch_text = text;
             }
             let arrived = now_here && !mouse_here && !first;
-            if arrived && active && cfg.edges.place_cursor {
+            if arrived && cfg.logitech_edges_allowed() && cfg.edges.place_cursor {
                 // The mouse has come back from the channel it was sent to: put the
                 // cursor at that channel's edge, as if it had come in from there.
                 if let Some(edge) = landing_channel.take().and_then(|c| cfg.edges.edge_for(c)) {
@@ -333,7 +333,9 @@ fn watch(shared: Arc<Shared>) {
             displays = platform::displays();
         }
         let Some((x, y)) = platform::cursor() else { continue };
-        let Some(edge) = edge_at(&displays, x, y, f64::from(cfg.edges.corner_margin)) else {
+        let network = cfg.network_edges_allowed();
+        let margin = if network { cfg.network.corner_margin } else { f64::from(cfg.edges.corner_margin) };
+        let Some(edge) = edge_at(&displays, x, y, margin) else {
             resting = None;
             armed = true;
             last_tick = None;
@@ -342,7 +344,7 @@ fn watch(shared: Arc<Shared>) {
         };
         // With "hold Control" the wait starts only with the key down; letting go calls
         // it off, and pressing again at the same edge starts over.
-        if cfg.edges.require_control && !platform::control_down() {
+        if (if network { cfg.network.require_control } else { cfg.edges.require_control }) && !platform::control_down() {
             resting = None;
             last_tick = None;
             end_countdown(&mut counting_down);
@@ -357,6 +359,29 @@ fn watch(shared: Arc<Shared>) {
                 continue;
             }
         };
+        if network {
+            if armed && crate::net::network_side_ready(edge) {
+                let dwell = Duration::from_millis(cfg.network.cross_delay_ms);
+                if !counting_down && !dwell.is_zero() {
+                    if let Some(display) = displays.iter().find(|d| d.contains(x, y)) {
+                        overlay::edge_begin(&cfg.edges, edge, display, since.elapsed(), dwell, false);
+                        counting_down = true;
+                    }
+                }
+                if since.elapsed() >= dwell {
+                    armed = false;
+                    end_countdown(&mut counting_down);
+                    crate::net::cross(edge, x, y);
+                }
+            } else {
+                // Not ready (no computer connected there yet): the wait starts over once
+                // it is, as on the Mac, instead of crossing at once.
+                resting = None;
+                last_tick = None;
+                end_countdown(&mut counting_down);
+            }
+            continue;
+        }
         let channel = cfg.edges.channel(edge);
         let dwell = Duration::from_millis(cfg.edges.dwell_ms);
         let cooling = last_switch.is_some_and(|t| t.elapsed() < COOLDOWN);
@@ -417,7 +442,7 @@ fn watch(shared: Arc<Shared>) {
 /// The cursor and the displays, from the X server (root-window coordinates, y down),
 /// through Xlib and Xinerama loaded at run time. Wayland lets no app read the cursor
 /// position, so there this is not available (XWayland sees it only over X11 windows).
-mod platform {
+pub(crate) mod platform {
     use super::Rect;
     use crate::config::ShakeKey;
     use std::sync::OnceLock;
@@ -430,11 +455,11 @@ mod platform {
         display: *mut Display,
         root: u64,
     }
-    // Safety: only one thread per process makes X calls on this connection (the watcher
-    // in the background process, the window's thread for the preview in the settings one).
+    // ACCESS serializes this connection. XInitThreads runs before any worker starts.
     unsafe impl Send for X {}
     unsafe impl Sync for X {}
 
+    static ACCESS: std::sync::Mutex<()> = std::sync::Mutex::new(());
     static X11: OnceLock<Option<X>> = OnceLock::new();
 
     /// An X11 session: cursor and displays can be read.
@@ -461,6 +486,7 @@ mod platform {
 
     /// The cursor position and the modifier keys, as of now.
     pub fn pointer() -> Option<(f64, f64, u32)> {
+        let _access = ACCESS.lock().unwrap();
         let x = x()?;
         let (mut root, mut child) = (0u64, 0u64);
         let (mut rx, mut ry, mut wx, mut wy) = (0i32, 0i32, 0i32, 0i32);
@@ -493,6 +519,7 @@ mod platform {
     }
 
     pub fn displays() -> Vec<Rect> {
+        let _access = ACCESS.lock().unwrap();
         let Some(x) = x() else { return Vec::new() };
         if let Some(xin) = &x.xinerama {
             let mut count = 0i32;
@@ -517,6 +544,7 @@ mod platform {
 
     /// Moves the cursor there.
     pub fn place(px: f64, py: f64) {
+        let _access = ACCESS.lock().unwrap();
         let Some(x) = x() else { return };
         unsafe {
             (x.xlib.XWarpPointer)(x.display, 0, x.root, 0, 0, 0, 0, px as i32, py as i32);

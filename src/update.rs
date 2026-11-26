@@ -662,6 +662,7 @@ mod tests {
 
     #[test]
     fn versions() {
+        assert!(is_newer("2.0.0", "0.15.0"));
         assert!(is_newer("0.3.2", "0.3.1"));
         assert!(is_newer("0.10.0", "0.9.9"));
         assert!(is_newer("1.0", "0.99.99"));
@@ -673,12 +674,12 @@ mod tests {
     #[test]
     fn assets() {
         let names = [
-            "flockswitch-linux-aarch64-0.1.0.tar.gz",
-            "flockswitch-linux-x86_64-0.1.0.tar.gz",
+            "flockswitch-linux-aarch64-2.0.0.tar.gz",
+            "flockswitch-linux-x86_64-2.0.0.tar.gz",
             "SHA256SUMS.txt",
         ];
-        assert_eq!(pick_asset_for(&names, "x86_64"), Some("flockswitch-linux-x86_64-0.1.0.tar.gz"));
-        assert_eq!(pick_asset_for(&names, "aarch64"), Some("flockswitch-linux-aarch64-0.1.0.tar.gz"));
+        assert_eq!(pick_asset_for(&names, "x86_64"), Some("flockswitch-linux-x86_64-2.0.0.tar.gz"));
+        assert_eq!(pick_asset_for(&names, "aarch64"), Some("flockswitch-linux-aarch64-2.0.0.tar.gz"));
         assert_eq!(pick_asset_for(&names, "riscv64"), None);
     }
 
