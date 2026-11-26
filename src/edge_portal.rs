@@ -723,6 +723,11 @@ impl Portal {
             let mut held: Vec<u16> = self.held_keys.iter().filter_map(|code| flock_net::linux_input::evdev_to_hid(*code)).collect();
             held.sort_by_key(|usage| (!matches!(usage, 0xe0..=0xe7), *usage));
             for usage in held { bridge.pending.push(flock_net::InputEvent::Key {usage, down: true}); }
+            // libei may report a Control held from before only as modifiers, and before
+            // this activation: send it as a key too (ei_event keeps it in step after).
+            let key_ctrl = self.held_keys.contains(&29) || self.held_keys.contains(&97);
+            self.ctrl_sent = self.ctrl.held() && !key_ctrl;
+            if self.ctrl_sent { bridge.pending.push(flock_net::InputEvent::Key {usage: 0xE0, down: true}); }
             return;
         }
         if !self.dwell.would_switch(seg.side, &self.watch.dwell_config(), &self.watch.sit, now) {
