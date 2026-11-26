@@ -31,6 +31,10 @@ const MAX_ACCEPTS_PER_IP: usize = 8;
 const POLL: Duration = Duration::from_millis(8);
 const HEARTBEAT: Duration = Duration::from_millis(500);
 const DEAD: Duration = Duration::from_secs(2);
+/// How long a peer paired by the service is kept against an older config snapshot from the app.
+const RECENT_PAIRED: Duration = Duration::from_secs(15);
+/// "Unpaired message" goodbyes must be this far apart to make us forget a peer.
+const UNPAIRED_CONFIRM: Duration = Duration::from_secs(10);
 /// A wall-clock jump this big between two ticks means the computer slept or was locked.
 const WAKE_JUMP: Duration = Duration::from_secs(5);
 /// After a wake-up, links silent for this long are closed.
@@ -137,6 +141,8 @@ impl Service {
             clip_sigs: HashMap::new(),
             pending_clip: HashMap::new(),
             deferred_clipboard: HashSet::new(),
+            recent_paired: HashMap::new(),
+            unpaired_seen: HashMap::new(),
             clip_origin: None,
             trusted: vec![],
             group: None,
@@ -205,6 +211,9 @@ impl Service {
         self.tx.send(Command::Reconnect).context("service stopped")
     }
     /// Send edited key rules: a master saves and hands them on, a sub sends them to its master.
+    /// A sub's message is a partial update: the master merges only the pairs in it into its
+    /// own rules, so apps on a sub should send only the "src>dst" pairs the user changed,
+    /// never the whole map (a whole map would overwrite changes made elsewhere meanwhile).
     pub fn send_key_rules(&self, keys: std::collections::BTreeMap<String, DirRules>) -> Result<()> {
         self.tx.send(Command::KeyRules(keys)).context("service stopped")
     }
@@ -311,9 +320,21 @@ impl Acceptor {
         let addr = listener.local_addr()?;
         let handle = thread::Builder::new().name("flock-accept".into()).spawn(move || {
             let mut pace = AcceptPace::default();
+            let _ = listener.set_nonblocking(true);
             loop {
+                // Wait for a connection at most ACCEPT_WAIT so the stop flag is looked at
+                // even when the poke from Drop never arrived.
+                if !wait_readable(&listener, ACCEPT_WAIT) {
+                    if stopped.load(Ordering::Acquire) { break; }
+                    continue;
+                }
                 let accepted = listener.accept();
                 if stopped.load(Ordering::Acquire) { break; }
+                if let Err(e) = &accepted {
+                    if e.kind() == std::io::ErrorKind::WouldBlock || e.kind() == std::io::ErrorKind::Interrupted { continue; }
+                }
+                // Some systems hand on the listener's non-blocking mode to what it accepts.
+                if let Ok((socket, _)) = &accepted { let _ = socket.set_nonblocking(false); }
                 match accepted {
                     Ok((socket, addr)) => {
                         if pace.allow(addr.ip(), Instant::now())
@@ -334,18 +355,63 @@ impl Acceptor {
 impl Drop for Acceptor {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Release);
-        // A blocked accept only returns for a connection: make one to ourselves, retrying
-        // when a full backlog or a busy loopback refuses it.
+        // Fast path: a connection to ourselves wakes the accept loop at once. Without it
+        // the loop notices the flag within ACCEPT_WAIT.
         let port = self.addr.port();
         let targets = [SocketAddr::from(([127, 0, 0, 1], port)), SocketAddr::from(([0u16, 0, 0, 0, 0, 0, 0, 1], port))];
-        let poked = (0..5).any(|n| {
-            if n > 0 { thread::sleep(Duration::from_millis(50)); }
-            targets.iter().any(|a| TcpStream::connect_timeout(a, Duration::from_millis(200)).is_ok())
-        });
+        let poked = targets.iter().any(|a| TcpStream::connect_timeout(a, Duration::from_millis(50)).is_ok());
         if let Some(handle) = self.handle.take() {
-            if poked { let _ = handle.join(); }
+            if poked {
+                let _ = handle.join();
+            } else {
+                // Never hold the service loop for the timeout: let go of the thread in the background.
+                let _ = thread::Builder::new().name("flock-accept-join".into()).spawn(move || { let _ = handle.join(); });
+            }
         }
     }
+}
+/// How long the accept thread waits between looks at its stop flag.
+const ACCEPT_WAIT: Duration = Duration::from_secs(2);
+/// Waits until `listener` has a connection to accept (true) or `timeout` passed (false).
+#[cfg(unix)]
+fn wait_readable(listener: &TcpListener, timeout: Duration) -> bool {
+    use std::os::fd::AsRawFd;
+    #[repr(C)]
+    struct PollFd { fd: i32, events: i16, revents: i16 }
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    type NFds = std::os::raw::c_ulong;
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    type NFds = u32;
+    extern "C" {
+        fn poll(fds: *mut PollFd, n: NFds, timeout: i32) -> i32;
+    }
+    const POLLIN: i16 = 1;
+    let mut fd = PollFd { fd: listener.as_raw_fd(), events: POLLIN, revents: 0 };
+    // SAFETY: one valid pollfd that lives through the call.
+    let ready = unsafe { poll(&mut fd, 1, timeout.as_millis() as i32) };
+    // On an error (not a timeout) fall through to accept, which reports it.
+    ready != 0
+}
+#[cfg(windows)]
+fn wait_readable(listener: &TcpListener, timeout: Duration) -> bool {
+    use std::os::windows::io::AsRawSocket;
+    #[repr(C)]
+    struct WsaPollFd { socket: usize, events: i16, revents: i16 }
+    #[link(name = "ws2_32")]
+    extern "system" {
+        fn WSAPoll(fds: *mut WsaPollFd, n: u32, timeout: i32) -> i32;
+    }
+    const POLLRDNORM: i16 = 0x0100;
+    let mut fd = WsaPollFd { socket: listener.as_raw_socket() as usize, events: POLLRDNORM, revents: 0 };
+    // SAFETY: one valid WSAPOLLFD that lives through the call; the listener keeps Winsock started.
+    let ready = unsafe { WSAPoll(&mut fd, 1, timeout.as_millis() as i32) };
+    // On an error (not a timeout) fall through to accept, which reports it.
+    ready != 0
+}
+#[cfg(not(any(unix, windows)))]
+fn wait_readable(_: &TcpListener, timeout: Duration) -> bool {
+    thread::sleep(timeout.min(Duration::from_millis(50)));
+    true
 }
 
 struct Link {
@@ -448,6 +514,10 @@ struct Control {
     pending_clip: HashMap<String, (u32, Vec<u8>)>,
     /// Targets requested while a completed receive is still being finalized.
     deferred_clipboard: HashSet<String>,
+    /// Peers this service paired itself lately: an app config snapshot taken before that must not drop them.
+    recent_paired: HashMap<String, (PeerConfig, Instant)>,
+    /// When a peer first said "unpaired message" since a session last worked.
+    unpaired_seen: HashMap<String, Instant>,
     /// Fingerprint of the content that last arrived, and the peer it came from.
     clip_origin: Option<(Vec<u8>, String, bool)>,
     /// On a sub: computers its master's roster vouches for (runtime only, `via_master`).
@@ -683,6 +753,15 @@ impl Control {
         }
         config.config_dir = self.config.config_dir.clone();
         config.peers.retain(|p| !p.via_master);
+        // A peer paired here after the app took its snapshot is not in it yet: keep it.
+        self.recent_paired.retain(|_, (_, at)| at.elapsed() < RECENT_PAIRED);
+        // Once a snapshot lists the peer the app has seen it, and a later removal is its own.
+        self.recent_paired.retain(|id, _| !config.peers.iter().any(|p| p.id == *id));
+        for (id, (peer, _)) in &self.recent_paired {
+            if self.config.peers.iter().any(|p| p.id == *id && p.fingerprint == peer.fingerprint) {
+                config.peers.push(self.config.peers.iter().find(|p| p.id == *id).cloned().unwrap_or_else(|| peer.clone()));
+            }
+        }
         let master_id = |c: &NetConfig| c.peers.iter().find(|p| p.role == Role::Master).map(|p| p.id.clone());
         if config.role != Role::Sub || master_id(&config).is_none() || master_id(&config) != master_id(&self.config) {
             self.clear_group();
@@ -737,7 +816,7 @@ impl Control {
             if self.config.on {
                 // The old listener may need a moment to let go of the port.
                 let mut started = None;
-                for n in 0..10 {
+                for n in 0..60 {
                     if n > 0 { thread::sleep(Duration::from_millis(50)); }
                     started = Some(bind(self.config.port)
                         .and_then(|l| Acceptor::start(l, self.events.clone(), self.wake.clone())));
@@ -792,6 +871,7 @@ impl Control {
             }
             Request::Unpair { unpair } => {
                 let was_master = self.config.peers.iter().any(|p| p.id == unpair && p.role == Role::Master);
+                self.recent_paired.remove(&unpair);
                 self.config.peers.retain(|p| p.id != unpair);
                 self.config.layout.retain(|c| c.id != unpair);
                 if was_master {
@@ -883,6 +963,7 @@ impl Control {
             };
             self.config.peers.retain(|p| p.id != id);
             self.config.peers.push(peer.clone());
+            self.recent_paired.insert(id.clone(), (peer.clone(), Instant::now()));
             (self.hooks.on_paired)(peer);
             if let Some(s) = &mut self.pair_status {
                 s.stage = "done".into();
@@ -996,6 +1077,10 @@ impl Control {
                     self.disconnect(&id, "unpaired message");
                     return;
                 }
+                // Anything but a goodbye or hello on a paired link means the peer accepts us.
+                if !self.unpaired_seen.is_empty() && !matches!(msg, Msg::Bye { .. } | Msg::Hello { .. }) {
+                    self.unpaired_seen.remove(&id);
+                }
                 match msg {
                     Msg::Hello { .. } => self.disconnect(&id, "duplicate hello"),
                     Msg::PairRequest => self.begin_pair(&id),
@@ -1031,7 +1116,10 @@ impl Control {
                     }
                     Msg::KeyRules(keys) => {
                         if self.config.role == Role::Master && l.role == Role::Sub {
-                            self.key_rules_edited(keys);
+                            // Partial update: only the pairs in the message change.
+                            let mut merged = self.config.keys.clone();
+                            merged.extend(keys.into_iter().filter(|(k, _)| keymap::parse_pair(k).is_some()));
+                            self.key_rules_edited(merged);
                             // Echo even an unchanged edit, so a lost acknowledgement
                             // can be recovered by retransmitting the durable request.
                             self.told.remove(&id);
@@ -1135,9 +1223,17 @@ impl Control {
                     Msg::Bye { reason } => {
                         // The peer no longer knows this computer (it was unpaired while this
                         // one was away): forget it here too, so it can be paired again.
-                        let forgotten = matches!(reason.as_str(), "unpaired" | "unpaired message")
-                            && self.config.peers.iter().any(|p| p.id == id && !p.via_master);
+                        // "unpaired" is the user's explicit unpair and counts at once. "unpaired
+                        // message" only says the peer does not know us right now: it counts
+                        // when heard twice at least UNPAIRED_CONFIRM apart with no working
+                        // session in between.
+                        let explicit = reason == "unpaired";
+                        let known = self.config.peers.iter().any(|p| p.id == id && !p.via_master);
+                        let forgotten = known
+                            && (explicit || (reason == "unpaired message" && self.unpaired_confirmed(&id)));
                         if forgotten {
+                            self.recent_paired.remove(&id);
+                            self.unpaired_seen.remove(&id);
                             let was_master = self.config.peers.iter().any(|p| p.id == id && p.role == Role::Master);
                             self.config.peers.retain(|p| p.id != id);
                             self.config.layout.retain(|c| c.id != id);
@@ -1155,12 +1251,25 @@ impl Control {
             }
         }
     }
+    /// Records an "unpaired message" goodbye from `id`; true once an earlier one is old enough.
+    fn unpaired_confirmed(&mut self, id: &str) -> bool {
+        let now = Instant::now();
+        match self.unpaired_seen.get(id) {
+            Some(first) if now.duration_since(*first) >= UNPAIRED_CONFIRM => true,
+            Some(_) => false,
+            None => {
+                self.unpaired_seen.insert(id.into(), now);
+                false
+            }
+        }
+    }
     fn disconnect(&mut self, id: &str, reason: &str) {
         if self.file_jobs.cancel_peer(id) { self.fail_running_transfer(); }
         if self.state.peer() == Some(id) {
             self.local(false);
         }
         self.told.remove(id);
+        self.deferred_clipboard.remove(id);
         if let Some(l) = self.links.remove(id) {
             l.send(Msg::ReleaseAll);
             l.send(Msg::Bye {
@@ -1428,10 +1537,6 @@ impl Control {
                 self.local(true);
                 (self.hooks.on_key_rules)(keys);
             }
-        } else if self.master.is_none() {
-            // Nothing from the master yet: the rules here are factory defaults, and sending
-            // them would reset the master's. The app keeps the edit and sends it again.
-            log::debug!("key rules edit held back until the master's settings arrived");
         } else if let Some(l) = self
             .config
             .peers
@@ -1564,6 +1669,7 @@ impl Control {
         Some(candidates[attempt % candidates.len()])
     }
     fn local(&mut self, notify: bool) {
+        self.deferred_clipboard.clear();
         let old = std::mem::replace(&mut self.state, State::Local);
         if notify {
             if let Some(id) = old.peer() {
@@ -1876,7 +1982,9 @@ impl Control {
             files.truncate(crate::transfer::MAX_FILES);
             files.shrink_to_fit();
             // Android cannot use files: text and images still go.
-            if self.links[peer].os == Os::Android { files.clear(); }
+            let android = self.links[peer].os == Os::Android;
+            let had_files = !files.is_empty();
+            if android { files.clear(); }
             if !files.is_empty() {
                 let id = self.take_transfer_id();
                 self.file_jobs.submit(files::Job {
@@ -1885,7 +1993,9 @@ impl Control {
                 });
                 return;
             }
-            if let Some(png) = self.platform.clipboard_image_png() {
+            // Files on the clipboard bring an icon image along: for Android that is not content.
+            let png = if android && had_files { None } else { self.platform.clipboard_image_png() };
+            if let Some(png) = png {
                 let sig = clip_sig(b"image", &[&png]);
                 if !self.clip_wanted(peer, &sig) {
                     return;
@@ -2042,9 +2152,6 @@ impl Control {
     fn clip_start(&mut self, peer: &str, id: u32, kind: crate::transfer::ClipKind, files: Vec<crate::transfer::FileMeta>) {
         use crate::transfer::{ClipKind, Incoming};
         self.file_jobs.cancel_direction(1);
-        if self.config.share_clipboard {
-            self.drop_stale_sends();
-        }
         self.transfer_revision = self.transfer_revision.wrapping_add(1);
         if let Some((_, old)) = self.incoming.take() {
             old.abandon();
@@ -2060,6 +2167,9 @@ impl Control {
         // Android has no place for files: refuse them without downloading.
         if kind == ClipKind::Files && self.platform.os() == Os::Android {
             return;
+        }
+        if self.config.share_clipboard {
+            self.drop_stale_sends();
         }
         let limit = u64::from(crate::transfer::LIMIT_MB) * 1024 * 1024;
         let work = self.config.config_dir.join("flockswitch");
@@ -2120,7 +2230,10 @@ impl Control {
     fn poll_file_jobs(&mut self) {
         if let Some(done) = self.file_jobs.poll() { self.apply_file_job(done); }
         if !self.file_jobs.receiving() {
-            for peer in std::mem::take(&mut self.deferred_clipboard) { self.send_clipboard(&peer); }
+            for peer in std::mem::take(&mut self.deferred_clipboard) {
+                // Only while still in a session with that very peer.
+                if self.state.peer() == Some(peer.as_str()) { self.send_clipboard(&peer); }
+            }
         }
     }
     fn apply_file_job(&mut self, done: files::Completion) {
@@ -2613,6 +2726,7 @@ mod tests {
         injected: Mutex<Vec<InputEvent>>,
         text: Mutex<Option<String>>,
         files: Mutex<Vec<std::path::PathBuf>>,
+        image: Mutex<Option<Vec<u8>>>,
         stopped: AtomicUsize,
         mac: AtomicBool,
         android: AtomicBool,
@@ -2633,6 +2747,7 @@ mod tests {
         fn clipboard_text(&self) -> Option<String> { self.text.lock().unwrap().clone() }
         fn set_clipboard_text(&self, text: &str) { *self.text.lock().unwrap() = Some(text.into()); }
         fn clipboard_files(&self) -> Vec<std::path::PathBuf> { self.files.lock().unwrap().clone() }
+        fn clipboard_image_png(&self) -> Option<Vec<u8>> { self.image.lock().unwrap().clone() }
         fn set_clipboard_files(&self, paths: &[std::path::PathBuf]) {
             if let Some(check) = &*self.on_files.lock().unwrap() { check(); }
             *self.files.lock().unwrap() = paths.to_vec();
@@ -2715,6 +2830,8 @@ mod tests {
             clip_sigs: HashMap::new(),
             pending_clip: HashMap::new(),
             deferred_clipboard: HashSet::new(),
+            recent_paired: HashMap::new(),
+            unpaired_seen: HashMap::new(),
             clip_origin: None,
             trusted: vec![],
             group: None,
@@ -3060,6 +3177,7 @@ mod tests {
         let _c = link(&mut r.c, OTHER, Role::Sub);
         let release = r.c.file_jobs.hold_worker("disk");
         queue_empty_receive(&mut r.c);
+        controlling(&mut r.c, OTHER);
         r.c.send_clipboard(OTHER);
         release.send(()).unwrap();
         finish_file_jobs(&mut r.c);
@@ -3638,27 +3756,169 @@ mod tests {
     }
 
     #[test]
+    fn a_subs_key_rules_edit_merges_into_the_masters_rules() {
+        let mut r = rig(Role::Master);
+        r.c.config.peers.push(peer(SUB, Role::Sub));
+        let _rx = link(&mut r.c, SUB, Role::Sub);
+        let mut all = r.c.config.all_rules();
+        all.get_mut("linux>mac").unwrap().hanja = true;
+        r.c.key_rules_edited(all);
+        // The sub never heard of that change and edits another pair only.
+        let mut edit = std::collections::BTreeMap::new();
+        let mut rule = r.c.config.all_rules()["mac>windows"].clone();
+        rule.hanja = true;
+        edit.insert("mac>windows".to_string(), rule);
+        message(&mut r.c, SUB, Msg::KeyRules(edit));
+        let keys = r.c.config.all_rules();
+        assert!(keys["linux>mac"].hanja && keys["mac>windows"].hanja);
+    }
+
+    #[test]
+    fn a_new_sub_without_master_settings_sends_one_pair_and_resets_no_other() {
+        let mut r = rig(Role::Sub);
+        r.c.config.peers.push(peer(MASTER, Role::Master));
+        let rx = link(&mut r.c, MASTER, Role::Master);
+        assert!(r.c.master.is_none());
+        let mut edit = std::collections::BTreeMap::new();
+        edit.insert("mac>windows".to_string(), r.c.config.all_rules()["mac>windows"].clone());
+        r.c.key_rules_edited(edit.clone());
+        let sent: Vec<_> = rx.try_iter().filter_map(|m| if let Msg::KeyRules(k) = m { Some(k) } else { None }).collect();
+        assert_eq!(sent, vec![edit]);
+        // And the master keeps what it had for every other pair.
+        let mut m = rig(Role::Master);
+        m.c.config.peers.push(peer(SUB, Role::Sub));
+        let _l = link(&mut m.c, SUB, Role::Sub);
+        let mut all = m.c.config.all_rules();
+        all.get_mut("linux>mac").unwrap().hanja = true;
+        m.c.key_rules_edited(all);
+        message(&mut m.c, SUB, Msg::KeyRules(sent[0].clone()));
+        assert!(m.c.config.all_rules()["linux>mac"].hanja);
+    }
+
+    #[test]
+    fn stale_sends_survive_when_nothing_is_received() {
+        use crate::transfer::{ClipKind, FileMeta, Outgoing};
+        let mut r = rig(Role::Master);
+        r.c.config.peers.push(peer(SUB, Role::Sub));
+        let _rx = link(&mut r.c, SUB, Role::Sub);
+        r.c.begin_send(SUB, "image", Outgoing::bytes(7, ClipKind::Image, "image", vec![1; 20]), vec![1]);
+        r.c.config.receive_clipboard = false;
+        r.c.clip_start(SUB, 70, ClipKind::Text, vec![FileMeta { name: "clipboard.txt".into(), size: 2 }]);
+        assert!(r.c.outgoing.is_some());
+        r.c.config.receive_clipboard = true;
+        r.p.android.store(true, Ordering::Relaxed);
+        r.c.clip_start(SUB, 71, ClipKind::Files, vec![FileMeta { name: "a".into(), size: 3 }]);
+        assert!(r.c.outgoing.is_some());
+        r.p.android.store(false, Ordering::Relaxed);
+        r.c.clip_start(SUB, 72, ClipKind::Text, vec![FileMeta { name: "clipboard.txt".into(), size: 2 }]);
+        assert!(r.c.outgoing.is_none());
+    }
+
+    #[test]
+    fn unpaired_message_goodbye_needs_two_sightings_ten_seconds_apart() {
+        let mut r = rig(Role::Sub);
+        r.c.config.peers.push(peer(MASTER, Role::Master));
+        let _rx = link(&mut r.c, MASTER, Role::Master);
+        message(&mut r.c, MASTER, Msg::Bye { reason: "unpaired message".into() });
+        assert_eq!(r.c.config.peers.len(), 1);
+        // A working session in between resets the count.
+        let _rx = link(&mut r.c, MASTER, Role::Master);
+        message(&mut r.c, MASTER, Msg::Pong { t: 1 });
+        assert!(r.c.unpaired_seen.is_empty());
+        message(&mut r.c, MASTER, Msg::Bye { reason: "unpaired message".into() });
+        let _rx = link(&mut r.c, MASTER, Role::Master);
+        message(&mut r.c, MASTER, Msg::Bye { reason: "unpaired message".into() });
+        assert_eq!(r.c.config.peers.len(), 1);
+        *r.c.unpaired_seen.get_mut(MASTER).unwrap() -= Duration::from_secs(11);
+        let _rx = link(&mut r.c, MASTER, Role::Master);
+        message(&mut r.c, MASTER, Msg::Bye { reason: "unpaired message".into() });
+        assert!(r.c.config.peers.is_empty());
+    }
+
+    #[test]
+    fn config_snapshot_from_the_app_does_not_drop_a_freshly_paired_peer() {
+        let mut r = rig(Role::Master);
+        let stale = r.c.config.clone();
+        r.c.config.peers.push(peer(SUB, Role::Sub));
+        r.c.recent_paired.insert(SUB.into(), (peer(SUB, Role::Sub), Instant::now()));
+        let _rx = link(&mut r.c, SUB, Role::Sub);
+        r.c.links.get_mut(SUB).unwrap().paired = true;
+        r.c.update(stale);
+        assert!(r.c.config.peers.iter().any(|p| p.id == SUB));
+        assert!(r.c.links.contains_key(SUB));
+    }
+
+    #[test]
+    fn deferred_clipboard_goes_only_to_the_peer_still_in_control() {
+        let mut r = rig(Role::Master);
+        r.c.config.peers.extend([peer(SUB, Role::Sub), peer(OTHER, Role::Sub)]);
+        let rx = link(&mut r.c, SUB, Role::Sub);
+        let _o = link(&mut r.c, OTHER, Role::Sub);
+        *r.p.text.lock().unwrap() = Some("hi".into());
+        rx.try_iter().for_each(drop);
+        // Switched to another peer meanwhile: nothing goes to SUB.
+        controlling(&mut r.c, OTHER);
+        r.c.deferred_clipboard.insert(SUB.into());
+        r.c.poll_file_jobs();
+        assert!(!rx.try_iter().any(|m| matches!(m, Msg::Clipboard { .. })));
+        // Back to local or a lost link forgets what waited.
+        controlling(&mut r.c, SUB);
+        r.c.deferred_clipboard.insert(SUB.into());
+        r.c.local(false);
+        assert!(r.c.deferred_clipboard.is_empty());
+        controlling(&mut r.c, SUB);
+        r.c.deferred_clipboard.insert(SUB.into());
+        r.c.disconnect(SUB, "test");
+        assert!(r.c.deferred_clipboard.is_empty());
+        // Still controlling the same peer: it is sent.
+        let rx = link(&mut r.c, SUB, Role::Sub);
+        rx.try_iter().for_each(drop);
+        controlling(&mut r.c, SUB);
+        r.c.deferred_clipboard.insert(SUB.into());
+        r.c.poll_file_jobs();
+        assert!(rx.try_iter().any(|m| matches!(m, Msg::Clipboard { text } if text == "hi")));
+    }
+
+    #[test]
+    fn android_gets_text_not_the_icon_image_that_comes_with_files() {
+        let mut r = rig(Role::Master);
+        r.c.config.peers.push(peer(SUB, Role::Sub));
+        let rx = link(&mut r.c, SUB, Role::Sub);
+        r.c.links.get_mut(SUB).unwrap().os = Os::Android;
+        let path = r.dir.join("file");
+        std::fs::write(&path, b"x").unwrap();
+        *r.p.files.lock().unwrap() = vec![path];
+        *r.p.image.lock().unwrap() = Some(vec![1, 2, 3]);
+        rx.try_iter().for_each(drop);
+        r.c.send_clipboard(SUB);
+        assert!(r.c.outgoing.is_none());
+        assert!(rx.try_iter().next().is_none());
+        *r.p.text.lock().unwrap() = Some("t".into());
+        r.c.send_clipboard(SUB);
+        assert!(rx.try_iter().any(|m| matches!(m, Msg::Clipboard { text } if text == "t")));
+    }
+
+    #[test]
+    fn accept_thread_stops_by_itself_without_the_poke() {
+        let (events, _er) = mpsc::channel();
+        let (wake, _wr) = mpsc::channel();
+        let mut acceptor = Acceptor::start(bind(0).unwrap(), events, wake).unwrap();
+        acceptor.stop.store(true, Ordering::Release);
+        let handle = acceptor.handle.take().unwrap();
+        let begun = Instant::now();
+        handle.join().unwrap();
+        assert!(begun.elapsed() < Duration::from_millis(2600));
+    }
+
+    #[test]
     fn peer_that_forgot_us_makes_us_forget_it_too() {
         let mut r = rig(Role::Sub);
         r.c.config.peers.push(peer(MASTER, Role::Master));
         let _rx = link(&mut r.c, MASTER, Role::Master);
         assert!(r.c.links[MASTER].paired);
-        message(&mut r.c, MASTER, Msg::Bye { reason: "unpaired message".into() });
+        message(&mut r.c, MASTER, Msg::Bye { reason: "unpaired".into() });
         assert!(r.c.config.peers.is_empty());
         assert!(!r.c.links.contains_key(MASTER));
-    }
-
-    #[test]
-    fn key_rules_wait_for_the_masters_settings() {
-        let mut r = rig(Role::Sub);
-        r.c.config.peers.push(peer(MASTER, Role::Master));
-        let rx = link(&mut r.c, MASTER, Role::Master);
-        let keys = r.c.config.all_rules();
-        r.c.key_rules_edited(keys.clone());
-        assert!(!rx.try_iter().any(|m| matches!(m, Msg::KeyRules(_))));
-        r.c.master = Some(MasterSettings::of(&r.c.config, "m"));
-        r.c.key_rules_edited(keys);
-        assert!(rx.try_iter().any(|m| matches!(m, Msg::KeyRules(_))));
     }
 
     #[test]
