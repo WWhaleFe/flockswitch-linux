@@ -36,6 +36,7 @@ pub fn probe() -> Result<(), String> {
     }
 }
 pub struct X11 {
+    clipboard: crate::clipboard::Clipboard,
     commands: Sender<Command>,
     worker: Mutex<Option<JoinHandle<()>>>,
 }
@@ -317,6 +318,7 @@ impl X11 {
             })?;
         initialized.recv()?.map_err(anyhow::Error::msg)?;
         Ok(Self {
+            clipboard: crate::clipboard::Clipboard::default(),
             commands,
             worker: Mutex::new(Some(worker)),
         })
@@ -329,6 +331,13 @@ fn displays() -> Vec<Rect> {
         .collect()
 }
 impl Platform for X11 {
+    fn clipboard_text(&self) -> Option<String> { self.clipboard.text() }
+    fn set_clipboard_text(&self, text: &str) { self.clipboard.set_text(text); }
+    fn clipboard_files(&self) -> Vec<std::path::PathBuf> { self.clipboard.files() }
+    fn set_clipboard_files(&self, files: &[std::path::PathBuf]) { self.clipboard.set_files(files); }
+    fn clipboard_image_png(&self) -> Option<Vec<u8>> { self.clipboard.image() }
+    fn set_clipboard_image_png(&self, png: &[u8]) { self.clipboard.set_image(png); }
+    fn received_dir(&self) -> Option<std::path::PathBuf> { Some(dirs::download_dir()?.join("flockswitch")) }
     fn os(&self) -> Os {
         Os::Linux
     }
@@ -336,15 +345,18 @@ impl Platform for X11 {
         displays()
     }
     fn cursor(&self) -> Option<(f64, f64)> {
+        if !crate::net::network_edges_allowed() { return None; }
         crate::edge::platform::cursor()
     }
     fn warp(&self, x: f64, y: f64) {
         crate::edge::platform::place(x, y)
     }
+    fn control_down(&self) -> bool { crate::edge::platform::control_down() }
     fn ready(&self) -> Result<(), String> {
         Ok(())
     }
     fn start_capture(&self, sink: Sender<InputEvent>) -> anyhow::Result<()> {
+        anyhow::ensure!(crate::net::network_edges_allowed(), "Network edges are paused");
         let (ack, done) = mpsc::channel();
         self.commands.send(Command::Capture(sink, ack))?;
         done.recv_timeout(Duration::from_secs(2))?
@@ -366,5 +378,86 @@ impl Drop for X11 {
         if let Some(h) = self.worker.lock().unwrap().take() {
             let _ = h.join();
         }
+    }
+}
+
+/// Requires a disposable X11 server (CI: xvfb-run, one test at a time).
+#[cfg(test)]
+mod smoke_tests {
+    use super::*;
+    use std::{path::PathBuf, sync::Once, time::Instant};
+
+    fn platform() -> X11 {
+        static INIT: Once = Once::new();
+        INIT.call_once(|| unsafe {
+            let x = xlib::Xlib::open().unwrap();
+            assert_ne!((x.XInitThreads)(), 0);
+        });
+        crate::net::allow_test_edges();
+        X11::new().unwrap()
+    }
+    fn wait_cursor(p: &X11, at: (f64, f64)) {
+        let until = Instant::now() + Duration::from_secs(2);
+        while p.cursor() != Some(at) && Instant::now() < until {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(p.cursor(), Some(at));
+    }
+    #[test]
+    #[ignore = "requires X11/XTest, run under xvfb-run"]
+    fn x11_displays() {
+        let p = platform();
+        assert!(!p.displays().is_empty());
+        assert!(p.displays().iter().all(|d| d.width > 0.0 && d.height > 0.0));
+    }
+    #[test]
+    #[ignore = "requires X11/XTest, run under xvfb-run"]
+    fn x11_cursor_warp_round_trip() {
+        let p = platform();
+        p.warp(100.0, 120.0);
+        wait_cursor(&p, (100.0, 120.0));
+        p.warp(140.0, 150.0);
+        wait_cursor(&p, (140.0, 150.0));
+    }
+    #[test]
+    #[ignore = "requires X11/XTest, run under xvfb-run"]
+    fn x11_inject_pointer_motion() {
+        let p = platform();
+        p.warp(100.0, 100.0);
+        wait_cursor(&p, (100.0, 100.0));
+        p.inject(&InputEvent::Motion { dx: 13.0, dy: 17.0 });
+        wait_cursor(&p, (113.0, 117.0));
+    }
+    #[test]
+    #[ignore = "requires X11 selection, run under xvfb-run"]
+    fn x11_clipboard_text_round_trip() {
+        let p = platform();
+        p.set_clipboard_text("flockswitch 한글 clipboard");
+        // A second connection must read the selection after the setter returned.
+        let mut reader = arboard::Clipboard::new().unwrap();
+        assert_eq!(reader.get_text().unwrap(), "flockswitch 한글 clipboard");
+        assert_eq!(p.clipboard_text().as_deref(), Some("flockswitch 한글 clipboard"));
+    }
+    #[test]
+    #[ignore = "requires X11 selection, run under xvfb-run"]
+    fn x11_clipboard_png_round_trip() {
+        let p = platform();
+        let pixels: Vec<u8> = (0..24).collect();
+        let png = crate::clipboard::encode_png(2, 3, &pixels).unwrap();
+        p.set_clipboard_image_png(&png);
+        let mut reader = arboard::Clipboard::new().unwrap();
+        let image = reader.get_image().unwrap();
+        assert_eq!((image.width, image.height, image.bytes.as_ref()), (2, 3, pixels.as_slice()));
+        assert_eq!(crate::clipboard::decode_png(&p.clipboard_image_png().unwrap()), Some((2, 3, pixels)));
+    }
+    #[test]
+    #[ignore = "requires X11 text/uri-list, run under xvfb-run"]
+    fn x11_clipboard_files_round_trip() {
+        let p = platform();
+        let files = vec![PathBuf::from("/tmp/a b.txt"), PathBuf::from("/tmp/한글.png")];
+        p.set_clipboard_files(&files);
+        let mut reader = arboard::Clipboard::new().unwrap();
+        assert_eq!(reader.get().file_list().unwrap(), files);
+        assert_eq!(p.clipboard_files(), files);
     }
 }

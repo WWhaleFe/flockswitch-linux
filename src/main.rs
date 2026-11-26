@@ -1,10 +1,12 @@
-//! flockswitch — use a spare Logitech mouse button as an Easy-Switch key that moves the
+//! flockswitch - use a spare Logitech mouse button as an Easy-Switch key that moves the
 //! mouse and its companion keyboard to another computer together.
 
 mod backup;
 mod config;
+mod clipboard;
 mod device;
 mod net;
+mod net_logic;
 mod net_x11;
 mod net_wayland;
 mod edge;
@@ -41,7 +43,7 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 const USAGE: &str = "\
-flockswitch — move your Logitech mouse and keyboard to another computer with one button
+flockswitch - move your Logitech mouse and keyboard to another computer with one button
 
 USAGE:
     flockswitch              start in the system tray (default)

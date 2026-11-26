@@ -5,6 +5,7 @@
 use crate::engine::Engine;
 use crate::i18n::{texts, Texts};
 use crate::icon;
+use crate::net::NetState;
 use crate::shared::Shared;
 use anyhow::Result;
 use auto_launch::{AutoLaunch, AutoLaunchBuilder, LinuxLaunchMode};
@@ -20,6 +21,7 @@ use tray_icon::{Icon, TrayIcon, TrayIconBuilder, TrayIconEvent};
 #[derive(Clone)]
 enum Action {
     Enabled,
+    Channel(u8),
     Settings,
     CheckUpdate,
     InstallUpdate,
@@ -37,7 +39,7 @@ struct Ui {
     tray: Option<TrayIcon>,
     actions: HashMap<MenuId, Action>,
     /// The status generation and settings version the menu was built from.
-    shown: (u64, u64),
+    shown: (u64, u64, NetState),
     uninstall_requested: bool,
     shortcuts: Option<crate::hotkey::Shortcuts>,
 }
@@ -61,7 +63,7 @@ pub fn run(shared: Arc<Shared>, open_settings: bool) -> Result<()> {
         shared: shared.clone(),
         tray: None,
         actions: HashMap::new(),
-        shown: (u64::MAX, u64::MAX),
+        shown: (u64::MAX, u64::MAX, NetState::Off),
         uninstall_requested: false,
         shortcuts: None,
     };
@@ -144,7 +146,7 @@ pub fn run(shared: Arc<Shared>, open_settings: bool) -> Result<()> {
 
         reap_children();
         // Redraw when the engine found/lost devices or switched.
-        let now = (shared.status_generation(), shared.version());
+        let now = (shared.status_generation(), shared.version(), NetState::of(&shared.config(), crate::net::live_status().as_ref()));
         if ui.tray.is_some() && now != ui.shown {
             ui.refresh();
         }
@@ -230,7 +232,7 @@ impl Ui {
         // grows for as long as the app runs.
         TrayIconEvent::set_event_handler(Some(|_: TrayIconEvent| {}));
         // Read before the menu is built: a change while it is built is drawn next time.
-        let shown = (self.shared.status_generation(), self.shared.version());
+        let shown = (self.shared.status_generation(), self.shared.version(), NetState::of(&self.shared.config(), crate::net::live_status().as_ref()));
         let menu = self.build_menu();
         let cfg = self.shared.config();
         let builder = TrayIconBuilder::new().with_menu(Box::new(menu)).with_tooltip("flockswitch");
@@ -242,7 +244,7 @@ impl Ui {
     }
 
     fn refresh(&mut self) {
-        let shown = (self.shared.status_generation(), self.shared.version());
+        let shown = (self.shared.status_generation(), self.shared.version(), NetState::of(&self.shared.config(), crate::net::live_status().as_ref()));
         let menu = self.build_menu();
         let enabled = self.shared.config().enabled;
         if let Some(tray) = &self.tray {
@@ -272,11 +274,13 @@ impl Ui {
         let cfg = self.shared.config();
         let st = self.shared.status();
         let menu = Menu::new();
+        let state = NetState::of(&cfg, crate::net::live_status().as_ref());
+        let _ = menu.append(&MenuItem::new(state.text(t), false, None));
 
         let status = if !cfg.enabled {
             format!("○ {}", t.paused)
         } else if let Some(trigger) = &st.trigger {
-            format!("● {} — {trigger}", t.running)
+            format!("● {} - {trigger}", t.running)
         } else {
             format!("◌ {}", t.searching)
         };
@@ -295,6 +299,13 @@ impl Ui {
         let _ = menu.append(&enabled);
         // Everything else lives in the settings window, which stays open while you
         // change things (a native menu closes after every click).
+        for channel in 1..=3 {
+            let item = self.item(format!("{} {channel}", t.channel), Action::Channel(channel));
+            let _ = menu.append(&item);
+        }
+        for device in &st.devices {
+            let _ = menu.append(&MenuItem::new(format!("{}: {}", t.section_devices, device.name), false, None));
+        }
         let settings = self.item(t.settings, Action::Settings);
         let _ = menu.append(&settings);
         let report = self.item(t.menu_report, Action::Report);
@@ -311,7 +322,7 @@ impl Ui {
             U::Available(r) | U::Downloading(r) | U::DownloadFailed(r) | U::Installing(r) => {
                 Some((format!("● {} {}", t.update_available, r.version), false))
             }
-            U::InstallFailed(r) => Some((format!("● {} {} — {}", t.update_available, r.version, t.update_install_failed), false)),
+            U::InstallFailed(r) => Some((format!("● {} {} - {}", t.update_available, r.version, t.update_install_failed), false)),
             U::Downloaded(_) => Some((format!("✓ {}", t.update_downloaded), false)),
             U::Installed(_) => Some((format!("✓ {}", t.update_restarting), false)),
             U::Failed => Some((t.menu_check_failed.to_string(), true)),
@@ -360,6 +371,7 @@ impl Ui {
     fn handle(&mut self, action: Action) -> bool {
         match action {
             Action::Quit => return true,
+            Action::Channel(channel) => self.shared.request_switch(channel),
             Action::Enabled => {
                 if let Err(e) = self.shared.update_config(|c| c.enabled = !c.enabled) {
                     log::info!("setting not changed: {e:#}");

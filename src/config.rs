@@ -915,9 +915,56 @@ impl Config {
         }
     }
 
+    /// Import only test-build networking, preserving all existing 1.x settings.
+    /// Leave the source intact and mark completion only after every write succeeds.
+    fn migrate_test_network(base: &std::path::Path) -> Result<()> {
+        let dest = base.join("flockswitch");
+        let marker = dest.join("migrated-from-flockswitch2");
+        if marker.exists() { return Ok(()); }
+        let old = base.join("flockswitch2/flockswitch");
+        let path = dest.join("config.toml");
+        let mut table: toml::Table = if path.exists() {
+            std::fs::read_to_string(&path)?.parse()?
+        } else { toml::Table::new() };
+        std::fs::create_dir_all(&dest)?;
+        if old.is_dir() && !table.contains_key("network") {
+            let source = old.join("config.toml");
+            let source: toml::Table = if source.is_file() {
+                std::fs::read_to_string(source)?.parse()?
+            } else { toml::Table::new() };
+            // Copy before installing peers so a failed copy can be retried. Do not
+            // overwrite an existing, different identity even if config was removed.
+            fn copy_tree(from: &std::path::Path, to: &std::path::Path) -> Result<()> {
+                std::fs::create_dir_all(to)?;
+                for entry in std::fs::read_dir(from)? {
+                    let entry = entry?;
+                    let target = to.join(entry.file_name());
+                    if entry.file_type()?.is_dir() {
+                        copy_tree(&entry.path(), &target)?;
+                    } else if target.exists() {
+                        anyhow::ensure!(std::fs::read(&target)? == std::fs::read(entry.path())?,
+                            "refusing to replace existing network identity: {}", target.display());
+                    } else { std::fs::copy(entry.path(), target)?; }
+                }
+                Ok(())
+            }
+            if old.join("net").is_dir() { copy_tree(&old.join("net"), &dest.join("net"))?; }
+            if let Some(network) = source.get("network") {
+                table.insert("network".into(), network.clone());
+                let temporary = dest.join("config-migration.tmp");
+                std::fs::write(&temporary, toml::to_string_pretty(&table)?)?;
+                std::fs::rename(temporary, &path)?;
+            }
+        }
+        std::fs::write(marker, b"")?;
+        Ok(())
+    }
+
     /// Loads the config, writing the defaults on first run so users have a file to edit.
     pub fn load_or_create() -> Result<Config> {
         let path = Self::path();
+        Self::migrate_test_network(&dirs::config_dir().unwrap_or_else(|| PathBuf::from(".")))
+            .context("migrating test-build network settings")?;
         if !path.exists() {
             let cfg = Config::default();
             cfg.save()?;
@@ -1063,7 +1110,7 @@ impl Config {
 
     fn set_unchecked(&mut self, key: &str, value: &str) -> Result<()> {
         match key {
-            "network.on" => { self.network.on = value.parse().context("network.on must be true or false")?; return Ok(()); }
+            "network.on" => { let previous = self.clone(); self.network.on = value.parse().context("network.on must be true or false")?; self.resolve_edge_owner(&previous); return Ok(()); }
             "network.name" => { self.network.name = value.into(); return Ok(()); }
             "network.port" => { self.network.port = value.parse().context("network.port must be between 1 and 65535")?; return Ok(()); }
             _ => {}
@@ -1904,5 +1951,190 @@ mod network_tests {
         config.set("network.name", "My Linux").unwrap();
         assert!(config.network.on);
         assert_eq!(config.network.name, "My Linux");
+    }
+}
+
+#[cfg(test)]
+mod test_build_migration_tests {
+    use super::*;
+    use std::fs;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static SEQUENCE: AtomicUsize = AtomicUsize::new(0);
+    struct Fixture(PathBuf);
+    impl Fixture {
+        fn new() -> Self {
+            let root = std::env::temp_dir().join(format!("flock-migration-{}-{}", std::process::id(), SEQUENCE.fetch_add(1, Ordering::Relaxed)));
+            fs::create_dir_all(root.join("flockswitch2/flockswitch")).unwrap();
+            Self(root)
+        }
+        fn source(&self) -> PathBuf { self.0.join("flockswitch2/flockswitch") }
+        fn dest(&self) -> PathBuf { self.0.join("flockswitch") }
+    }
+    impl Drop for Fixture { fn drop(&mut self) { let _ = fs::remove_dir_all(&self.0); } }
+    #[test]
+    fn imports_network_and_identity_once_preserving_1x_files() {
+        let f = Fixture::new();
+        fs::create_dir_all(f.dest()).unwrap();
+        fs::write(f.dest().join("config.toml"), "enabled = false\nlanguage = 'ko'\n[edges]\nright = 2\n").unwrap();
+        for name in ["devices.toml", "button-state.toml", "wheel-mode.toml", "status.json"] {
+            fs::write(f.dest().join(name), name).unwrap();
+        }
+        fs::write(f.source().join("config.toml"), "enabled = true\n[network]\non = true\nname = 'Test Mac'\n[[network.peers]]\nid = 'paired'\nfingerprint = 'fingerprint'\n").unwrap();
+        let before = flock_net::identity::Identity::load_or_create(&f.0.join("flockswitch2")).unwrap();
+        Config::migrate_test_network(&f.0).unwrap();
+        let cfg = Config::parse(&fs::read_to_string(f.dest().join("config.toml")).unwrap()).unwrap();
+        assert!(!cfg.enabled);
+        assert_eq!(cfg.language, "ko");
+        assert_eq!(cfg.edges.right, 2);
+        assert_eq!(cfg.network.name, "Test Mac");
+        assert_eq!(cfg.network.peers[0].id, "paired");
+        let after = flock_net::identity::Identity::load_or_create(&f.0).unwrap();
+        assert_eq!(before.id, after.id);
+        assert_eq!(fs::read(f.source().join("net/identity.key")).unwrap(), fs::read(f.dest().join("net/identity.key")).unwrap());
+        for name in ["devices.toml", "button-state.toml", "wheel-mode.toml", "status.json"] {
+            assert_eq!(fs::read_to_string(f.dest().join(name)).unwrap(), name);
+        }
+        assert!(f.dest().join("migrated-from-flockswitch2").is_file());
+        let saved = fs::read(f.dest().join("config.toml")).unwrap();
+        fs::write(f.source().join("config.toml"), "broken = [").unwrap();
+        Config::migrate_test_network(&f.0).unwrap();
+        assert_eq!(fs::read(f.dest().join("config.toml")).unwrap(), saved);
+        assert!(f.source().join("net/identity.der").exists());
+    }
+    #[test]
+    fn existing_network_and_identity_are_never_replaced() {
+        let f = Fixture::new();
+        let original = flock_net::identity::Identity::load_or_create(&f.0).unwrap();
+        let text = "[network]\nname = 'Existing'\n";
+        fs::write(f.dest().join("config.toml"), text).unwrap();
+        fs::write(f.source().join("config.toml"), "[network]\nname = 'Test'\n").unwrap();
+        flock_net::identity::Identity::load_or_create(&f.0.join("flockswitch2")).unwrap();
+        Config::migrate_test_network(&f.0).unwrap();
+        assert_eq!(fs::read_to_string(f.dest().join("config.toml")).unwrap(), text);
+        assert_eq!(flock_net::identity::Identity::load_or_create(&f.0).unwrap().id, original.id);
+    }
+    #[test]
+    fn no_test_build_marks_done_without_changing_1x_config() {
+        let f = Fixture::new();
+        fs::remove_dir_all(f.source()).unwrap();
+        fs::create_dir_all(f.dest()).unwrap();
+        let text = "# preserve comments too\nenabled = false\n";
+        fs::write(f.dest().join("config.toml"), text).unwrap();
+        Config::migrate_test_network(&f.0).unwrap();
+        assert_eq!(fs::read_to_string(f.dest().join("config.toml")).unwrap(), text);
+        assert!(f.dest().join("migrated-from-flockswitch2").exists());
+    }
+    #[test]
+    fn conflicting_identity_is_preserved_and_migration_stays_retryable() {
+        let f = Fixture::new();
+        let existing = flock_net::identity::Identity::load_or_create(&f.0).unwrap();
+        flock_net::identity::Identity::load_or_create(&f.0.join("flockswitch2")).unwrap();
+        fs::write(f.source().join("config.toml"), "[network]\nname = 'Imported'\n").unwrap();
+        assert!(Config::migrate_test_network(&f.0).is_err());
+        assert_eq!(flock_net::identity::Identity::load_or_create(&f.0).unwrap().id, existing.id);
+        assert!(!f.dest().join("config.toml").exists());
+        assert!(!f.dest().join("migrated-from-flockswitch2").exists());
+    }
+    #[test]
+    fn first_install_and_failed_migration_retry() {
+        let f = Fixture::new();
+        fs::write(f.source().join("config.toml"), "invalid = [").unwrap();
+        assert!(Config::migrate_test_network(&f.0).is_err());
+        assert!(!f.dest().join("migrated-from-flockswitch2").exists());
+        fs::write(f.source().join("config.toml"), "[network]\nname = 'Imported'\n").unwrap();
+        Config::migrate_test_network(&f.0).unwrap();
+        assert_eq!(Config::parse(&fs::read_to_string(f.dest().join("config.toml")).unwrap()).unwrap().network.name, "Imported");
+    }
+}
+
+impl Config {
+    pub fn resolve_edge_owner(&mut self, previous: &Config) {
+        if self.network.on && !previous.network.on { self.edges.on = false; }
+    }
+    pub fn network_edges_allowed(&self) -> bool { self.network.on && !self.edges.on }
+    pub fn logitech_edges_allowed(&self) -> bool {
+        self.enabled && self.edges.on && self.edges.any()
+    }
+}
+#[cfg(test)]
+mod owner_tests {
+    use super::*;
+    #[test]
+    fn sharing_takes_edges_but_logitech_can_pause_crossing() {
+        let before = Config::default();
+        let mut c = before.clone(); c.edges.on = true; c.edges.right = 2;
+        assert!(c.logitech_edges_allowed());
+        let previous = c.clone(); c.network.on = true; c.resolve_edge_owner(&previous);
+        assert!(!c.edges.on && c.network_edges_allowed());
+        let previous = c.clone(); c.edges.on = true; c.resolve_edge_owner(&previous);
+        assert!(c.network.on && !c.network_edges_allowed() && c.logitech_edges_allowed());
+        c.edges.on = false; assert!(c.network_edges_allowed());
+    }
+    #[test]
+    fn test2_config_gets_logitech_defaults() {
+        let c = Config::parse(r#"language = "ko"
+[network]
+on = true
+[edges]
+anim_style = "bar"
+"#).unwrap();
+        assert_eq!(c.buttons, Config::default().buttons);
+        assert_eq!(c.edges.anim_style, EdgeAnimStyle::Bar);
+        c.validate().unwrap();
+    }
+}
+
+
+#[cfg(test)]
+mod v2_compatibility_tests {
+    use super::*;
+    #[test]
+    fn linux_015_without_network_preserves_settings() {
+        let text = r##"
+language = "en"
+enabled = false
+keep_wheel_mode = false
+follow = ["MX Keys"]
+[buttons.wheel_mode]
+on = true
+channels = [2]
+[edges]
+on = true
+left = 3
+anim_color = "#123456"
+[locate]
+on = true
+on_arrival = true
+"##;
+        let cfg = Config::parse(text).unwrap();
+        cfg.validate().unwrap();
+        assert!(!cfg.network.on && !cfg.network.notice_accepted);
+        assert!(!cfg.enabled && !cfg.keep_wheel_mode);
+        assert_eq!(cfg.buttons.wheel_mode.channels, [2]);
+        assert_eq!(cfg.edges.left, 3);
+        assert_eq!(cfg.follow, ["MX Keys"]);
+        assert!(cfg.locate.on && cfg.locate.on_arrival);
+    }
+    #[test]
+    fn test_build_linux_network_config_still_loads() {
+        let cfg = Config::parse(r#"
+language = "ko"
+[network]
+on = true
+name = "Linux test"
+clipboard_limit_mb = 25
+[[network.peers]]
+id = "peer"
+name = "Mac"
+fingerprint = "stored"
+side = "right"
+logitech_channel = 2
+"#).unwrap();
+        cfg.validate().unwrap();
+        assert!(cfg.network.on);
+        assert!(!cfg.network.notice_accepted);
+        assert_eq!(cfg.network.peers[0].side, Some(flock_net::Side::Right));
+        assert_eq!(cfg.network.peers[0].logitech_channel, 2);
+        assert_eq!(cfg.network.name, "Linux test");
     }
 }

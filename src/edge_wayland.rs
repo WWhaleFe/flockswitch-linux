@@ -309,11 +309,11 @@ impl Watch {
     }
 
     pub fn active(&self) -> bool {
-        (self.cfg.enabled && self.cfg.edges.on && self.cfg.edges.any()) || self.network_wanted()
+        self.cfg.logitech_edges_allowed() || self.network_wanted()
     }
 
     pub fn network_wanted(&self) -> bool {
-        self.cfg.network.on && std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_default().to_ascii_lowercase().contains("gnome")
+        self.cfg.network_edges_allowed() && self.cfg.network.notice_accepted && std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_default().to_ascii_lowercase().contains("gnome")
     }
 
     /// Edge switching is set up, whether or not flockswitch is paused from the menu.
@@ -326,7 +326,7 @@ impl Watch {
         let on = self.edges_wanted();
         let mut sides = [false; 4];
         for edge in EDGES {
-            sides[side_of(edge).index()] = on && self.cfg.enabled && self.cfg.edges.on && self.cfg.edges.channel(edge) != 0 && !crate::net::owns_edge(&self.cfg.network, edge);
+            sides[side_of(edge).index()] = on && self.cfg.logitech_edges_allowed() && self.cfg.edges.channel(edge) != 0;
             if self.network_wanted() && crate::net_wayland::capture().lock().unwrap().sides.contains(&crate::net::side(edge)) {
                 sides[side_of(edge).index()] = true;
             }
@@ -335,13 +335,14 @@ impl Watch {
     }
 
     pub fn margin(&self) -> i32 {
-        i32::try_from(self.cfg.edges.corner_margin).unwrap_or(i32::MAX)
+        if self.network_wanted() { self.cfg.network.corner_margin.clamp(0.0, 1000.0) as i32 }
+        else { i32::try_from(self.cfg.edges.corner_margin).unwrap_or(i32::MAX) }
     }
 
     pub fn dwell_config(&self) -> DwellConfig {
         let mut channels = [0; 4];
         for edge in EDGES {
-            channels[side_of(edge).index()] = if !self.cfg.enabled || !self.cfg.edges.on || crate::net::owns_edge(&self.cfg.network, edge) {0} else {self.cfg.edges.channel(edge)};
+            channels[side_of(edge).index()] = if !self.cfg.logitech_edges_allowed() {0} else {self.cfg.edges.channel(edge)};
         }
         DwellConfig {
             channels,

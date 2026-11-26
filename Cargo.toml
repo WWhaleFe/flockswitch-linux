@@ -3,7 +3,7 @@ name = "flockswitch"
 version = "2.0.0"
 edition = "2021"
 license = "MIT"
-description = "Turn a spare Logitech mouse button into an Easy-Switch key that moves your mouse and keyboard to another computer together"
+description = "Share your mouse, keyboard and clipboard across computers, with Logitech Easy-Switch support"
 repository = "https://github.com/WWhaleFe/flockswitch-linux"
 readme = "README.md"
 

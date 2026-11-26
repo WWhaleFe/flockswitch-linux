@@ -27,6 +27,7 @@ pub struct Capture {
     pub pending: Vec<InputEvent>,
     pub release: Option<Instant>,
     pub position: Option<(f64, f64)>,
+    pub control: bool,
 }
 pub fn capture() -> &'static Mutex<Capture> {
     static CAPTURE: OnceLock<Mutex<Capture>> = OnceLock::new();
@@ -64,6 +65,7 @@ enum Command {
     Quit,
 }
 pub struct Wayland {
+    clipboard: crate::clipboard::Clipboard,
     commands: Sender<Command>,
     model: Arc<Mutex<Model>>,
     worker: Mutex<Option<JoinHandle<()>>>,
@@ -94,6 +96,7 @@ impl Wayland {
                 });
             })?;
         Ok(Self {
+            clipboard: crate::clipboard::Clipboard::default(),
             commands,
             model,
             worker: Mutex::new(Some(worker)),
@@ -104,6 +107,13 @@ impl Wayland {
     }
 }
 impl Platform for Wayland {
+    fn clipboard_text(&self) -> Option<String> { self.clipboard.text() }
+    fn set_clipboard_text(&self, text: &str) { self.clipboard.set_text(text); }
+    fn clipboard_files(&self) -> Vec<std::path::PathBuf> { self.clipboard.files() }
+    fn set_clipboard_files(&self, files: &[std::path::PathBuf]) { self.clipboard.set_files(files); }
+    fn clipboard_image_png(&self) -> Option<Vec<u8>> { self.clipboard.image() }
+    fn set_clipboard_image_png(&self, png: &[u8]) { self.clipboard.set_image(png); }
+    fn received_dir(&self) -> Option<std::path::PathBuf> { Some(dirs::download_dir()?.join("flockswitch")) }
     fn os(&self) -> Os {
         Os::Linux
     }
@@ -111,6 +121,7 @@ impl Platform for Wayland {
         self.model.lock().unwrap().displays.clone()
     }
     fn cursor(&self) -> Option<(f64, f64)> {
+        if !crate::net::network_edges_allowed() { return None; }
         if capture().lock().unwrap().active {
             None
         } else {
@@ -124,8 +135,10 @@ impl Platform for Wayland {
     fn arm_edges(&self, sides: &[Side]) {
         capture().lock().unwrap().sides = if self.send { sides.to_vec() } else { vec![] };
     }
+    fn control_down(&self) -> bool { capture().lock().unwrap().control }
     fn take_edge_hit(&self) -> Option<(Side, f64)> {
-        capture().lock().unwrap().hit.take()
+        let mut c = capture().lock().unwrap();
+        if crate::net::network_edges_allowed() { c.hit.take() } else { c.hit = None; None }
     }
     fn place_on_return(&self, side: Side, pos: f64) {
         let mut c = capture().lock().unwrap();
@@ -134,6 +147,7 @@ impl Platform for Wayland {
     }
     fn start_capture(&self, sink: Sender<InputEvent>) -> anyhow::Result<()> {
         let mut c = capture().lock().unwrap();
+        anyhow::ensure!(crate::net::network_edges_allowed(), "Network edges are paused");
         anyhow::ensure!(self.send && c.active, "GNOME InputCapture is not active");
         for e in c.pending.drain(..) {
             let _ = sink.send(e);

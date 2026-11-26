@@ -212,7 +212,7 @@ pub fn preview(edges: &Edges) {
 
 /// Logs which edges switch to which channel, when the edge settings are read.
 pub(crate) fn announce(cfg: &Config) {
-    let active = cfg.enabled && cfg.edges.on && cfg.edges.any();
+    let active = cfg.logitech_edges_allowed() || (cfg.network_edges_allowed() && cfg.network.notice_accepted);
     if active {
         let list: Vec<String> =
             EDGES.iter().filter(|&&e| cfg.edges.channel(e) != 0).map(|&e| format!("{} → {}", e.name(), cfg.edges.channel(e))).collect();
@@ -276,7 +276,7 @@ fn watch(shared: Arc<Shared>) {
             cfg = shared.config();
             announced = false;
         }
-        let active = cfg.enabled && cfg.edges.on && cfg.edges.any();
+        let active = cfg.logitech_edges_allowed() || (cfg.network_edges_allowed() && cfg.network.notice_accepted);
         if !std::mem::replace(&mut announced, true) {
             announce(&cfg);
         }
@@ -333,7 +333,9 @@ fn watch(shared: Arc<Shared>) {
             displays = platform::displays();
         }
         let Some((x, y)) = platform::cursor() else { continue };
-        let Some(edge) = edge_at(&displays, x, y, f64::from(cfg.edges.corner_margin)) else {
+        let network = cfg.network_edges_allowed();
+        let margin = if network { cfg.network.corner_margin } else { f64::from(cfg.edges.corner_margin) };
+        let Some(edge) = edge_at(&displays, x, y, margin) else {
             resting = None;
             armed = true;
             last_tick = None;
@@ -342,7 +344,7 @@ fn watch(shared: Arc<Shared>) {
         };
         // With "hold Control" the wait starts only with the key down; letting go calls
         // it off, and pressing again at the same edge starts over.
-        if cfg.edges.require_control && !platform::control_down() {
+        if (if network { cfg.network.require_control } else { cfg.edges.require_control }) && !platform::control_down() {
             resting = None;
             last_tick = None;
             end_countdown(&mut counting_down);
@@ -357,8 +359,21 @@ fn watch(shared: Arc<Shared>) {
                 continue;
             }
         };
-        if crate::net::owns_edge(&cfg.network, edge) {
-            end_countdown(&mut counting_down);
+        if network {
+            if armed && crate::net::network_side_ready(edge) {
+                let dwell = Duration::from_millis(cfg.network.cross_delay_ms);
+                if !counting_down && !dwell.is_zero() {
+                    if let Some(display) = displays.iter().find(|d| d.contains(x, y)) {
+                        overlay::edge_begin(&cfg.edges, edge, display, since.elapsed(), dwell, false);
+                        counting_down = true;
+                    }
+                }
+                if since.elapsed() >= dwell {
+                    armed = false;
+                    end_countdown(&mut counting_down);
+                    crate::net::cross(edge, x, y);
+                }
+            } else { end_countdown(&mut counting_down); }
             continue;
         }
         let channel = cfg.edges.channel(edge);

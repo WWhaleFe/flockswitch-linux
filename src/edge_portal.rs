@@ -191,6 +191,7 @@ struct Live {
     zones: Vec<Zone>,
     /// The sides and margin the barriers were made for.
     made_for: ([bool; 4], i32),
+    network_owner: bool,
     /// XWayland coordinates = zone coordinates × this, when they line up.
     xwayland: Option<f64>,
     /// The libei devices that move the pointer and type.
@@ -397,6 +398,7 @@ impl Portal {
                 barriers: HashMap::new(),
                 zones: Vec::new(),
                 made_for: ([false; 4], 0),
+                network_owner: self.watch.network_wanted(),
                 xwayland: None,
                 pointers: 0,
                 paused: false,
@@ -463,6 +465,7 @@ impl Portal {
             }
             live.enabled = false;
         }
+        live.network_owner = self.watch.network_wanted();
         let zones = live.ic.zones(&live.session, GetZonesOptions::default()).await.map_err(err)?.response().map_err(err)?;
         live.zones = zones.regions().iter().map(|r| Zone { x: r.x_offset(), y: r.y_offset(), w: r.width() as i32, h: r.height() as i32 }).collect();
         log::info!("input-capture: zones {:?} (zone set {})", live.zones, zones.zone_set());
@@ -560,7 +563,7 @@ impl Portal {
                                 log::info!("input-capture: resumed");
                             }
                         }
-                        if !live.paused && live.made_for != (self.watch.sides(), self.watch.margin()) {
+                        if !live.paused && (live.network_owner != self.watch.network_wanted() || live.made_for != (self.watch.sides(), self.watch.margin())) {
                             self.end_capture(live, None, "the edge settings changed").await;
                             if !self.reconfigure {
                                 return End::Changed("the edges with a channel changed".into());
@@ -570,7 +573,7 @@ impl Portal {
                             }
                         }
                     }
-                    if !live.paused && live.made_for != (self.watch.sides(), self.watch.margin()) {
+                    if !live.paused && (live.network_owner != self.watch.network_wanted() || live.made_for != (self.watch.sides(), self.watch.margin())) {
                         self.end_capture(live, None, "network edges changed").await;
                         if !self.reconfigure { return End::Changed("network edges changed".into()); }
                         if let Err(e) = self.arm(live).await { return End::Again(e); }
@@ -668,14 +671,23 @@ impl Portal {
             return;
         }
         let net_side = crate::net::side(crate::edge_wayland::edge_of(seg.side));
-        let is_network = crate::net_wayland::capture().lock().unwrap().sides.contains(&net_side);
+        let is_network = self.watch.network_wanted() && crate::net_wayland::capture().lock().unwrap().sides.contains(&net_side);
         if is_network {
+            let dwell = Duration::from_millis(self.watch.cfg.network.cross_delay_ms);
+            // GNOME has no layer-shell. Draw through XWayland only when its screens
+            // line up with portal zones; otherwise retain the delay without a drawing.
+            if let Some(k) = live.xwayland.filter(|_| !dwell.is_zero()) {
+                let p = cap.edge_position();
+                overlay::edge_begin_at(&self.watch.cfg.edges, crate::edge_wayland::edge_of(seg.side), None,
+                    Some((p.0 * k, p.1 * k)), Duration::ZERO, dwell, false);
+            }
             let (x, y) = cap.edge_position();
             let displays = crate::net_wayland::zones().lock().unwrap().clone();
             let pos = flock_net::geometry::edge_ratio(&displays, net_side, x, y);
             if let Some(c) = self.capture.as_mut() { c.network = true; }
             let mut bridge = crate::net_wayland::capture().lock().unwrap();
             bridge.active = true;
+            bridge.control = self.held_keys.contains(&29) || self.held_keys.contains(&97);
             bridge.hit = Some((net_side, pos));
             bridge.release = None;
             bridge.position = None;
@@ -737,7 +749,8 @@ impl Portal {
             let release = {
                 let mut bridge = crate::net_wayland::capture().lock().unwrap();
                 let expired = bridge.sink.is_none() && c.since.elapsed() > Duration::from_millis(self.watch.cfg.network.cross_delay_ms.saturating_add(2000));
-                if bridge.release.is_some_and(|t| Instant::now() >= t) || !self.watch.cfg.network.on || expired {
+                if bridge.sink.is_some() { overlay::edge_end(); }
+                if bridge.release.is_some_and(|t| Instant::now() >= t) || !self.watch.network_wanted() || expired {
                     Some(bridge.position.take().or(Some(c.cap.position())))
                 } else { None }
             };
@@ -767,7 +780,7 @@ impl Portal {
     /// Gives the pointer back (at `at`, if given) and ends the wait.
     async fn end_capture(&mut self, live: &mut Live, at: Option<(f64, f64)>, why: &str) {
         let Some(c) = self.capture.take() else { return };
-        if c.network { network_capture_ended(); }
+        if c.network { overlay::edge_end(); network_capture_ended(); }
         self.release(live, c.id, c.since, at, why).await;
     }
 
@@ -783,6 +796,7 @@ impl Portal {
         self.wait_step(live, None);
         self.ctrl.forget();
         self.held_keys.clear();
+        crate::net_wayland::capture().lock().unwrap().control = false;
         self.early_motion = (0.0, 0.0);
     }
 
@@ -790,8 +804,26 @@ impl Portal {
         if let EiEvent::KeyboardKey(k) = &event {
             if k.state == ei::keyboard::KeyState::Press { self.held_keys.insert(k.key); }
             else { self.held_keys.remove(&k.key); }
+            crate::net_wayland::capture().lock().unwrap().control = self.held_keys.contains(&29) || self.held_keys.contains(&97);
         }
         if self.capture.as_ref().is_some_and(|c| c.network) {
+            // Before crossing, inward motion cancels the pending dwell. Once the
+            // network sink owns input, all relative motion goes to the peer instead.
+            if crate::net_wayland::capture().lock().unwrap().sink.is_none() {
+                if let EiEvent::PointerMotion(m) = &event {
+                    let c = self.capture.as_mut().unwrap();
+                    c.cap.motion(m.dx.into(), m.dy.into());
+                    if !c.cap.at_edge() {
+                        let at = c.cap.position();
+                        self.end_capture(live, Some(at), "network countdown cancelled").await;
+                        return None;
+                    }
+                    if let Some(k) = live.xwayland {
+                        let p = c.cap.edge_position();
+                        overlay::edge_cursor(p.0 * k, p.1 * k);
+                    }
+                }
+            }
             use flock_net::{linux_input as input, InputEvent};
             let captured = match &event {
                 EiEvent::PointerMotion(m) => Some(InputEvent::Motion { dx: m.dx.into(), dy: m.dy.into() }),

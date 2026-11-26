@@ -4,6 +4,7 @@
 //! stays open, unlike a native menu that closes after each click.
 
 use crate::backup;
+use crate::net::NetState;
 use crate::config::{
     format_color, parse_color, pick, Config, EFFECT_SIZES, Edge, EdgeAnimDirection, EdgeAnimStyle, EffectSettings, Gesture, Haptics, LocateStyle,
     ShakeKey, BUTTON_GESTURE, BUTTON_MIDDLE, BUTTON_WHEEL_MODE, EDGE_ANIM_STYLES, SHAKE_KEYS, SHAKE_TIMES,
@@ -21,7 +22,7 @@ use anyhow::{anyhow, Result};
 use auto_launch::AutoLaunch;
 use eframe::egui::{
     self, Align2, Color32, CornerRadius, FontFamily, FontId, Margin, Pos2, Rect, Response, RichText, Role,
-    Sense, Stroke, StrokeKind, Ui, UiBuilder, Vec2, WidgetInfo,
+    Sense, Shape, Shadow, Stroke, StrokeKind, Ui, UiBuilder, Vec2, WidgetInfo,
 };
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -230,55 +231,112 @@ fn install_style(ctx: &egui::Context) {
 #[derive(Clone, Copy)]
 struct Palette {
     bg: Color32,
+    /// The ground's gradient, top and bottom (the same as `bg` where it is flat).
+    bg_top: Color32,
+    bg_bottom: Color32,
     card: Color32,
     border: Color32,
     track: Color32,
     hover: Color32,
     text: Color32,
     muted: Color32,
+    /// Lime. Never used for text on the ground: see `accent_text`.
     accent: Color32,
-    /// A chosen "Off" segment: neutral gray (Apple's systemGray), so it reads as
-    /// switched off rather than as a choice made.
+    /// Text and marks on the lime (ink, never white).
+    ink: Color32,
+    /// Accent-coloured text on the ground: lime itself is too pale on the light ground.
+    accent_text: Color32,
+    /// A chosen "Off" segment and a switch that is off: neutral gray.
     off: Color32,
+    /// The dashed outline and the hatching of the "other computer" cards.
+    dash: Color32,
+    hatch: Color32,
+    /// The soft shadow under cards.
+    shadow: Color32,
     green: Color32,
     amber: Color32,
     red: Color32,
 }
 
+const INK: Color32 = Color32::from_rgb(0x1B, 0x1C, 0x1F);
+const LIME: Color32 = Color32::from_rgb(0xD4, 0xF5, 0x3C);
+
 impl Palette {
     fn new(dark: bool) -> Palette {
         if dark {
+            let bg = INK;
             Palette {
-                bg: Color32::from_rgb(0x1C, 0x1C, 0x1F),
-                card: Color32::from_rgb(0x2A, 0x2A, 0x2E),
-                border: Color32::from_rgb(0x3A, 0x3A, 0x40),
-                track: Color32::from_rgb(0x48, 0x48, 0x50),
-                hover: Color32::from_rgb(0x33, 0x33, 0x39),
-                text: Color32::from_rgb(0xF2, 0xF2, 0xF5),
-                muted: Color32::from_rgb(0xA8, 0xA8, 0xB0),
-                accent: Color32::from_rgb(0x6E, 0x7B, 0xFF),
-                off: Color32::from_rgb(0x8E, 0x8E, 0x93),
+                bg,
+                bg_top: bg,
+                bg_bottom: bg,
+                card: Color32::from_rgb(0x25, 0x26, 0x2A),
+                border: Color32::from_rgb(0x34, 0x36, 0x3C),
+                track: Color32::from_rgb(0x3A, 0x3C, 0x42),
+                hover: Color32::from_rgb(0x2E, 0x30, 0x35),
+                text: Color32::from_rgb(0xF2, 0xF3, 0xF5),
+                muted: Color32::from_rgb(0xA3, 0xA7, 0xB0),
+                accent: LIME,
+                ink: INK,
+                accent_text: LIME,
+                off: Color32::from_rgb(0x5A, 0x5D, 0x64),
+                dash: Color32::from_rgb(0x5A, 0x5D, 0x64),
+                hatch: Color32::from_rgba_unmultiplied(0x6B, 0x6F, 0x78, 60),
+                shadow: Color32::from_black_alpha(90),
                 green: Color32::from_rgb(0x30, 0xD1, 0x58),
                 amber: Color32::from_rgb(0xFF, 0xB3, 0x40),
                 red: Color32::from_rgb(0xFF, 0x5A, 0x50),
             }
         } else {
             Palette {
-                bg: Color32::from_rgb(0xF2, 0xF2, 0xF6),
-                card: Color32::WHITE,
-                border: Color32::from_rgb(0xE2, 0xE2, 0xE8),
-                track: Color32::from_rgb(0xD5, 0xD5, 0xDC),
-                hover: Color32::from_rgb(0xF4, 0xF4, 0xF8),
-                text: Color32::from_rgb(0x1C, 0x1C, 0x1E),
-                muted: Color32::from_rgb(0x60, 0x60, 0x68),
-                accent: Color32::from_rgb(0x46, 0x55, 0xE8),
-                off: Color32::from_rgb(0x8E, 0x8E, 0x93),
-                green: Color32::from_rgb(0x1F, 0xA8, 0x45),
-                amber: Color32::from_rgb(0xC2, 0x6A, 0x00),
-                red: Color32::from_rgb(0xD7, 0x2C, 0x24),
+                bg: Color32::from_rgb(0xEC, 0xEE, 0xF1),
+                bg_top: Color32::from_rgb(0xF0, 0xF1, 0xF3),
+                bg_bottom: Color32::from_rgb(0xE4, 0xE6, 0xEA),
+                card: Color32::from_rgb(0xFB, 0xFB, 0xFC),
+                border: Color32::from_rgb(0xE1, 0xE3, 0xE8),
+                track: Color32::from_rgb(0xE4, 0xE6, 0xEA),
+                hover: Color32::from_rgb(0xF3, 0xF4, 0xF6),
+                text: INK,
+                muted: Color32::from_rgb(0x6B, 0x6F, 0x78),
+                accent: LIME,
+                ink: INK,
+                accent_text: INK,
+                off: Color32::from_rgb(0xC9, 0xCC, 0xD2),
+                dash: Color32::from_rgb(0xA4, 0xA9, 0xB1),
+                hatch: Color32::from_rgba_unmultiplied(0xCD, 0xD0, 0xD6, 110),
+                // Ink at about 8%.
+                shadow: Color32::from_rgba_unmultiplied(0x1B, 0x1C, 0x1F, 20),
+                green: Color32::from_rgb(0x2D, 0xA4, 0x4E),
+                amber: Color32::from_rgb(0xC9, 0x8A, 0x00),
+                red: Color32::from_rgb(0xD9, 0x3B, 0x3B),
             }
         }
     }
+
+    /// The soft wide shadow of cards: offset (0, 6), blur 24.
+    fn card_shadow(&self) -> Shadow {
+        Shadow { offset: [0, 6], blur: 24, spread: 0, color: self.shadow }
+    }
+}
+
+/// Paints the ground: a very subtle vertical gradient where the palette has one.
+fn paint_ground(ui: &Ui, p: Palette) {
+    let rect = ui.max_rect();
+    if p.bg_top == p.bg_bottom {
+        ui.painter().rect_filled(rect, 0, p.bg);
+        return;
+    }
+    let mut mesh = egui::Mesh::default();
+    let uv = Pos2::ZERO;
+    for (pos, color) in [
+        (rect.left_top(), p.bg_top),
+        (rect.right_top(), p.bg_top),
+        (rect.right_bottom(), p.bg_bottom),
+        (rect.left_bottom(), p.bg_bottom),
+    ] {
+        mesh.vertices.push(egui::epaint::Vertex { pos, uv, color });
+    }
+    mesh.indices.extend([0, 1, 2, 0, 2, 3]);
+    ui.painter().add(Shape::mesh(mesh));
 }
 
 fn bold(size: f32) -> FontId {
@@ -291,6 +349,7 @@ enum Tab {
     Network,
     Switching,
     Devices,
+    Effects,
     General,
 }
 
@@ -328,6 +387,16 @@ struct SettingsApp {
     net_status: Option<flock_net::Status>,
     net_read: Instant,
     net_address: String,
+    header_status: Option<flock_net::Status>,
+    net_port_edit: Option<String>,
+    net_port_error: Option<&'static str>,
+    net_port_confirm: Option<u16>,
+    net_notice_open: bool,
+    net_ips: (Instant, Vec<String>),
+    net_how: bool,
+    net_tab: usize,
+    edge_confirm: bool,
+
     tab: Tab,
     /// The button whose settings are shown, and for the gesture button which gesture.
     button_tab: u16,
@@ -533,6 +602,15 @@ impl SettingsApp {
             net_status: None,
             net_read: Instant::now() - Duration::from_secs(1),
             net_address: String::new(),
+            header_status: None,
+            net_port_edit: None,
+            net_port_error: None,
+            net_port_confirm: None,
+            net_notice_open: false,
+            net_ips: (Instant::now() - Duration::from_secs(10), Vec::new()),
+            net_how: false,
+            net_tab: 0,
+            edge_confirm: false,
             last_refresh: Instant::now() - REFRESH,
             // Started from the tray app: come to the front once at start.
             raise_frames: 2,
@@ -650,6 +728,7 @@ impl SettingsApp {
     /// Re-reads settings, the remembered devices and what the engine sees, so the window
     /// also reflects changes made from the tray menu or by switching computers.
     fn refresh(&mut self) {
+        self.header_status = flock_net::read_status(crate::net::config_dir()).ok();
         self.last_refresh = Instant::now();
         if let Ok(cfg) = Config::load_or_create() {
             crate::i18n::set_language(&cfg.language);
@@ -669,7 +748,9 @@ impl SettingsApp {
     /// Applies one change on top of the file's current content, validates, saves.
     fn apply(&mut self, change: impl FnOnce(&mut Config)) {
         let mut next = Config::load_or_create().unwrap_or_else(|_| self.cfg.clone());
+        let previous = next.clone();
         change(&mut next);
+        next.resolve_edge_owner(&previous);
         match next.validate().and_then(|_| next.save()) {
             Ok(()) => {
                 crate::i18n::set_language(&next.language);
@@ -744,7 +825,7 @@ impl eframe::App for SettingsApp {
 
         // While the haptics window is open this one cannot be closed or used, and
         // coming back to it hands the focus straight on.
-        let modal = self.haptics_dialog.is_some();
+        let modal = self.edge_confirm || self.net_port_confirm.is_some() || self.haptics_dialog.is_some();
         if modal {
             self.backup_picker = None;
             self.backup_manager = None;
@@ -763,6 +844,7 @@ impl eframe::App for SettingsApp {
             if modal {
                 ui.disable();
             }
+            paint_ground(ui, p);
             self.header(ui, t, p);
             if self.status.hid_denied {
                 // The setup check on the General tab installs the rule.
@@ -777,10 +859,11 @@ impl eframe::App for SettingsApp {
                 (Tab::Switching, t.section_switching),
                 (Tab::Network, t.section_network),
                 (Tab::Devices, t.section_devices),
+                (Tab::Effects, t.section_effects),
                 (Tab::General, t.section_general),
             ];
             let labels: Vec<String> = tabs.iter().map(|(_, l)| l.to_string()).collect();
-            if let Some(i) = segments(ui, p, "tabs", &labels, Role::Tab, SEG_NORMAL, None, None, |i| tabs[i].0 == self.tab) {
+            if let Some(i) = segments(ui, p, "tabs", &labels, Role::Tab, SEG_NORMAL, &[], None, |i| tabs[i].0 == self.tab) {
                 self.tab = tabs[i].0;
                 self.stop_recording();
             }
@@ -802,10 +885,23 @@ impl eframe::App for SettingsApp {
                     }
                     match self.tab {
                         Tab::Network => self.network_section(ui, t, p),
-                        Tab::Switching => self.switching_section(ui, t, p),
+                        Tab::Switching => {
+                            let sub = self.follows_master();
+                            if sub { self.follow_banner(ui, p, t); }
+                            ui.add_enabled_ui(!sub, |ui| self.switching_section(ui, t, p));
+                        }
+                        Tab::Effects => {
+                            let sub = self.follows_master();
+                            if sub { self.follow_banner(ui, p, t); }
+                            ui.add_enabled_ui(!sub, |ui| self.effects_section(ui, t, p));
+                        }
                         Tab::Devices => {
-                            self.master_section(ui, t, p);
-                            self.group_section(ui, t, p);
+                            let sub = self.follows_master();
+                            if sub { self.follow_banner(ui, p, t); }
+                            ui.add_enabled_ui(!sub, |ui| {
+                                self.master_section(ui, t, p);
+                                self.group_section(ui, t, p);
+                            });
                         }
                         Tab::General => {
                             self.setup_card(ui, t, p);
@@ -813,8 +909,7 @@ impl eframe::App for SettingsApp {
                                 // As on the Mac: haptics under finding the cursor, the
                                 // language at the top on the right.
                                 notice(left, p, t);
-                                self.locate_section(left, t, p);
-                                self.haptics_summary(left, t, p);
+
                                 self.preferences_card(right, t, p);
                                 self.update_section(right, t, p);
                                 self.report_section(right, t, p);
@@ -840,6 +935,9 @@ impl eframe::App for SettingsApp {
         self.backup_picker_ui(&ctx, t, p);
         self.backup_manager_ui(&ctx, t, p);
         self.setup_confirm_ui(&ctx, p);
+        self.edge_confirm_window(&ctx, t, p);
+        self.port_confirm_window(&ctx, t, p);
+        self.how_window(&ctx, t);
     }
 }
 
@@ -902,41 +1000,179 @@ impl SettingsApp {
     fn header(&mut self, ui: &mut Ui, t: &Texts, p: Palette) {
         let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 48.0), Sense::hover());
         let painter = ui.painter();
-        let icon = Rect::from_min_size(rect.min + Vec2::new(0.0, 2.0), Vec2::splat(44.0));
-        let uv = Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0));
-        painter.image(self.icon.id(), icon, uv, Color32::WHITE);
-
+        let icon = Rect::from_min_size(rect.min + Vec2::new(0.0, 4.0), Vec2::splat(40.0));
         let x = icon.right() + 12.0;
         painter.text(Pos2::new(x, rect.top() + 3.0), Align2::LEFT_TOP, "flockswitch", bold(19.0), p.text);
 
-        let (color, line) = if !self.cfg.enabled {
-            (p.muted, t.paused.to_string())
-        } else if let Some(trigger) = &self.status.trigger {
-            (p.green, format!("{} · {trigger}", t.running))
-        } else {
-            (p.amber, t.searching.to_string())
-        };
+        let state = NetState::of(&self.cfg, self.header_status.as_ref());
+        let color = if state == NetState::Off { p.muted } else { p.green };
+        let device = if let Some(name) = &self.status.trigger { format!("{} · {}", name, self.status.channel.map(|c| c.to_string()).unwrap_or_default()) } else { t.searching.to_string() };
+        let line = format!("{}  |  {}", state.text(t), device);
         let y = rect.top() + 35.0;
         painter.circle_filled(Pos2::new(x + 5.0, y), 4.5, color);
-        let status = painter.text(Pos2::new(x + 16.0, y), Align2::LEFT_CENTER, line, FontId::proportional(14.0), p.text);
+        painter.text(Pos2::new(x + 16.0, y), Align2::LEFT_CENTER, line, FontId::proportional(14.0), p.text);
+        // The app icon at 40 px with rounded corners.
+        egui::Image::new((self.icon.id(), icon.size())).corner_radius(10).paint_at(ui, icon);
+    }
 
-        if let Some(last) = &self.status.last_switch {
-            let label = format!("{} · {} {last}", t.last_switch, t.channel);
-            let galley = painter.layout_no_wrap(label, FontId::proportional(12.0), p.muted);
-            // On the same line when it fits, otherwise left out (the tray menu shows it too).
-            if status.right() + 16.0 + galley.size().x + 16.0 <= rect.right() {
-                let pill = Rect::from_min_size(
-                    Pos2::new(rect.right() - galley.size().x - 16.0, y - 11.0),
-                    Vec2::new(galley.size().x + 16.0, 22.0),
-                );
-                painter.rect_filled(pill, 11, p.card);
-                painter.rect_stroke(pill, 11, Stroke::new(1.0, p.border), StrokeKind::Inside);
-                painter.galley(pill.center() - galley.size() / 2.0, galley, p.muted);
+    /// The master switch, then the settings of one button at a time.
+    fn follows_master(&self) -> bool {
+        self.cfg.network.role == flock_net::Role::Sub && !self.cfg.network.peers.is_empty()
+    }
+
+    fn master_name(&self) -> String {
+        self.net_status
+            .as_ref()
+            .and_then(|s| s.following.clone())
+            .or_else(|| self.cfg.network.peers.first().map(|p| p.name.clone()))
+            .unwrap_or_default()
+    }
+
+    fn follow_banner(&self, ui: &mut Ui, p: Palette, t: &Texts) {
+        ui.add_space(6.0);
+        info_box(ui, p, &format!("{}{}{}", t.net_follow_pre, self.master_name(), t.net_follow_post));
+        ui.add_space(6.0);
+    }
+
+    fn notice_items(&self, ui: &mut Ui, p: Palette, t: &Texts) {
+        for (i, item) in t.net_notice_items.iter().enumerate() {
+            ui.add_space(6.0);
+            ui.label(RichText::new(format!("{}. {item}", i + 1)).size(13.0).color(p.text));
+        }
+    }
+
+    fn try_port(&mut self, t: &Texts, port: Option<u16>, current: u16) {
+        let Some(port) = port else {
+            self.net_port_error = Some(t.net_port_invalid);
+            return;
+        };
+        match flock_net::check_port(port, current) {
+            Err(flock_net::PortProblem::Reserved) => self.net_port_error = Some(t.net_port_reserved),
+            Err(flock_net::PortProblem::Ours) => self.net_port_error = Some(t.net_port_ours),
+            Err(flock_net::PortProblem::InUse) => self.net_port_error = Some(t.net_port_in_use),
+            Ok(()) => {
+                self.net_port_error = None;
+                if port == self.cfg.network.port {
+                    self.net_port_edit = None;
+                } else if port == flock_net::DEFAULT_PORT {
+                    self.apply(|c| c.network.port = port);
+                    self.net_port_edit = None;
+                } else {
+                    self.net_port_confirm = Some(port);
+                }
             }
         }
     }
 
-    /// The master switch, then the settings of one button at a time.
+    fn port_confirm_window(&mut self, ctx: &egui::Context, t: &Texts, p: Palette) {
+        let Some(port) = self.net_port_confirm else { return };
+        let (mut close, mut change) = (false, false);
+        let frame = egui::Frame::new()
+            .fill(p.bg)
+            .stroke(Stroke::new(1.0, p.border))
+            .corner_radius(16)
+            .inner_margin(Margin::same(18))
+            .shadow(ctx.global_style().visuals.window_shadow);
+        let response = egui::Modal::new(egui::Id::unique("port-confirm")).frame(frame).show(ctx, |ui| {
+            ui.set_width(420.0);
+            ui.label(RichText::new(format!("{}: {port}", t.net_port)).font(bold(16.0)).color(p.text));
+            ui.add_space(8.0);
+            ui.label(RichText::new(t.net_port_confirm).size(13.0).color(p.text));
+            ui.add_space(14.0);
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.spacing_mut().item_spacing.x = 8.0;
+                change = button(ui, p, t.net_port_change, ButtonKind::Primary).clicked();
+                close = button(ui, p, t.cancel, ButtonKind::Plain).clicked();
+            });
+        });
+        if change {
+            self.apply(|c| c.network.port = port);
+            self.net_port_edit = None;
+            self.net_port_confirm = None;
+        } else if close || response.should_close() {
+            self.net_port_confirm = None;
+        }
+    }
+
+    fn how_window(&mut self, ctx: &egui::Context, t: &Texts) {
+        if !self.net_how {
+            return;
+        }
+        let builder = egui::ViewportBuilder::default()
+            .with_title(window_title(t.net_how_button))
+            .with_inner_size([560.0, 640.0])
+            .with_min_inner_size([420.0, 360.0]);
+        ctx.show_viewport_immediate(how_viewport(), builder, |ui, _| {
+            if ui.ctx().input(|i| i.viewport().close_requested()) {
+                self.net_how = false;
+                return;
+            }
+            let p = Palette::new(ui.visuals().dark_mode);
+            let panel = egui::Frame::new().fill(p.bg).inner_margin(Margin::symmetric(18, 14));
+            egui::CentralPanel::default().frame(panel).show(ui, |ui| {
+                egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                    how_diagram(ui, p, t);
+                    ui.add_space(14.0);
+                    for (i, item) in t.net_how_items.iter().enumerate() {
+                        let (title, body) = item.split_once(" - ").unwrap_or(("", item));
+                        ui.label(RichText::new(format!("{}. {title}", i + 1)).font(bold(14.0)).color(p.text));
+                        ui.add_space(2.0);
+                        ui.label(RichText::new(body).size(13.0).color(p.text));
+                        ui.add_space(12.0);
+                    }
+                });
+            });
+        });
+    }
+
+    fn effects_section(&mut self, ui: &mut Ui, t: &Texts, p: Palette) {
+        ui.add_space(12.0);
+        info_box(ui, p, t.effects_help);
+        two_columns(ui, |left, right| {
+            self.edge_effects_card(left, t, p);
+            self.locate_section(right, t, p);
+            self.haptics_summary(right, t, p);
+        });
+    }
+
+    fn edge_effects_card(&mut self, ui: &mut Ui, t: &Texts, p: Palette) {
+        let sub = self.follows_master();
+        section(ui, p, t.section_edge_effects, |ui| {
+            if sub {
+                self.follow_banner(ui, p, t);
+            }
+            ui.add_enabled_ui(!sub, |ui| self.edge_anim_rows(ui, t, p));
+            ui.add_space(8.0);
+        });
+    }
+
+    fn edge_confirm_window(&mut self, ctx: &egui::Context, t: &Texts, p: Palette) {
+        if !self.edge_confirm { return; }
+        egui::Window::new(t.edges_title).collapsible(false).resizable(false).show(ctx, |ui| {
+            ui.label(t.edges_confirm);
+            ui.horizontal(|ui| {
+                if button(ui, p, t.turn_on, ButtonKind::Primary).clicked() {
+                    self.apply(|c| c.edges.on = true);
+                    self.edge_confirm = false;
+                }
+                if button(ui, p, t.cancel, ButtonKind::Plain).clicked() { self.edge_confirm = false; }
+            });
+        });
+    }
+
+    fn easy_switch_hint(&mut self, ui: &mut Ui, t: &Texts, p: Palette) {
+        ui.label(RichText::new(t.easy_switch_hint).size(12.5).color(p.amber));
+        if self.cfg.enabled && button(ui, p, t.easy_switch_off, ButtonKind::Plain).clicked() {
+            self.apply(|c| c.enabled = false);
+        }
+    }
+
+    fn row_info(&self, ui: &mut Ui, p: Palette, label: &str, id: &str, text: &str) {
+        let label_width = ui.painter().layout_no_wrap(label.into(), FontId::proportional(14.5), p.text).size().x;
+        let center = Pos2::new(ui.min_rect().left() + label_width + 14.0, ui.cursor().top() - ROW_SMALL / 2.0);
+        info_icon(ui, p, id, center, text);
+    }
+
     fn net_request(&mut self, request: flock_net::Request) {
         if let Err(e) = flock_net::write_request(crate::net::config_dir(), &request) {
             self.error = Some(format!("{e:#}"));
@@ -949,27 +1185,103 @@ impl SettingsApp {
             self.net_status = flock_net::read_status(crate::net::config_dir()).ok();
             self.net_read = Instant::now();
         }
+        if self.net_ips.0.elapsed() >= Duration::from_secs(10) {
+            self.net_ips = (Instant::now(), local_ips());
+        }
         ui.ctx().request_repaint_after(poll);
         let status = self.net_status.clone();
-        section_full(ui, p, t.section_network, None, None, |ui| {
-            let mut on = self.cfg.network.on;
-            if switch_row(ui, p, t.net_share, None, &mut on) { self.apply(|c| c.network.on = on); }
-            hint(ui, p, t.net_explain);
-            hint(ui, p, t.net_permission);
-            hint(ui, p, &crate::net::support_text(crate::i18n::is_korean()));
-            if on && self.status.edge_backend == "input-capture" {
-                let (text, problem) = edge_backend_text(t, &self.status.edge_backend, &self.status.edge_note, false);
-                ui.colored_label(if problem { p.red } else { p.muted }, text);
+        let net = self.cfg.network.clone();
+        let accepted = net.notice_accepted;
+        let master = net.role == flock_net::Role::Master;
+        let sub = self.follows_master();
+        let live = status.as_ref().filter(|s| s.running && net.on);
+
+        // The explanation window, and what this computer is (master or sub).
+        ui.add_space(10.0);
+        ui.horizontal(|ui| {
+            if button(ui, p, t.net_how_button, ButtonKind::Plain).clicked() {
+                self.net_how = true;
             }
+            let badge = if master {
+                format!("{} {}/{}", t.net_badge_master, net.peers.len(), flock_net::MAX_SUBS)
+            } else {
+                let name = self.master_name();
+                format!("{} {}", t.net_badge_sub, if name.is_empty() { t.net_no_master } else { &name })
+            };
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                // Clear of the page's scroll bar.
+                ui.add_space(14.0);
+                ui.label(RichText::new(badge).font(bold(13.0)).color(p.accent_text));
+            });
+        });
+
+        if !accepted {
+            section_with(ui, p, t.net_notice_title, None, None, |ui| {
+                self.notice_items(ui, p, t);
+                ui.add_space(10.0);
+                if button(ui, p, t.net_notice_accept, ButtonKind::Primary).clicked() {
+                    self.apply(|c| c.network.notice_accepted = true);
+                }
+                ui.add_space(8.0);
+            });
+        }
+        section_with(ui, p, t.section_network, None, None, |ui| {
+            let mut on = net.on && accepted;
+            ui.add_enabled_ui(accepted, |ui| {
+                if switch_row(ui, p, t.net_share, None, &mut on) {
+                    self.apply(|c| c.network.on = on);
+                }
+            });
+            hint(ui, p, if accepted { t.net_explain } else { t.net_notice_first });
             if on {
-                if let Some(error) = status.as_ref().and_then(|s| s.me.error.as_ref()) { ui.colored_label(p.red, error); }
+                if let Some(error) = status.as_ref().and_then(|s| s.me.error.as_ref()) {
+                    let error = error.as_str();
+                    ui.colored_label(p.red, error);
+                }
+            }
+            if accepted {
+                ui.add_space(6.0);
+                let label = if self.net_notice_open { t.net_notice_hide } else { t.net_notice_review };
+                let link = ui
+                    .add(egui::Label::new(RichText::new(label).size(13.0).color(p.accent_text).underline()).sense(Sense::click()))
+                    .on_hover_cursor(egui::CursorIcon::PointingHand);
+                if link.clicked() {
+                    self.net_notice_open = !self.net_notice_open;
+                }
+                if self.net_notice_open {
+                    self.notice_items(ui, p, t);
+                }
+                ui.add_space(8.0);
             }
         });
-        if let Some(pairing) = status.as_ref().filter(|_| self.cfg.network.on).and_then(|s| s.pairing.as_ref()) {
-            section_full(ui, p, t.net_pairing, None, Some((&pairing.peer_name, p.accent)), |ui| {
+        let background = crate::main_instance_running();
+        if !background || status.as_ref().is_some_and(|s| net.on && !s.running) {
+            card(ui, p, |ui| {
+                ui.label(RichText::new(t.background_stopped).color(p.red));
+                if button(ui, p, t.background_restart, ButtonKind::Primary).clicked() {
+                    if let Err(e) = crate::net::launch_background() { self.error = Some(e.to_string()); }
+                }
+            });
+        }
+        if net.on {
+            let support = crate::net::cached_support();
+            if !support.send || !support.receive {
+                card(ui, p, |ui| { error_box(ui, p, &crate::net::support_text(crate::i18n::is_korean())); });
+            }
+        }
+        if let Some(pairing) = live.and_then(|s| s.pairing.as_ref()) {
+            section_with(ui, p, t.net_pairing, None, Some((&pairing.peer_name, p.accent_text)), |ui| {
                 let code = &pairing.code;
                 let shown = if code.len() == 6 && code.is_ascii() { format!("{} {}", &code[..3], &code[3..]) } else { code.clone() };
-                ui.label(RichText::new(shown).font(bold(32.0)).color(p.accent));
+                ui.label(RichText::new(shown).font(bold(32.0)).color(p.accent_text));
+                let reason = match pairing.reason.as_deref() {
+                    Some("both_master") => Some(t.net_reason_both_master),
+                    Some("both_sub") => Some(t.net_reason_both_sub),
+                    Some("full") => Some(t.net_reason_full),
+                    Some("has_master") => Some(t.net_reason_has_master),
+                    _ => None,
+                };
+                if let Some(reason) = reason { ui.colored_label(p.red, reason); }
                 match pairing.stage.as_str() {
                     "done" => { ui.colored_label(p.green, t.net_done); }
                     "failed" => { ui.colored_label(p.red, t.net_failed); }
@@ -984,34 +1296,106 @@ impl SettingsApp {
                 }
             });
         }
-        section_full(ui, p, t.net_me, None, None, |ui| {
+        let labels = [t.net_computers, t.net_this_computer, t.net_crossing, t.net_keyboard_clipboard].map(str::to_string);
+        ui.add_space(10.0);
+        if let Some(i) = segments(ui, p, "network-tabs", &labels, Role::Tab, SEG_SMALL, &[], None, |i| i == self.net_tab) { self.net_tab = i; }
+        if self.net_tab == 1 {
+        section_with(ui, p, t.net_me, None, None, |ui| {
+            hint(ui, p, &crate::net::support_text(crate::i18n::is_korean()));
             let width = (ui.available_width() * 0.62).min(300.0);
-            let mut name = self.cfg.network.name.clone();
+            // Master or sub: only while no computer is paired.
+            let locked = !net.peers.is_empty();
+            let labels = [t.net_role_master.to_string(), t.net_role_sub.to_string()];
+            let mut picked = None;
+            ui.add_enabled_ui(!locked, |ui| {
+                labeled_row(ui, p, t.net_role, width, ROW_SMALL, |ui| {
+                    picked = segments(ui, p, "net-role", &labels, Role::RadioButton, SEG_SMALL, &[], None, |i| (i == 1) == !master);
+                    false
+                });
+            });
+            self.row_info(ui, p, t.net_role, "net-role-info", t.net_role_info);
+            if locked { hint(ui, p, t.net_role_locked); }
+            if let Some(i) = picked {
+                let role = if i == 1 { flock_net::Role::Sub } else { flock_net::Role::Master };
+                self.apply(|c| c.network.role = role);
+            }
+            divider(ui, p);
+            let mut name = net.name.clone();
             if labeled_row(ui, p, t.net_name, width, ROW_SMALL, |ui| {
                 ui.add(egui::TextEdit::singleline(&mut name).hint_text(t.net_name_hint).desired_width(width)).changed()
             }) { self.apply(|c| c.network.name = name); }
-            let mut port = self.cfg.network.port;
-            if labeled_row(ui, p, t.net_port, width, ROW_SMALL, |ui| ui.add(egui::DragValue::new(&mut port).range(1..=65535)).changed()) {
-                self.apply(|c| c.network.port = port);
+            // The port is typed into a buffer and checked only on Apply.
+            let current = status.as_ref().filter(|s| s.running).map_or(net.port, |s| s.me.port);
+            let mut text = self.net_port_edit.clone().unwrap_or_else(|| net.port.to_string());
+            let (mut apply, mut default) = (false, false);
+            let port_width = (ui.available_width() * 0.8).min(400.0);
+            let typed = labeled_row(ui, p, t.net_port, port_width, ROW_SMALL, |ui| {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.spacing_mut().item_spacing.x = 6.0;
+                    default = button(ui, p, t.net_port_default, ButtonKind::Plain).clicked();
+                    apply = button(ui, p, t.net_port_apply, ButtonKind::Plain).clicked();
+                    ui.add(egui::TextEdit::singleline(&mut text).desired_width(64.0)).changed()
+                }).inner
+            });
+            if typed {
+                text.retain(|c| c.is_ascii_digit());
+                text.truncate(5);
+                self.net_port_edit = Some(text.clone());
+                self.net_port_error = None;
+            }
+            if default {
+                self.net_port_edit = Some(flock_net::DEFAULT_PORT.to_string());
+                self.try_port(t, Some(flock_net::DEFAULT_PORT), current);
+            } else if apply {
+                self.try_port(t, text.parse().ok(), current);
+            }
+            if let Some(error) = self.net_port_error {
+                ui.colored_label(p.red, error);
+            }
+            if !self.net_ips.1.is_empty() {
+                let shown: Vec<String> = self
+                    .net_ips
+                    .1
+                    .iter()
+                    .map(|ip| if net.port == flock_net::DEFAULT_PORT { ip.clone() } else { format!("{ip}:{}", net.port) })
+                    .collect();
+                hint(ui, p, &format!("{}: {}", t.net_local_ips, shown.join(", ")));
             }
             if let Some(s) = &status { hint(ui, p, &format!("{}: {}", t.net_id, s.me.id.get(..8).unwrap_or(&s.me.id))); }
+            ui.add_space(6.0);
         });
-        section_full(ui, p, t.net_nearby, None, None, |ui| {
-            let discovered: Vec<_> = status.as_ref().filter(|s| self.cfg.network.on && s.running).map(|s| s.discovered.iter().filter(|d| !d.paired && !self.cfg.network.peers.iter().any(|p| p.id == d.id)).cloned().collect()).unwrap_or_default();
-            if discovered.is_empty() { empty(ui, p, if self.cfg.network.on { t.net_empty } else { t.net_disabled }); }
-            for peer in discovered {
+        }
+        if self.net_tab == 0 {
+        // A computer found nearby but not paired yet is "the other computer": a ghost card.
+        heading(ui, p, t.net_nearby);
+        let discovered: Vec<_> = live
+            .map(|s| s.discovered.iter().filter(|d| !d.paired && !net.peers.iter().any(|p| p.id == d.id)).cloned().collect())
+            .unwrap_or_default();
+        if discovered.is_empty() {
+            empty_card(ui, p, if net.on { t.net_empty } else { t.net_disabled });
+            ui.add_space(8.0);
+        }
+        for peer in discovered {
+            ghost_card(ui, p, |ui| {
+                ui.add_space(6.0);
                 ui.horizontal(|ui| {
                     ui.vertical(|ui| {
                         ui.label(RichText::new(&peer.name).strong());
                         hint(ui, p, &format!("{:?} · {}", peer.os, peer.addr));
                     });
-                    if button(ui, p, t.net_pair, ButtonKind::Plain).clicked() { self.net_request(flock_net::Request::Pair { pair: peer.id }); }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if button(ui, p, t.net_pair, ButtonKind::Primary).clicked() { self.net_request(flock_net::Request::Pair { pair: peer.id }); }
+                    });
                 });
-            }
-            divider(ui, p);
+                ui.add_space(6.0);
+            });
+            ui.add_space(8.0);
+        }
+        card(ui, p, |ui| {
+            ui.add_space(6.0);
             ui.horizontal(|ui| {
                 ui.add(egui::TextEdit::singleline(&mut self.net_address).hint_text(t.net_address_hint).desired_width((ui.available_width() - 110.0).max(100.0)));
-                ui.add_enabled_ui(self.cfg.network.on && !self.net_address.trim().is_empty(), |ui| {
+                ui.add_enabled_ui(net.on && !self.net_address.trim().is_empty(), |ui| {
                     if button(ui, p, t.net_add_ip, ButtonKind::Plain).clicked() {
                         let input = self.net_address.trim();
                         let address = if let Ok(ip) = input.parse::<std::net::IpAddr>() {
@@ -1022,59 +1406,130 @@ impl SettingsApp {
                     }
                 });
             });
+            ui.add_space(6.0);
         });
-        // Same heading as `section_with`, but each peer gets its own card below it.
-        ui.add_space(10.0);
-        ui.horizontal(|ui| {
-            ui.add_space(4.0);
-            ui.label(RichText::new(t.net_peers).font(bold(13.0)).color(p.muted));
-        });
-        ui.add_space(2.0);
-        if self.cfg.network.peers.is_empty() { card(ui, p, |ui| empty(ui, p, t.net_no_peers)); }
-        for peer in self.cfg.network.peers.clone() {
-            ui.push_id(&peer.id, |ui| card(ui, p, |ui| {
+        // Same heading as `section_with`, but each peer gets its own card below it
+        // (a computer that is not connected is a ghost card).
+        heading(ui, p, t.net_peers);
+        if net.peers.is_empty() { empty_card(ui, p, t.net_no_peers); }
+        for peer in net.peers.clone() {
+            let connected = live.and_then(|s| s.peers.iter().find(|s| s.id == peer.id)).is_some_and(|s| s.connected);
+            let body = |ui: &mut Ui| {
                 ui.horizontal(|ui| {
                     ui.label(RichText::new(&peer.name).font(bold(15.0)));
-                    let online = status.as_ref().filter(|s| s.running && self.cfg.network.on).and_then(|s| s.peers.iter().find(|p| p.id == peer.id)).filter(|p| p.connected);
+                    let online = live.and_then(|s| s.peers.iter().find(|p| p.id == peer.id)).filter(|p| p.connected);
                     if let Some(online) = online {
                         let delay = online.rtt_ms.map(|ms| format!(" · {ms:.1} ms")).unwrap_or_default();
                         ui.colored_label(p.green, format!("● {}{delay}", t.net_connected));
                     } else { ui.colored_label(p.muted, format!("● {}", t.net_offline)); }
                     if button(ui, p, t.net_unpair, ButtonKind::Danger).clicked() { self.net_request(flock_net::Request::Unpair { unpair: peer.id.clone() }); }
                 });
+                if !master {
+                    // The master decides where it sits; here it is only shown.
+                    let side = match peer.side {
+                        Some(flock_net::Side::Left) => t.edge_left,
+                        Some(flock_net::Side::Right) => t.edge_right,
+                        Some(flock_net::Side::Top) => t.edge_top,
+                        Some(flock_net::Side::Bottom) => t.edge_bottom,
+                        None => t.net_side_off,
+                    };
+                    hint(ui, p, &format!("{}{}{}", t.net_master_at_pre, side.to_lowercase(), t.net_master_at_post));
+                    ui.add_space(8.0);
+                    return;
+                }
                 let sides = [None, Some(flock_net::Side::Left), Some(flock_net::Side::Right), Some(flock_net::Side::Top), Some(flock_net::Side::Bottom)];
                 let labels: Vec<String> = [t.off, t.edge_left, t.edge_right, t.edge_top, t.edge_bottom].iter().map(|s| s.to_string()).collect();
                 let width = (ui.available_width() * 0.66).min(300.0);
+                // A side another sub already sits on cannot be chosen.
+                let taken: Vec<usize> = (1..sides.len())
+                    .filter(|&i| net.peers.iter().any(|o| o.id != peer.id && o.side == sides[i]))
+                    .collect();
                 let mut selected = None;
                 labeled_row(ui, p, t.net_position, width, ROW_SMALL, |ui| {
-                    selected = segments(ui, p, &format!("net-side-{}", peer.id), &labels, Role::RadioButton, SEG_SMALL, None, Some(0), |i| sides[i] == peer.side);
+                    selected = segments(ui, p, &format!("net-side-{}", peer.id), &labels, Role::RadioButton, SEG_SMALL, &taken, Some(0), |i| sides[i] == peer.side);
                     false
                 });
                 if let Some(i) = selected { self.apply(|c| { if let Some(p) = c.network.peers.iter_mut().find(|p| p.id == peer.id) { p.side = sides[i]; } }); }
-                let labels: Vec<String> = [t.off, "1", "2", "3"].iter().map(|s| s.to_string()).collect();
-                let mut channel = None;
-                labeled_row(ui, p, t.net_channel, width, ROW_SMALL, |ui| {
-                    channel = segments(ui, p, &format!("net-channel-{}", peer.id), &labels, Role::RadioButton, SEG_SMALL, None, Some(0), |i| i as u8 == peer.logitech_channel);
-                    false
-                });
-                let label_width = ui.painter().layout_no_wrap(t.net_channel.into(), FontId::proportional(14.5), p.text).size().x;
-                let center = Pos2::new(ui.min_rect().left() + label_width + 14.0, ui.cursor().top() - ROW_SMALL / 2.0);
-                info_icon(ui, p, &format!("net-channel-info-{}", peer.id), center, t.net_channel_info);
-                if let Some(i) = channel { self.apply(|c| { if let Some(p) = c.network.peers.iter_mut().find(|p| p.id == peer.id) { p.logitech_channel = i as u8; } }); }
-            }));
+            };
+            ui.push_id(&peer.id, |ui| if connected { card(ui, p, body) } else { ghost_card(ui, p, body) });
             ui.add_space(8.0);
         }
-        section_full(ui, p, t.net_options, None, None, |ui| {
-            let mut swap = self.cfg.network.swap_cmd_ctrl;
-            if switch_row(ui, p, t.net_swap, None, &mut swap) { self.apply(|c| c.network.swap_cmd_ctrl = swap); }
-            let mut lang1 = self.cfg.network.lang1_on_mac != "off";
-            if switch_row(ui, p, t.net_lang1, None, &mut lang1) { self.apply(|c| c.network.lang1_on_mac = if lang1 { "capslock" } else { "off" }.into()); }
+        }
+        if self.net_tab >= 2 {
+        section_with(ui, p, t.net_options, None, None, |ui| {
+            if sub { self.follow_banner(ui, p, t); }
+            ui.add_enabled_ui(!sub, |ui| {
+                let width = (ui.available_width() * 0.7).min(380.0);
+                if self.net_tab == 2 {
+                if net.on && self.cfg.enabled { self.easy_switch_hint(ui, t, p); }
+                let choices: Vec<(u64, String)> = [(0, ""), (300, "0.3"), (500, "0.5"), (1000, "1"), (2000, "2")]
+                    .into_iter()
+                    .map(|(ms, text)| (ms, if ms == 0 { t.net_delay_none.to_string() } else { format!("{text}{}", t.seconds_short) }))
+                    .collect();
+                let choices: Vec<(u64, &str)> = choices.iter().map(|(ms, s)| (*ms, s.as_str())).collect();
+                let mut delay = net.cross_delay_ms;
+                if labeled_row(ui, p, t.net_delay, width, ROW_SMALL, |ui| segmented(ui, p, "net-delay", &mut delay, &choices, SEG_SMALL)) {
+                    self.apply(|c| c.network.cross_delay_ms = delay);
+                }
+                hint(ui, p, t.net_delay_hint);
+                divider(ui, p);
+                let mut control = net.require_control;
+                if switch_row(ui, p, t.net_require_control, Some(t.net_require_control_note), &mut control) { self.apply(|c| c.network.require_control = control); }
+                let mut arrival = self.cfg.locate.on && self.cfg.locate.on_arrival;
+                if switch_row(ui, p, t.net_arrival, None, &mut arrival) {
+                    self.apply(|c| {
+                        c.locate.on_arrival = arrival;
+                        if arrival { c.locate.on = true; }
+                    });
+                }
+                hint(ui, p, t.net_arrival_hint);
+                divider(ui, p);
+                }
+                if self.net_tab == 3 {
+                let mut swap = net.swap_cmd_ctrl;
+                if switch_row(ui, p, t.net_swap, None, &mut swap) { self.apply(|c| c.network.swap_cmd_ctrl = swap); }
+                ui.add_enabled_ui(false, |ui| {
+                    let mut capslock = net.mac_capslock_to_hangul;
+                    switch_row(ui, p, t.net_mac_capslock, Some(t.net_set_on_mac), &mut capslock);
+                    let mut shift_space = net.mac_shift_space_to_hangul;
+                    switch_row(ui, p, t.net_mac_shift_space, Some(t.net_set_on_mac), &mut shift_space);
+                });
+                let mut lang1 = net.lang1_on_mac != "off";
+                if switch_row(ui, p, t.net_lang1, None, &mut lang1) { self.apply(|c| c.network.lang1_on_mac = if lang1 { "capslock" } else { "off" }.into()); }
+                divider(ui, p);
+                let mut clipboard = net.share_clipboard;
+                if switch_row(ui, p, t.net_clipboard, None, &mut clipboard) { self.apply(|c| c.network.share_clipboard = clipboard); }
+                hint(ui, p, t.net_clip_hint);
+                }
+            });
+            if let Some(tr) = live.and_then(|s| s.transfer.as_ref()) {
+                let mb = |bytes: u64| bytes as f64 / 1_048_576.0;
+                let line = match tr.stage.as_str() {
+                    "running" => Some((
+                        format!("{} {:.1} / {:.1} MB", if tr.direction == "send" { t.net_sending } else { t.net_receiving }, mb(tr.done_bytes), mb(tr.total_bytes)),
+                        p.muted,
+                    )),
+                    "done" if tr.direction == "receive" && tr.kind == "files" => {
+                        Some((format!("{} {}", t.net_received, tr.saved_in.clone().unwrap_or_default()), p.green))
+                    }
+                    "too_large" => Some((t.net_too_large.to_string(), p.amber)),
+                    "failed" => Some((t.net_transfer_failed.to_string(), p.red)),
+                    _ => None,
+                };
+                if let Some((text, color)) = line {
+                    ui.add_space(4.0);
+                    ui.label(RichText::new(text).size(12.5).color(color));
+                }
+            }
+            divider(ui, p);
             hint(ui, p, t.net_return);
-            hint(ui, p, t.net_priority);
+            ui.add_space(6.0);
         });
+        }
     }
 
     fn switching_section(&mut self, ui: &mut Ui, t: &Texts, p: Palette) {
+        if self.cfg.network.on { self.easy_switch_hint(ui, t, p); }
         ui.add_space(12.0);
         info_box(ui, p, t.switching_help);
         ui.add_space(10.0);
@@ -1103,7 +1558,7 @@ impl SettingsApp {
             .chain([(t.hotkeys_short, self.cfg.hotkeys.on), (t.edges_short, self.cfg.edges.any())])
             .map(|(short, on)| if on { format!("{short} ✓") } else { short.to_string() })
             .collect();
-        if let Some(i) = segments(ui, p, "button-tabs", &labels, Role::Tab, SEG_NORMAL, None, None, |i| tab_ids[i] == self.button_tab) {
+        if let Some(i) = segments(ui, p, "button-tabs", &labels, Role::Tab, SEG_NORMAL, &[], None, |i| tab_ids[i] == self.button_tab) {
             self.button_tab = tab_ids[i];
             self.stop_recording();
         }
@@ -1309,7 +1764,13 @@ impl SettingsApp {
             }
             ui.add_space(4.0);
         }
-        // No on/off switch: an edge is on when it has a channel, off on "Off".
+        let mut on = self.cfg.edges.on;
+        if switch_row(ui, p, t.edges_title, None, &mut on) {
+            if on && self.cfg.network.on { self.edge_confirm = true; }
+            else { self.apply(|c| c.edges.on = on); }
+        }
+        if self.cfg.network.on { hint(ui, p, t.edges_network_hint); }
+        ui.add_enabled_ui(!self.cfg.network.on, |ui| {
         title_row(ui, p, t.edges_title, None);
         hint(ui, p, t.edges_hint);
         ui.add_space(6.0);
@@ -1317,6 +1778,7 @@ impl SettingsApp {
         two_columns(ui, |left, right| {
             self.edge_sides(left, t, p);
             self.edge_wait(right, t, p);
+        });
         });
         ui.add_space(8.0);
     }
@@ -1332,7 +1794,7 @@ impl SettingsApp {
             let mut clicked = None;
             labeled_row(ui, p, label, width, ROW_SMALL, |ui| {
                 // Segment 0 is "off"; this computer's own channel is shown but locked.
-                clicked = segments(ui, p, &format!("edge-{edge:?}"), &labels, Role::RadioButton, SEG_SMALL, here.map(|c| c as usize), Some(0), |i| {
+                clicked = segments(ui, p, &format!("edge-{edge:?}"), &labels, Role::RadioButton, SEG_SMALL, &here.map(|c| c as usize).into_iter().collect::<Vec<_>>(), Some(0), |i| {
                     i as u8 == current
                 });
                 false
@@ -1375,7 +1837,6 @@ impl SettingsApp {
         hint(ui, p, t.edge_require_control_hint);
         ui.add_space(6.0);
         divider(ui, p);
-        self.edge_anim_rows(ui, t, p);
     }
 
     /// Which countdown is drawn at the edge, and how it drains where that can be chosen.
@@ -1566,7 +2027,7 @@ impl SettingsApp {
             .map(|(g, l)| if moves.get(*g).is_some_and(|m| m.on) { format!("{l} ✓") } else { l.to_string() })
             .collect();
         ui.add_space(10.0);
-        if let Some(i) = segments(ui, p, "gesture-tabs", &labels, Role::Tab, SEG_SMALL, None, None, |i| gestures[i].0 == self.gesture_tab) {
+        if let Some(i) = segments(ui, p, "gesture-tabs", &labels, Role::Tab, SEG_SMALL, &[], None, |i| gestures[i].0 == self.gesture_tab) {
             self.gesture_tab = gestures[i].0;
         }
         hint(ui, p, t.gesture_hint);
@@ -1598,7 +2059,7 @@ impl SettingsApp {
         labeled_row(ui, p, t.channels, seg_width, ROW_SMALL, |ui| {
             // Segment 0 is "Off"; this computer's own channel is shown but locked.
             let locked = here.map(|c| c as usize);
-            clicked = segments(ui, p, &format!("channels-{slot:?}"), &labels, Role::RadioButton, SEG_SMALL, locked, Some(0), |i| {
+            clicked = segments(ui, p, &format!("channels-{slot:?}"), &labels, Role::RadioButton, SEG_SMALL, &locked.into_iter().collect::<Vec<_>>(), Some(0), |i| {
                 if i == 0 { !is_on } else { target == Some(i as u8) }
             });
             false
@@ -3098,7 +3559,8 @@ fn card(ui: &mut Ui, p: Palette, add: impl FnOnce(&mut Ui)) {
     egui::Frame::new()
         .fill(p.card)
         .stroke(Stroke::new(1.0, p.border))
-        .corner_radius(12)
+        .shadow(p.card_shadow())
+        .corner_radius(16)
         .inner_margin(Margin::symmetric(18, 6))
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
@@ -3388,17 +3850,14 @@ fn segments(
     labels: &[String],
     role: Role,
     size: SegSize,
-    // A segment shown but not clickable (this computer's channel).
-    locked: Option<usize>,
+    // Segments shown but not clickable (a side another computer already sits on).
+    locked: &[usize],
     // The "Off" segment: chosen, it is drawn gray instead of in the accent colour.
     off: Option<usize>,
     selected: impl Fn(usize) -> bool,
 ) -> Option<usize> {
-    let toggles = role == Role::CheckBox;
     let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), size.height), Sense::hover());
-    if !toggles {
-        ui.painter().rect_filled(rect, 8, p.track.gamma_multiply(0.55));
-    }
+    ui.painter().rect_filled(rect, 8, p.track);
     let w = rect.width() / labels.len() as f32;
     let mut clicked = None;
     for (i, label) in labels.iter().enumerate() {
@@ -3407,7 +3866,7 @@ fn segments(
         // Named per bar: the rows sit in look-alike child areas, so an id derived from
         // the area would be shared and one bar's click would also hit the other.
         let id = egui::Id::unique(("segment", name, i));
-        let locked = locked == Some(i);
+        let locked = locked.contains(&i);
         let resp = if locked {
             ui.interact(seg, id, Sense::hover())
         } else {
@@ -3419,21 +3878,19 @@ fn segments(
             clicked = Some(i);
         }
         let painter = ui.painter();
+        // Chosen: lime with ink text ("Off" in its gray); the others sit on the track.
         let (fill, color) = if locked {
-            (locked_fill(p), Color32::WHITE.gamma_multiply(0.7))
+            (locked_fill(p), p.muted)
         } else if on && off == Some(i) {
-            (p.off, Color32::WHITE)
+            (p.off, p.text)
         } else if on {
-            (p.accent, Color32::WHITE)
+            (p.accent, p.ink)
         } else if resp.hovered() {
-            (if toggles { p.hover } else { p.card.gamma_multiply(0.6) }, p.text)
+            (p.hover, p.text)
         } else {
-            (if toggles { p.card } else { Color32::TRANSPARENT }, p.text)
+            (Color32::TRANSPARENT, p.muted)
         };
         painter.rect_filled(seg, 7, fill);
-        if toggles && !on && !locked {
-            painter.rect_stroke(seg, 7, Stroke::new(1.0, p.track), StrokeKind::Inside);
-        }
         if locked {
             // A faint inner shadow: pressed in, not pressable.
             painter.rect_stroke(seg, 7, Stroke::new(1.5, Color32::from_black_alpha(45)), StrokeKind::Inside);
@@ -3471,7 +3928,7 @@ fn segmented<T: PartialEq + Copy>(
     size: SegSize,
 ) -> bool {
     let labels: Vec<String> = options.iter().map(|(_, l)| l.to_string()).collect();
-    match segments(ui, p, name, &labels, Role::RadioButton, size, None, None, |i| options[i].0 == *value) {
+    match segments(ui, p, name, &labels, Role::RadioButton, size, &[], None, |i| options[i].0 == *value) {
         Some(i) if options[i].0 != *value => {
             *value = options[i].0;
             true
@@ -3700,8 +4157,10 @@ fn button_of_width(ui: &mut Ui, p: Palette, label: &str, kind: ButtonKind, width
     let hovered = resp.hovered();
     let (fill, stroke, color) = match kind {
         ButtonKind::Plain => (if hovered { p.hover } else { p.card }, p.track, p.text),
-        ButtonKind::Primary => (if hovered { p.accent.gamma_multiply(0.85) } else { p.accent }, p.accent, Color32::WHITE),
-        ButtonKind::Danger => (if hovered { p.red.gamma_multiply(0.10) } else { p.card }, p.red.gamma_multiply(0.7), p.red),
+        // Lime with ink text, never white.
+        ButtonKind::Primary => (if hovered { p.accent.lerp_to_gamma(p.ink, 0.12) } else { p.accent }, p.accent, p.ink),
+        // Red text on a light red tint.
+        ButtonKind::Danger => (p.red.gamma_multiply(if hovered { 0.22 } else { 0.12 }), Color32::TRANSPARENT, p.red),
         ButtonKind::DangerFilled => (if hovered { p.red.gamma_multiply(0.85) } else { p.red }, p.red, Color32::WHITE),
     };
     let painter = ui.painter();
@@ -3725,3 +4184,151 @@ fn shortcut_text(key: egui::Key, m: egui::Modifiers) -> Option<String> {
     parts.push(name);
     Some(parts.join("+").to_lowercase())
 }
+
+
+fn how_viewport() -> egui::ViewportId {
+    egui::ViewportId::from_hash_of("network-how")
+}
+
+
+fn how_diagram(ui: &mut Ui, p: Palette, t: &Texts) {
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 118.0), Sense::hover());
+    let painter = ui.painter();
+    let gap = 44.0;
+    let w = (rect.width() - 2.0 * gap) / 3.0;
+    let h = 58.0;
+    let boxes: Vec<Rect> = (0..3)
+        .map(|i| Rect::from_min_size(Pos2::new(rect.left() + i as f32 * (w + gap), rect.top() + 4.0), Vec2::new(w, h)))
+        .collect();
+    for (i, (r, label)) in boxes.iter().zip([t.net_how_this, t.net_how_link, t.net_how_other]).enumerate() {
+        if i == 1 {
+            // The network between the two computers: the dashed, hatched card.
+            painter.add(Shape::Vec(ghost_shapes(*r, 12.0, p)));
+        } else {
+            painter.add(p.card_shadow().as_shape(*r, 12));
+            painter.rect_filled(*r, 12, p.card);
+            painter.rect_stroke(*r, 12, Stroke::new(1.0, p.border), StrokeKind::Inside);
+        }
+        let (first, rest) = label.split_once(" / ").unwrap_or((label, ""));
+        let text = if rest.is_empty() { first.to_string() } else { format!("{first}\n{rest}") };
+        let galley = painter.layout(text, FontId::proportional(12.5), p.text, w - 12.0);
+        painter.galley(r.center() - galley.size() / 2.0, galley, p.text);
+    }
+    // Ink arrows to the other computer, the lime arrow back.
+    let arrow = Stroke::new(1.6, p.text);
+    let head = |tip: Pos2, dir: Vec2, stroke: Stroke| {
+        let side = Vec2::new(-dir.y, dir.x);
+        painter.line_segment([tip, tip - dir * 7.0 + side * 4.0], stroke);
+        painter.line_segment([tip, tip - dir * 7.0 - side * 4.0], stroke);
+    };
+    for pair in boxes.windows(2) {
+        let (from, to) = (Pos2::new(pair[0].right() + 4.0, pair[0].center().y), Pos2::new(pair[1].left() - 4.0, pair[0].center().y));
+        painter.line_segment([from, to], arrow);
+        head(to, Vec2::new(1.0, 0.0), arrow);
+    }
+    // The way back runs under the boxes, from the last to the first.
+    let (start, end) = (Pos2::new(boxes[2].center().x, boxes[2].bottom() + 4.0), Pos2::new(boxes[0].center().x, boxes[0].bottom() + 4.0));
+    let low = rect.top() + h + 30.0;
+    let back = Stroke::new(2.2, p.accent);
+    painter.line_segment([start, Pos2::new(start.x, low)], back);
+    painter.line_segment([Pos2::new(start.x, low), Pos2::new(end.x, low)], back);
+    painter.line_segment([Pos2::new(end.x, low), end], back);
+    head(end, Vec2::new(0.0, -1.0), back);
+    let galley = painter.layout_no_wrap(t.net_how_back.to_string(), FontId::proportional(12.0), p.muted);
+    let label = Rect::from_center_size(Pos2::new(rect.center().x, low), galley.size() + Vec2::new(12.0, 2.0));
+    painter.rect_filled(label, 4, p.bg);
+    painter.galley(label.center() - galley.size() / 2.0, galley, p.muted);
+}
+
+
+fn ghost_card(ui: &mut Ui, p: Palette, add: impl FnOnce(&mut Ui)) {
+    let slot = ui.painter().add(Shape::Noop);
+    let shown = egui::Frame::new().corner_radius(16).inner_margin(Margin::symmetric(18, 6)).show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        ui.spacing_mut().item_spacing.y = 0.0;
+        add(ui);
+    });
+    ui.painter().set(slot, Shape::Vec(ghost_shapes(shown.response.rect, 16.0, p)));
+}
+
+
+fn heading(ui: &mut Ui, p: Palette, title: &str) {
+    ui.add_space(10.0);
+    ui.horizontal(|ui| {
+        ui.add_space(4.0);
+        ui.label(RichText::new(title).font(bold(13.0)).color(p.muted));
+    });
+    ui.add_space(2.0);
+}
+
+fn section_with(ui: &mut Ui, p: Palette, title: &str, info: Option<&str>, trailing: Option<(&str, Color32)>, add: impl FnOnce(&mut Ui)) {
+    section_full(ui, p, title, info, trailing, add);
+}
+fn local_ips() -> Vec<String> {
+    // Query local interfaces only. This never opens a network connection.
+    let Ok(out) = std::process::Command::new("ip").args(["-o", "-4", "addr", "show", "scope", "global"]).output() else { return Vec::new() };
+    let mut ips: Vec<String> = String::from_utf8_lossy(&out.stdout).split_whitespace()
+        .filter_map(|s| s.split_once('/')?.0.parse::<std::net::Ipv4Addr>().ok())
+        .filter(|ip| ip.is_private()).map(|ip| ip.to_string()).collect();
+    ips.sort(); ips.dedup(); ips
+}
+
+fn ghost_shapes(rect: Rect, radius: f32, p: Palette) -> Vec<Shape> {
+    let mut shapes = vec![Shape::rect_filled(rect, radius, p.card.gamma_multiply(0.45))];
+    // Hatching: lines rising to the right, cut where they leave the rounded rectangle.
+    let inside = |pos: Pos2| {
+        let r = rect.shrink(1.0);
+        if !r.contains(pos) {
+            return false;
+        }
+        let corner = Pos2::new(
+            pos.x.clamp(r.left() + radius, r.right() - radius),
+            pos.y.clamp(r.top() + radius, r.bottom() - radius),
+        );
+        (pos - corner).length() <= radius - 1.0
+    };
+    let (w, h) = (rect.width(), rect.height());
+    let mut k = -h;
+    while k < w {
+        // From the bottom edge up and to the right, in 3 px steps.
+        let at = |t: f32| Pos2::new(rect.left() + k + t, rect.bottom() - t);
+        let (mut run_start, mut t) = (None, 0.0_f32);
+        while t <= h + 3.0 {
+            let ok = inside(at(t));
+            match (ok, run_start) {
+                (true, None) => run_start = Some(t),
+                (false, Some(a)) => {
+                    shapes.push(Shape::line_segment([at(a), at(t - 3.0)], Stroke::new(1.0, p.hatch)));
+                    run_start = None;
+                }
+                _ => {}
+            }
+            t += 3.0;
+        }
+        if let Some(a) = run_start {
+            shapes.push(Shape::line_segment([at(a), at(t - 3.0)], Stroke::new(1.0, p.hatch)));
+        }
+        k += 9.0;
+    }
+    // The dashed outline: 6 on, 5 off.
+    let mut path = Vec::new();
+    let r = rect.shrink(0.6);
+    for (center, from) in [
+        (Pos2::new(r.right() - radius, r.top() + radius), -90.0_f32),
+        (Pos2::new(r.right() - radius, r.bottom() - radius), 0.0),
+        (Pos2::new(r.left() + radius, r.bottom() - radius), 90.0),
+        (Pos2::new(r.left() + radius, r.top() + radius), 180.0),
+    ] {
+        for step in 0..=6 {
+            let a = (from + 15.0 * step as f32).to_radians();
+            path.push(center + Vec2::new(a.cos(), a.sin()) * radius);
+        }
+    }
+    path.push(path[0]);
+    shapes.extend(Shape::dashed_line(&path, Stroke::new(1.2, p.dash), 6.0, 5.0));
+    shapes
+}
+
+
+
+fn empty_card(ui: &mut Ui, p: Palette, text: &str) { ghost_card(ui, p, |ui| empty(ui, p, text)); }
