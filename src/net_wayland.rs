@@ -79,6 +79,18 @@ static REMOTE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::ne
 /// The EIS session ended with an error and nothing restarts it: the supervisor must
 /// drop this platform and start a new one.
 static EIS_FAILED: Mutex<Option<String>> = Mutex::new(None);
+/// The EIS connection was established at least once in this platform's life. A failure
+/// before that is the user cancelling or denying the portal dialog (or no portal): asking
+/// again by itself would only pop the dialog up forever.
+static EIS_OPENED: AtomicBool = AtomicBool::new(false);
+/// The portal never answered `create_session`: no dialog was shown, so trying again is safe.
+static EIS_NO_ANSWER: AtomicBool = AtomicBool::new(false);
+pub fn eis_opened() -> bool {
+    EIS_OPENED.load(Ordering::Acquire)
+}
+pub fn eis_no_answer() -> bool {
+    EIS_NO_ANSWER.load(Ordering::Acquire)
+}
 pub fn eis_failed() -> Option<String> {
     EIS_FAILED.lock().unwrap().clone()
 }
@@ -99,6 +111,8 @@ pub struct Wayland {
     commands: Sender<Command>,
     /// Wakes the EIS loop for a queued command; idle, it waits for the compositor only.
     wake: Arc<OwnedFd>,
+    /// Wakes the `cancelled` future in `receive`, which may be waiting on the portal.
+    cancel_wake: Arc<OwnedFd>,
     model: Arc<Mutex<Model>>,
     worker: Mutex<Option<JoinHandle<()>>>,
     send: bool,
@@ -114,9 +128,13 @@ impl Wayland {
             "Network sharing was disabled"
         );
         *EIS_FAILED.lock().unwrap() = None;
+        EIS_OPENED.store(false, Ordering::Release);
+        EIS_NO_ANSWER.store(false, Ordering::Release);
         let (commands, rx) = mpsc::channel();
         let wake = Arc::new(eventfd(0, EventfdFlags::CLOEXEC | EventfdFlags::NONBLOCK)?);
         let worker_wake = wake.clone();
+        let cancel_wake = Arc::new(eventfd(0, EventfdFlags::CLOEXEC | EventfdFlags::NONBLOCK)?);
+        let worker_cancel_wake = cancel_wake.clone();
         let model = Arc::new(Mutex::new(Model::default()));
         let state = model.clone();
         let cancelled = Arc::new(AtomicBool::new(false));
@@ -125,7 +143,7 @@ impl Wayland {
             .name("network-eis".into())
             .spawn(move || {
                 async_io::block_on(async {
-                    if let Err(e) = receive(shared, rx, worker_wake, state.clone(), cancel).await {
+                    if let Err(e) = receive(shared, rx, worker_wake, worker_cancel_wake, state.clone(), cancel).await {
                         let text = format!("{e:#}");
                         state.lock().unwrap().error = Some(text.clone());
                         *EIS_FAILED.lock().unwrap() = Some(text);
@@ -136,6 +154,7 @@ impl Wayland {
             clipboard: crate::clipboard::Clipboard::default(),
             commands,
             wake,
+            cancel_wake,
             model,
             worker: Mutex::new(Some(worker)),
             send: support.send,
@@ -238,6 +257,7 @@ impl Drop for Wayland {
     fn drop(&mut self) {
         disable();
         self.cancelled.store(true, Ordering::Release);
+        let _ = rustix::io::write(&*self.cancel_wake, &1u64.to_ne_bytes());
         self.command(Command::Quit);
         if let Some(h) = self.worker.lock().unwrap().take() {
             let _ = h.join();
@@ -255,6 +275,7 @@ async fn receive(
     shared: Arc<Shared>,
     rx: mpsc::Receiver<Command>,
     wake: Arc<OwnedFd>,
+    cancel_wake: Arc<OwnedFd>,
     model: Arc<Mutex<Model>>,
     cancel: Arc<AtomicBool>,
 ) -> anyhow::Result<()> {
@@ -270,7 +291,10 @@ async fn receive(
         Ok::<_, ashpd::Error>((portal, session))
     })
     .await
-    .ok_or_else(|| anyhow::anyhow!("RemoteDesktop did not answer"))??;
+    .ok_or_else(|| {
+        EIS_NO_ANSWER.store(true, Ordering::Release);
+        anyhow::anyhow!("RemoteDesktop did not answer")
+    })??;
     let result = async {
         let path = crate::config::Config::path().with_file_name("remote-desktop.token");
         let token = std::fs::read_to_string(&path).ok();
@@ -314,6 +338,7 @@ async fn receive(
         let (connection, events) = context
             .handshake_async_io("flockswitch", ei::handshake::ContextType::Sender)
             .await?;
+        EIS_OPENED.store(true, Ordering::Release);
         enum Ev {
             Ei(Result<EiEvent, reis::Error>),
             Gone,
@@ -391,38 +416,47 @@ async fn receive(
                 Ev::Gone => anyhow::bail!("RemoteDesktop EIS connection closed"),
                 _ => {}
             }
-            for command in rx.try_iter().take(512) {
-                match command {
-                    Command::Quit => return Ok(()),
-                    Command::Warp(x, y) => move_pointer(&emulation.devices, &model, x, y),
-                    Command::Input(event) => {
-                        if matches!(event, InputEvent::Scroll { .. }) {
-                            scroll_active = Some(Instant::now());
-                        }
-                        let changed = match event {
-                            InputEvent::Key { usage, down } => {
-                                if down {
-                                    emulation.keys.insert(usage)
-                                } else {
-                                    emulation.keys.remove(&usage)
-                                }
+            // A full batch means more may be queued: go on at once, so a key-up never
+            // waits for the next input event.
+            loop {
+                let mut taken = 0;
+                for command in rx.try_iter().take(512) {
+                    taken += 1;
+                    match command {
+                        Command::Quit => return Ok(()),
+                        Command::Warp(x, y) => move_pointer(&emulation.devices, &model, x, y),
+                        Command::Input(event) => {
+                            if matches!(event, InputEvent::Scroll { .. }) {
+                                scroll_active = Some(Instant::now());
                             }
-                            InputEvent::Button { button, down } => {
-                                if down {
-                                    emulation.buttons.insert(button)
-                                } else {
-                                    emulation.buttons.remove(&button)
+                            let changed = match event {
+                                InputEvent::Key { usage, down } => {
+                                    if down {
+                                        emulation.keys.insert(usage)
+                                    } else {
+                                        emulation.keys.remove(&usage)
+                                    }
                                 }
+                                InputEvent::Button { button, down } => {
+                                    if down {
+                                        emulation.buttons.insert(button)
+                                    } else {
+                                        emulation.buttons.remove(&button)
+                                    }
+                                }
+                                _ => true,
+                            };
+                            if changed {
+                                inject(&emulation.devices, &model, &event);
                             }
-                            _ => true,
-                        };
-                        if changed {
-                            inject(&emulation.devices, &model, &event);
                         }
                     }
+                    for d in &emulation.devices {
+                        d.device().frame(connection.serial(), monotonic_micros());
+                    }
                 }
-                for d in &emulation.devices {
-                    d.device().frame(connection.serial(), monotonic_micros());
+                if taken < 512 {
+                    break;
                 }
             }
             if scroll_active.is_some_and(|t| t.elapsed() >= Duration::from_millis(150)) {
@@ -440,11 +474,13 @@ async fn receive(
         Ok(())
     };
     let cancelled = async {
-        loop {
-            if cancel.load(Ordering::Acquire) || shared.stopped() {
-                break;
+        // Dropping the platform writes the eventfd; it is never read, so it stays readable.
+        if let Ok(fd) = async_io::Async::new(cancel_wake) {
+            while !cancel.load(Ordering::Acquire) && !shared.stopped() {
+                if fd.readable().await.is_err() {
+                    break;
+                }
             }
-            async_io::Timer::after(Duration::from_millis(25)).await;
         }
     };
     let result = match futures_util::future::select(Box::pin(result), Box::pin(cancelled)).await {

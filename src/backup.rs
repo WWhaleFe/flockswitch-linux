@@ -98,6 +98,9 @@ fn keep_device_network(cfg: &mut Config, from: &Config) {
 pub fn restore(current: &Config, loaded: Config) -> Config {
     let mut next = Config { setup: current.setup.clone(), ..loaded };
     keep_device_network(&mut next, current);
+    // This computer's name and port stay too; the file may carry them (export writes them).
+    next.network.name = current.network.name.clone();
+    next.network.port = current.network.port;
     next
 }
 
@@ -619,9 +622,12 @@ mod tests {
         let mut other = Config::default();
         other.network.on = true;
         other.network.peers.push(flock_net::PeerConfig::default());
+        other.network.name = "mine".into();
+        other.network.port = 47199;
         let next = restore(&other, loaded);
         assert!(next.network.on && next.network.peers.len() == 1);
-        assert_eq!(next.network.name, "desk");
+        assert_eq!(next.network.name, "mine");
+        assert_eq!(next.network.port, 47199);
     }
 
     #[test]

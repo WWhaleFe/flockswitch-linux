@@ -199,6 +199,8 @@ fn publish_error(config: &NetConfig, error: String) {
         },
     );
 }
+const PLATFORM_RETRY_MIN: Duration = Duration::from_secs(5);
+const PLATFORM_RETRY_MAX: Duration = Duration::from_secs(60);
 pub fn spawn(shared: Arc<Shared>) -> JoinHandle<()> {
     thread::Builder::new()
         .name("network".into())
@@ -210,7 +212,13 @@ pub fn spawn(shared: Arc<Shared>) -> JoinHandle<()> {
             let mut version = None;
             let mut cached = None;
             let mut edges_allowed = false;
-            let mut platform_retry = Instant::now() - Duration::from_secs(5);
+            let mut platform_retry = Instant::now() - PLATFORM_RETRY_MIN;
+            // Wait before the next try; doubles after each failed start, reset after a success.
+            let mut platform_wait = PLATFORM_RETRY_MIN;
+            // The user cancelled or denied the portal dialog: only a settings change (or
+            // turning sharing off and on) asks again.
+            let mut platform_blocked = false;
+            let mut starting: Option<std::sync::mpsc::Receiver<anyhow::Result<Arc<dyn Platform>>>> = None;
             let mut retry = Instant::now() - Duration::from_secs(5);
             let mut key_retry = Instant::now() - Duration::from_secs(2);
             while !shared.stopped() {
@@ -235,15 +243,30 @@ pub fn spawn(shared: Arc<Shared>) -> JoinHandle<()> {
                             s.stop();
                         }
                         platform = None;
-                        platform_retry = Instant::now() - Duration::from_secs(5);
+                        starting = None;
+                        platform_wait = PLATFORM_RETRY_MIN;
+                        platform_blocked = false;
+                        platform_retry = Instant::now() - PLATFORM_RETRY_MIN;
                         crate::net_wayland::disable();
                     }
                 } else {
+                    // Changed settings are a new request: ask again at once.
+                    if previous.as_ref() != Some(config) && platform.is_none() {
+                        platform_blocked = false;
+                        platform_wait = PLATFORM_RETRY_MIN;
+                        platform_retry = Instant::now() - PLATFORM_RETRY_MIN;
+                    }
+                    if platform.is_some() && crate::net_wayland::eis_opened() {
+                        platform_wait = PLATFORM_RETRY_MIN;
+                    }
                     // The Wayland EIS session ends for good when the compositor drops it:
-                    // throw the platform away and build a new one after a pause.
+                    // throw the platform away and build a new one after a pause. A session
+                    // that never opened (dialog cancelled or denied) is not asked again.
                     if platform.is_some() {
                         if let Some(reason) = crate::net_wayland::eis_failed() {
-                            log::warn!("network: input session ended, restarting: {reason}");
+                            let opened = crate::net_wayland::eis_opened();
+                            let retry_later = opened || crate::net_wayland::eis_no_answer();
+                            log::warn!("network: input session ended{}: {reason}", if retry_later { ", restarting" } else { "" });
                             LIVE.lock().unwrap().take();
                             if let Some(s) = service.take() {
                                 s.stop();
@@ -251,21 +274,55 @@ pub fn spawn(shared: Arc<Shared>) -> JoinHandle<()> {
                             mode = "local".into();
                             platform = None;
                             platform_retry = Instant::now();
+                            if opened {
+                                platform_wait = PLATFORM_RETRY_MIN;
+                            } else if retry_later {
+                                platform_wait = (platform_wait * 2).min(PLATFORM_RETRY_MAX);
+                            } else {
+                                platform_blocked = true;
+                            }
                             publish_error(config, reason);
                         }
                     }
-                    // A failed start (portal not answering yet) is tried again later.
-                    if platform.is_none() && platform_retry.elapsed() >= Duration::from_secs(5) {
+                    // A start that failed (no EIS yet, portal not answering) is tried again
+                    // later. It runs on its own thread: probing the portal can take seconds
+                    // and the supervisor must keep answering stop and settings changes.
+                    if let Some(rx) = &starting {
+                        match rx.try_recv() {
+                            Ok(Ok(p)) => {
+                                platform = Some(p);
+                                starting = None;
+                            }
+                            Ok(Err(e)) => {
+                                platform_retry = Instant::now();
+                                platform_wait = (platform_wait * 2).min(PLATFORM_RETRY_MAX);
+                                publish_error(config, format!("{e:#}"));
+                                starting = None;
+                            }
+                            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                            Err(std::sync::mpsc::TryRecvError::Disconnected) => starting = None,
+                        }
+                    }
+                    if platform.is_none()
+                        && starting.is_none()
+                        && !platform_blocked
+                        && platform_retry.elapsed() >= platform_wait
+                    {
                         platform_retry = Instant::now();
-                        let result: anyhow::Result<Arc<dyn Platform>> =
-                            if crate::edge_wayland::session_is_wayland() {
-                                crate::net_wayland::Wayland::new(shared.clone())
-                                    .map(|p| Arc::new(p) as Arc<dyn Platform>)
-                            } else {
-                                crate::net_x11::X11::new().map(|p| Arc::new(p) as Arc<dyn Platform>)
-                            };
-                        match result {
-                            Ok(p) => platform = Some(p),
+                        let (tx, rx) = std::sync::mpsc::channel();
+                        let wayland_shared = shared.clone();
+                        let spawned = thread::Builder::new().name("network-platform".into()).spawn(move || {
+                            let result: anyhow::Result<Arc<dyn Platform>> =
+                                if crate::edge_wayland::session_is_wayland() {
+                                    crate::net_wayland::Wayland::new(wayland_shared)
+                                        .map(|p| Arc::new(p) as Arc<dyn Platform>)
+                                } else {
+                                    crate::net_x11::X11::new().map(|p| Arc::new(p) as Arc<dyn Platform>)
+                                };
+                            let _ = tx.send(result);
+                        });
+                        match spawned {
+                            Ok(_) => starting = Some(rx),
                             Err(e) => publish_error(config, format!("{e:#}")),
                         }
                     }
