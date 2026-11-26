@@ -368,7 +368,6 @@ impl Watch {
             self.announced = false;
             changed = true;
         }
-        let active = self.active();
         if !std::mem::replace(&mut self.announced, true) {
             crate::edge::announce(&self.cfg);
         }
@@ -384,7 +383,7 @@ impl Watch {
                 self.last_switch_text = text;
             }
             let arrived = now_here && !self.sit.mouse_here && !first;
-            if arrived && active && self.cfg.edges.place_cursor {
+            if arrived && self.cfg.logitech_edges_allowed() && self.cfg.edges.place_cursor {
                 let edge = self.landing_channel.take().and_then(|c| self.cfg.edges.edge_for(c));
                 if let Some(edge) = edge.filter(|_| !std::mem::replace(&mut self.told_place, true)) {
                     log::info!("mouse is back: Wayland lets no app move the cursor, so it is not put at the {} edge", edge.name());

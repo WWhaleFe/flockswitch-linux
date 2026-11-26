@@ -963,8 +963,11 @@ impl Config {
     /// Loads the config, writing the defaults on first run so users have a file to edit.
     pub fn load_or_create() -> Result<Config> {
         let path = Self::path();
-        Self::migrate_test_network(&dirs::config_dir().unwrap_or_else(|| PathBuf::from(".")))
-            .context("migrating test-build network settings")?;
+        // A failed import of test-build networking must never cost the user's own
+        // settings: it is logged, left unmarked and tried again at the next start.
+        if let Err(e) = Self::migrate_test_network(&dirs::config_dir().unwrap_or_else(|| PathBuf::from("."))) {
+            log::warn!("migrating test-build network settings: {e:#}");
+        }
         if !path.exists() {
             let cfg = Config::default();
             cfg.save()?;

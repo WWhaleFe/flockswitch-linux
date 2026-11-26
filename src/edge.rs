@@ -291,7 +291,7 @@ fn watch(shared: Arc<Shared>) {
                 last_switch_text = text;
             }
             let arrived = now_here && !mouse_here && !first;
-            if arrived && active && cfg.edges.place_cursor {
+            if arrived && cfg.logitech_edges_allowed() && cfg.edges.place_cursor {
                 // The mouse has come back from the channel it was sent to: put the
                 // cursor at that channel's edge, as if it had come in from there.
                 if let Some(edge) = landing_channel.take().and_then(|c| cfg.edges.edge_for(c)) {

@@ -16,7 +16,13 @@ impl Clipboard {
         match f(owner.as_mut()?) {
             Ok(value) => Some(value),
             Err(arboard::Error::ContentNotAvailable) => None,
-            Err(e) => { log::warn!("clipboard: {e}"); None }
+            Err(e) => {
+                // A lost display connection (X server or XWayland restarted) stays lost:
+                // drop the handle so the next call opens a fresh one.
+                log::warn!("clipboard: {e}");
+                *owner = None;
+                None
+            }
         }
     }
     pub fn text(&self) -> Option<String> { self.with(|c| c.get_text()) }

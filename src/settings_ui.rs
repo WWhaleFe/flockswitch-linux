@@ -885,23 +885,17 @@ impl eframe::App for SettingsApp {
                     }
                     match self.tab {
                         Tab::Network => self.network_section(ui, t, p),
-                        Tab::Switching => {
-                            let sub = self.follows_master();
-                            if sub { self.follow_banner(ui, p, t); }
-                            ui.add_enabled_ui(!sub, |ui| self.switching_section(ui, t, p));
-                        }
+                        // As on the Mac: a sub keeps its own Logitech switching and devices
+                        // (its edge channels stay its own); only the effects follow the master.
+                        Tab::Switching => self.switching_section(ui, t, p),
                         Tab::Effects => {
                             let sub = self.follows_master();
                             if sub { self.follow_banner(ui, p, t); }
                             ui.add_enabled_ui(!sub, |ui| self.effects_section(ui, t, p));
                         }
                         Tab::Devices => {
-                            let sub = self.follows_master();
-                            if sub { self.follow_banner(ui, p, t); }
-                            ui.add_enabled_ui(!sub, |ui| {
-                                self.master_section(ui, t, p);
-                                self.group_section(ui, t, p);
-                            });
+                            self.master_section(ui, t, p);
+                            self.group_section(ui, t, p);
                         }
                         Tab::General => {
                             self.setup_card(ui, t, p);
