@@ -70,6 +70,9 @@ pub enum Msg {
         /// Optional 2.1 features the sender understands (see `FEATURES`); 2.0 peers send none.
         #[serde(default)]
         features: Vec<String>,
+        /// Listening port, absent in older peers. Never use the inbound source port.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        listen_port: Option<u16>,
     },
     PairRequest,
     /// Master to sub: where the sub sits around the master's screen (None: nowhere).
@@ -177,7 +180,8 @@ mod tests {
     #[test]
     fn hello_from_2_0_has_no_features_and_new_messages_round_trip() {
         let old = r#"{"type":"Hello","data":{"proto":1,"id":"a","name":"n","os":"mac","app_version":"2.0.0","role":"sub"}}"#;
-        let Msg::Hello { features, .. } = serde_json::from_str(old).unwrap() else { panic!() };
+        let Msg::Hello { features, listen_port, .. } = serde_json::from_str(old).unwrap() else { panic!() };
+        assert_eq!(listen_port, None);
         assert!(features.is_empty());
         let group = Msg::Group {
             cells: vec![crate::Cell { id: "a".into(), col: 2, row: 1 }],

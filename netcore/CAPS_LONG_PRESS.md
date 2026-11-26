@@ -34,48 +34,28 @@ back up, with the real time between them. The time comes from one of two sources
     that press in milliseconds. It is used instead of the time between the two events and
     describes that one press only.
 
-If neither is provided, a synthetic down+up pair (as the Mac capture sends today) reads
-as a press of about 0 ms: always a short tap, never a real Caps Lock. That is the legacy
-behaviour and still works for the Korean/English switch; only the long press is lost.
+If neither hook is provided, a synthetic down/up pair reads as a press of about
+0 ms. It can switch Korean/English but cannot preserve a long hold.
 
-## What the mac capture code must change
+## Current mac capture
 
-Today `src/net.rs` (the `flagsChanged` branch, event kind 12) reacts to a flip of bit 16
-(`1 << 16`) in the event flags with `caps_press(...)` and, for each new press, sends
-`Key { usage: 0x39, down: true }` and `Key { usage: 0x39, down: false }` back to back.
-Both leave within microseconds, so netcore sees a zero length press.
+`src/caps_macos.m` observes raw keyboard usage 0x39 through IOHIDManager. It sends
+physical down and up edges independently of alpha-shift `flagsChanged`. The latter
+can arrive only on release when Caps Lock switches input sources, and cannot measure
+a hold or distinguish two rapid presses.
 
-Required change, either of:
+The raw observer combines held state across keyboards and releases a held key when
+its device is removed. It opens devices without seizing them. The event tap continues
+to swallow local keyboard events, including Caps Lock state flips.
 
-A. Real timing (preferred). On the flag flip that begins a press send only
-   `Key { usage: 0x39, down: true }` and remember the time (`Instant::now()`). Send
-   `Key { usage: 0x39, down: false }` when the press ends. The end of a press is not a
-   second flip when macOS's "use Caps Lock to switch input source" is on (a short press
-   flips on and back off at once on release; `caps_press` already recognises that off as
-   belonging to the same press within `CAPS_SAME_PRESS`, 400 ms). Rules for the end:
-   - plain Caps Lock: the flip to off at the next press is not the release of the first;
-     the release has to come from the key itself. Use a key-up of keycode 0x39 if the
-     event tap delivers one (on the current capture only flagsChanged, kind 12, arrives for
-     Caps Lock; check it on hardware), or
-     treat a flip to on followed by a flip to off within `CAPS_SAME_PRESS` as down/up with
-     those two times, and a lone flip to on as down with the up sent on the next flip or
-     when the physical key is seen up (poll `CGEventSourceKeyState(.., 0x39)` every
-     10-20 ms while pending);
-   - never send the up before the key is physically up, or the length is lost again.
-   - Send the two events from the capture thread at the moments they happen (do not
-     queue them up and send both at the end).
+`src/net.rs` forwards those physical edges and implements `Platform::captured_at`.
+IOHIDValue timestamps are converted to monotonic `Instant`s and consumed in channel
+order, so a busy capture or service loop does not collapse a long hold into a tap.
+The timestamp queue is cleared when a capture session starts.
 
-B. Keep the pair, add the hint. Keep sending down+up on the flip, but measure the press
-   (time from the flip to on until the release as above) in the capture thread, store it,
-   and implement `Platform::caps_hold_ms` for the Mac platform to return it once, right
-   after the up event has been consumed (clear it on read so it describes one press only).
-   For this the up must still be sent after the physical release, not at the flip.
+Tests cover rapid physical presses, repeated held state, a batched 700 ms press,
+and netcore's short/long press decisions at the 300 ms boundary. Hardware input and
+input-source switching still need a macOS session with Input Monitoring permission.
 
-In both cases the key remains swallowed below the event tap as it is now, the
-Korean/English tap and the 300 ms boundary are decided only in netcore, and nothing else
-in the capture changes. Tests: netcore has unit tests for the boundary
-(`collapsed_caps_events_use_hold_hint_at_300ms_boundary`) and for down/up with a gap; the
-mac side needs a test of the capture helper for a press of 120 ms and one of 700 ms.
-
-Other ports: Windows, Linux and Android are not mac sources, so `caps_long_press` does
-nothing there.
+Other ports: Windows, Linux and Android are not mac sources, so `caps_long_press`
+does nothing there.

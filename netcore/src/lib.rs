@@ -135,7 +135,9 @@ pub struct Hooks {
     pub on_peer_changed: Box<dyn Fn(PeerConfig) + Send + Sync>,
     /// On a sub: the master's settings arrived or changed. The app applies them.
     pub on_master_settings: Box<dyn Fn(MasterSettings) + Send + Sync>,
-    /// On a master: a sub sent edited key rules. The app saves them.
+    /// Optional fallible persistence before a master's key edit is acknowledged.
+    pub persist_key_rules: Box<dyn Fn(&BTreeMap<String, DirRules>) -> anyhow::Result<()> + Send + Sync>,
+    /// On a master: edited key rules were accepted and persisted.
     pub on_key_rules: Box<dyn Fn(BTreeMap<String, DirRules>) + Send + Sync>,
 }
 impl Default for Hooks {
@@ -147,6 +149,7 @@ impl Default for Hooks {
             on_peer_changed: Box::new(|_| {}),
             on_master_settings: Box::new(|_| {}),
             on_key_rules: Box::new(|_| {}),
+            persist_key_rules: Box::new(|_| Ok(())),
         }
     }
 }

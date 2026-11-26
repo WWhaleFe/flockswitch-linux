@@ -124,6 +124,11 @@ impl Outgoing {
         })
     }
 
+    /// The regular files that passed the count, name and size checks, in wire order.
+    pub(crate) fn file_paths(&self) -> Option<&[PathBuf]> {
+        match &self.source { Source::Files(paths, ..) => Some(paths), _ => None }
+    }
+
     /// An image (PNG) or long text, held in memory (both are bounded by their limits).
     pub fn bytes(id: u32, kind: ClipKind, name: &str, data: Vec<u8>) -> Self {
         let total = data.len() as u64;

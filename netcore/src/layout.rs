@@ -65,9 +65,12 @@ pub fn with_master(cells: &[Cell], master: &str) -> Vec<Cell> {
             .flat_map(|row| (0..COLS).map(move |col| (col, row)))
             .filter(|&at| !cells.iter().any(|c| (c.col, c.row) == at))
             .min_by_key(|&(col, row)| col.abs_diff(MASTER_CELL.0) + row.abs_diff(MASTER_CELL.1));
-        if let Some((col, row)) = free {
-            cells.push(Cell { id: master.into(), col, row });
-        }
+        let (col, row) = free.unwrap_or_else(|| {
+            // A full saved grid must still include the master. Evict the middle cell.
+            cells.retain(|c| (c.col, c.row) != MASTER_CELL);
+            MASTER_CELL
+        });
+        cells.push(Cell { id: master.into(), col, row });
     }
     cells
 }
@@ -143,6 +146,15 @@ mod tests {
         assert_eq!(with_master(&[cell("x", 0, 0)], "m"), vec![cell("x", 0, 0), cell("m", 2, 1)]);
         assert_eq!(with_master(&[cell("m", 0, 0)], "m"), vec![cell("m", 0, 0)]);
     }
+    #[test]
+    fn full_grid_still_reserves_a_master_cell() {
+        let full: Vec<_> = (0..ROWS).flat_map(|row| (0..COLS).map(move |col| cell(&format!("p{col}{row}"), col, row))).collect();
+        let fixed = with_master(&full, "master");
+        assert_eq!(fixed.len(), (COLS * ROWS) as usize);
+        assert!(fixed.contains(&cell("master", MASTER_CELL.0, MASTER_CELL.1)));
+        assert_eq!(valid_cells(&fixed), fixed);
+    }
+
     #[test]
     fn master_never_loses_its_cell() {
         // Someone else holds the middle: the master takes the nearest free cell.

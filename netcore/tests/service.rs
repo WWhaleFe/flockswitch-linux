@@ -497,6 +497,7 @@ fn silent_peer_triggers_two_second_safety_return() {
                 app_version: "test".into(),
                 role: Role::Sub,
                 features: vec![],
+                listen_port: None,
             },
         )
         .unwrap();
@@ -1041,6 +1042,7 @@ impl Raw {
             app_version: "test".into(),
             role: Role::Sub,
             features,
+            listen_port: None,
         })
         .unwrap();
         Self { stream, id: identity.id, _dir: None }

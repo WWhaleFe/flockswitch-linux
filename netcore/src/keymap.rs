@@ -277,24 +277,31 @@ impl Ctx<'_> {
     /// `out` with the held modifiers in `release` lifted off the receiver first and put
     /// back after.
     fn around(&self, held: &HashSet<u16>, release: impl Fn(u16) -> bool, out: Vec<InputEvent>) -> Vec<InputEvent> {
-        let lifted: Vec<u16> = (LCTRL..=0xe7).filter(|u| held.contains(u) && release(*u)).collect();
+        let targets: HashSet<u16> = held.iter().filter(|&&u| release(u)).map(|&u| self.map_mod(u)).collect();
+        // Lift and restore a target once, including every source that shares it.
+        let lifted: Vec<u16> = (LCTRL..=0xe7).filter(|u| held.contains(u) && targets.contains(&self.map_mod(*u))).collect();
+        let mut emitted = HashSet::new();
+        let mut active: HashSet<u16> = held.iter().map(|&u| self.map_mod(u)).collect();
         let mut events = vec![];
         let mut masked = false;
         for &u in &lifted {
             let to = self.map_mod(u);
+            if !emitted.insert(to) { continue; }
             if !masked && self.needs_mask(to) {
-                // Ctrl still down at the receiver once the lifts so far are done?
-                let ctrl = held.iter().any(|&h| !lifted.iter().take_while(|&&l| l != u).any(|&l| l == h) && is_kind(self.map_mod(h), 0));
+                // Count destination keys already lifted, including shared targets.
+                let ctrl = active.iter().any(|&to| is_kind(to, 0));
                 if !ctrl {
                     events.extend(tap(LCTRL));
                 }
                 masked = true;
             }
             events.push(key(to, false));
+            active.remove(&to);
         }
         self.lifted.borrow_mut().extend(&lifted);
         events.extend(out);
-        events.extend(lifted.iter().map(|&u| key(self.map_mod(u), true)));
+        emitted.clear();
+        events.extend(lifted.iter().map(|&u| self.map_mod(u)).filter(|&to| emitted.insert(to)).map(|to| key(to, true)));
         events
     }
 }
@@ -339,7 +346,11 @@ impl KeyMapper {
                 return vec![];
             }
             let to = cx.map_mod(usage);
-            if self.restored.remove(&usage) && cx.needs_mask(to) && !self.live().iter().any(|&h| is_kind(cx.map_mod(h), 0)) {
+            let restored = self.restored.remove(&usage);
+            if (LCTRL..=0xe7).contains(&usage) && self.live().iter().any(|&u| cx.map_mod(u) == to) {
+                return vec![];
+            }
+            if restored && cx.needs_mask(to) && !self.live().iter().any(|&h| is_kind(cx.map_mod(h), 0)) {
                 // Pressed again after a chord: its release must not look like a lone Alt or Win tap.
                 return [tap(LCTRL).to_vec(), vec![key(to, false)]].concat();
             }
@@ -347,8 +358,10 @@ impl KeyMapper {
         }
         if self.sent.contains(&usage) {
             // Auto-repeat of a key already sent as itself.
-            return vec![key(cx.map_mod(usage), true)];
+            return if (LCTRL..=0xe7).contains(&usage) { vec![] } else { vec![key(cx.map_mod(usage), true)] };
         }
+        let shared_target = (LCTRL..=0xe7).contains(&usage)
+            && self.live().iter().any(|&u| cx.map_mod(u) == cx.map_mod(usage));
         self.held.insert(usage);
         if self.swallow.contains(&usage) || (usage == CAPS && self.caps.is_some()) {
             return vec![];
@@ -362,7 +375,7 @@ impl KeyMapper {
         }
         self.rewritten.remove(&usage);
         self.sent.insert(usage);
-        vec![key(cx.map_mod(usage), true)]
+        if shared_target { vec![] } else { vec![key(cx.map_mod(usage), true)] }
     }
     /// A duration measured by capture for this release, including collapsed down/up pairs.
     pub(crate) fn caps_hold_ms(&mut self, ms: u64) {
@@ -867,6 +880,34 @@ mod rules_tests {
         DirRules { mod_mode: ModMode::Off, ..DirRules::default_for(src, dst) }
     }
     fn taps(usage: u16) -> Vec<InputEvent> { vec![k(usage, true), k(usage, false)] }
+
+    #[test]
+    fn shared_modifier_target_stays_down_until_last_source_release() {
+        let mut r = off(Os::Mac, Os::Windows);
+        r.mods = BTreeMap::from([(LCTRL, LCTRL), (LGUI, LCTRL)]);
+        let out = run_at(Os::Mac, Os::Windows, &r, vec![k(LCTRL, true), k(LGUI, true), k(LCTRL, false), k(4, true), k(4, false), k(LGUI, false)]);
+        assert_eq!(out, vec![k(LCTRL, true), k(4, true), k(4, false), k(LCTRL, false)]);
+    }
+
+    #[test]
+    fn chord_lifts_each_shared_target_once_and_restores_all_sources() {
+        let mut r = off(Os::Mac, Os::Windows);
+        r.mods = BTreeMap::from([(LCTRL, LCTRL), (LGUI, LCTRL)]);
+        r.hangul_src = vec![HangulKey::Lang1];
+        r.hangul_dst = HangulKey::RightAlt;
+        let out = run_at(Os::Mac, Os::Windows, &r, vec![k(LCTRL, true), k(LGUI, true), k(LANG1, true), k(LANG1, false), k(LCTRL, false), k(LGUI, false)]);
+        assert_eq!(out, vec![k(LCTRL, true), k(LCTRL, false), k(RALT, true), k(RALT, false), k(LCTRL, true), k(LCTRL, false)]);
+    }
+
+    #[test]
+    fn shared_ctrl_target_does_not_hide_the_mask_after_it_was_lifted() {
+        let mut r = off(Os::Mac, Os::Windows);
+        r.mods = BTreeMap::from([(LCTRL, LCTRL), (LGUI, LCTRL)]);
+        r.hangul_src = vec![HangulKey::Lang1];
+        r.hangul_dst = HangulKey::RightAlt;
+        let out = run_at(Os::Mac, Os::Windows, &r, vec![k(LCTRL, true), k(LGUI, true), k(LALT, true), k(LANG1, true)]);
+        assert_eq!(&out[..7], &[k(LCTRL, true), k(LALT, true), k(LCTRL, false), k(LCTRL, true), k(LCTRL, false), k(LALT, false), k(RALT, true)]);
+    }
 
     #[test]
     fn modifier_tables() {

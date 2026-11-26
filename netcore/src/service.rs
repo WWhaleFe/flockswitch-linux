@@ -270,6 +270,7 @@ struct Link {
     features: Vec<String>,
     fp: String,
     addr: SocketAddr,
+    listen_port: Option<u16>,
     outgoing: bool,
     paired: bool,
     last_rx: Instant,
@@ -425,6 +426,7 @@ impl Control {
             name: computer_name(&self.config),
             os: self.platform.os(),
             role: self.config.role,
+            listen_port: self.status.lock().unwrap().me.port,
             client: self.client.clone(),
             server: self.server.clone(),
             events: self.events.clone(),
@@ -720,14 +722,14 @@ impl Control {
         }
         let id = p.peer.clone();
         if let Some(l) = self.links.get_mut(&id) {
-            if !l.outgoing {
+            if !l.outgoing && l.listen_port.is_none() {
                 if let Some(addr) = self
                     .discovered
                     .iter()
                     .find(|p| p.id == id && p.fingerprint == l.fp)
                     .and_then(|p| p.addresses.first())
                 {
-                    l.addr = *addr;
+                    l.addr.set_port(addr.port());
                 }
             }
             l.paired = true;
@@ -786,9 +788,11 @@ impl Control {
                         return;
                     }
                     link.paired = true;
-                    if let Ok(addr) = p.last_addr.parse() {
-                        if !link.outgoing {
-                            link.addr = addr;
+                    if let Ok(addr) = p.last_addr.parse::<SocketAddr>() {
+                        if !link.outgoing && link.listen_port.is_none() {
+                            // The inbound socket supplies the current IP, the saved
+                            // address only supplies a legacy peer's listening port.
+                            link.addr.set_port(addr.port());
                         }
                     }
                 }
@@ -799,7 +803,15 @@ impl Control {
                     }
                     self.disconnect(&id, "duplicate");
                 }
-                self.retry.remove(&id);
+                if link.paired {
+                    if let Some(p) = self.config.peers.iter_mut().find(|p| p.id == id) {
+                        let addr = link.addr.to_string();
+                        if p.last_addr != addr {
+                            p.last_addr = addr;
+                            (self.hooks.on_peer_changed)(p.clone());
+                        }
+                    }
+                }
                 self.peer_features.insert(id.clone(), link.features.clone());
                 self.links.insert(id.clone(), link);
                 if pair {
@@ -870,6 +882,9 @@ impl Control {
                     Msg::KeyRules(keys) => {
                         if self.config.role == Role::Master && l.role == Role::Sub {
                             self.key_rules_edited(keys);
+                            // Echo even an unchanged edit, so a lost acknowledgement
+                            // can be recovered by retransmitting the durable request.
+                            self.told.remove(&id);
                         }
                     }
                     Msg::MasterSettings(settings) => {
@@ -881,9 +896,7 @@ impl Control {
                             }
                             settings.apply_to(&mut self.config);
                             self.status.lock().unwrap().following = Some(settings.master_name.clone());
-                            if self.master.as_ref() != Some(&settings) {
-                                (self.hooks.on_master_settings)(settings.clone());
-                            }
+                            (self.hooks.on_master_settings)(settings.clone());
                             self.master = Some(settings);
                         }
                     }
@@ -892,6 +905,7 @@ impl Control {
                             if sent == t {
                                 l.rtt = Some(at.elapsed().as_secs_f64() * 1000.0);
                                 l.ping = None;
+                                self.retry.remove(&id);
                             }
                         }
                     }
@@ -1052,14 +1066,7 @@ impl Control {
             let Some(features) = self.peer_features.get(&p.id).filter(|f| f.iter().any(|f| f == "group")) else {
                 continue;
             };
-            let stored: Option<SocketAddr> = p.last_addr.parse().ok();
-            let addr = match (self.links.get(&p.id), stored) {
-                // A live link tells where the computer really is now; an inbound one only
-                // knows the port as the default, so keep a stored port.
-                (Some(l), Some(s)) if !l.outgoing => SocketAddr::new(l.addr.ip(), s.port()).to_string(),
-                (Some(l), _) => l.addr.to_string(),
-                (None, _) => p.last_addr.clone(),
-            };
+            let addr = self.links.get(&p.id).map_or_else(|| p.last_addr.clone(), |l| l.addr.to_string());
             roster.push(Member {
                 id: p.id.clone(),
                 name: p.name.clone(),
@@ -1226,6 +1233,10 @@ impl Control {
             keys.into_iter().filter(|(k, _)| keymap::parse_pair(k).is_some()).collect();
         if self.config.role == Role::Master {
             if self.config.keys != keys {
+                if let Err(e) = (self.hooks.persist_key_rules)(&keys) {
+                    log::warn!("key rules not saved, leaving edit unacknowledged: {e:#}");
+                    return;
+                }
                 self.config.keys = keys.clone();
                 self.local(true);
                 (self.hooks.on_key_rules)(keys);
@@ -1655,13 +1666,20 @@ impl Control {
         if limit > 0 {
             let files = self.platform.clipboard_files();
             if !files.is_empty() {
-                let sig = files_sig(&files);
-                if !self.clip_wanted(peer, &sig) {
-                    return;
-                }
                 let id = self.take_transfer_id();
                 match Outgoing::files(id, &files, limit) {
-                    Ok(out) => self.begin_send(peer, "files", out, sig),
+                    Ok(out) => {
+                        // Hash exactly what will travel, after filtering and size checks.
+                        let sig = match files_sig(out.file_paths().expect("file transfer")) {
+                            Ok(sig) => sig,
+                            Err(e) => {
+                                log::info!("clipboard files not read: {e:#}");
+                                self.transfer_note("send", "files", "failed");
+                                return;
+                            }
+                        };
+                        if self.clip_wanted(peer, &sig) { self.begin_send(peer, "files", out, sig); }
+                    }
                     Err(e) => {
                         log::info!("clipboard files not sent: {e:#}");
                         let large = e.to_string().starts_with("too large");
@@ -1879,9 +1897,13 @@ impl Control {
             .unwrap_or_else(|| self.config.config_dir.join("flockswitch").join("received"));
         match incoming.finish(&dest) {
             Ok(Received::Files(saved)) => {
-                self.platform.set_clipboard_files(&saved);
-                self.clip_received(peer, files_sig(&saved));
+                // Hashing reads every file back, so do it before the clipboard is set: anyone
+                // who sees the files on the clipboard then also sees the transfer as done.
+                if let Ok(sig) = files_sig(&saved) {
+                    self.clip_received(peer, sig);
+                }
                 self.transfer_finished(Some(dest.display().to_string()));
+                self.platform.set_clipboard_files(&saved);
             }
             Ok(Received::Image(png)) => {
                 self.platform.set_clipboard_image_png(&png);
@@ -2000,6 +2022,7 @@ struct Worker {
     name: String,
     os: Os,
     role: Role,
+    listen_port: u16,
     client: Arc<rustls::ClientConfig>,
     server: Arc<rustls::ServerConfig>,
     events: Sender<Event>,
@@ -2068,6 +2091,7 @@ impl Worker {
                 app_version: env!("CARGO_PKG_VERSION").into(),
                 role: self.role,
                 features: proto::FEATURES.iter().map(|f| f.to_string()).collect(),
+                listen_port: Some(self.listen_port),
             },
         )?;
         let (tx, rx) = mpsc::channel();
@@ -2141,6 +2165,7 @@ impl Worker {
                         os,
                         role,
                         features,
+                        listen_port,
                         ..
                     } = msg
                     else {
@@ -2164,12 +2189,10 @@ impl Worker {
                         "unexpected device"
                     );
                     *remote = Some(id.clone());
-                    // Hello has no listen port. Discovery or saved config supplies it on inbound links.
-                    let addr = if self.outgoing {
-                        self.addr
-                    } else {
-                        SocketAddr::new(self.addr.ip(), 47160)
-                    };
+                    let listen_port = listen_port.filter(|&port| port != 0);
+                    // Keep the socket's real IP and the advertised listening port.
+                    let mut addr = self.addr;
+                    if !self.outgoing { addr.set_port(listen_port.unwrap_or(47160)); }
                     self.events.send(Event::Connected(
                         id,
                         Link {
@@ -2182,6 +2205,7 @@ impl Worker {
                             features,
                             fp: fp.clone(),
                             addr,
+                            listen_port,
                             outgoing: self.outgoing,
                             paired: false,
                             last_rx: Instant::now(),
@@ -2228,20 +2252,28 @@ fn clip_sig(kind: &[u8], parts: &[&[u8]]) -> Vec<u8> {
     }
     h.finalize().to_vec()
 }
-/// Files are told apart by path, size and modification time, without reading them.
-fn files_sig(files: &[std::path::PathBuf]) -> Vec<u8> {
-    let mut parts = Vec::new();
-    for f in files {
-        let meta = std::fs::metadata(f).ok();
-        let modified = meta
-            .as_ref()
-            .and_then(|m| m.modified().ok())
-            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-            .map_or(0, |d| d.as_nanos());
-        parts.push(format!("{}|{}|{}", f.display(), meta.map_or(0, |m| m.len()), modified).into_bytes());
+/// Ordered file contents, independent of local paths, collision suffixes and mtimes.
+fn files_sig(files: &[std::path::PathBuf]) -> Result<Vec<u8>> {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(b"files");
+    h.update((files.len() as u64).to_le_bytes());
+    let mut buffer = [0; 64 * 1024];
+    for path in files {
+        anyhow::ensure!(std::fs::metadata(path)?.is_file(), "not a regular clipboard file");
+        let mut file = std::fs::File::open(path)?;
+        let size = file.metadata()?.len();
+        h.update(size.to_le_bytes());
+        let mut read = 0u64;
+        loop {
+            let n = file.read(&mut buffer)?;
+            if n == 0 { break; }
+            read += n as u64;
+            h.update(&buffer[..n]);
+        }
+        anyhow::ensure!(read == size, "clipboard file changed while reading");
     }
-    let refs: Vec<&[u8]> = parts.iter().map(Vec::as_slice).collect();
-    clip_sig(b"files", &refs)
+    Ok(h.finalize().to_vec())
 }
 
 #[cfg(test)]
@@ -2386,7 +2418,7 @@ mod tests {
         c.event(Event::Connected(id.into(), Link {
             token: 1, tx, cancel: Arc::new(AtomicBool::new(false)), name: id.into(), os: Os::Mac,
             role, features: proto::FEATURES.iter().map(|s| s.to_string()).collect(), fp: id.repeat(4),
-            addr: "127.0.0.1:47160".parse().unwrap(), outgoing: true, paired: false,
+            addr: "127.0.0.1:47160".parse().unwrap(), listen_port: None, outgoing: true, paired: false,
             last_rx: Instant::now(), last_ping: Instant::now(), ping: None, rtt: None,
             bulk: Arc::new(AtomicUsize::new(0)),
         }, false));
@@ -2570,6 +2602,144 @@ mod tests {
     }
 
     #[test]
+    fn key_rules_are_echoed_after_persistence_and_duplicate_requests_get_an_echo() {
+        let mut r = rig(Role::Master);
+        r.c.config.peers.push(peer(SUB, Role::Sub));
+        let rx = link(&mut r.c, SUB, Role::Sub);
+        r.c.tell_subs();
+        rx.try_iter().for_each(drop);
+        let mut keys = r.c.config.all_rules();
+        keys.get_mut("mac>windows").unwrap().hanja = true;
+        r.c.hooks.persist_key_rules = Box::new(|_| anyhow::bail!("disk full"));
+        message(&mut r.c, SUB, Msg::KeyRules(keys.clone()));
+        r.c.tell_subs();
+        assert_ne!(r.c.config.keys, keys);
+        assert!(rx.try_iter().filter_map(|msg| if let Msg::MasterSettings(s) = msg { Some(s) } else { None }).all(|s| s.keys != keys));
+        r.c.hooks.persist_key_rules = Box::new(|_| Ok(()));
+        for _ in 0..2 {
+            message(&mut r.c, SUB, Msg::KeyRules(keys.clone()));
+            r.c.tell_subs();
+            assert!(rx.try_iter().any(|msg| matches!(msg, Msg::MasterSettings(s) if s.keys == keys)));
+        }
+    }
+
+    #[test]
+    fn received_file_signature_prevents_the_next_round_of_a_relay_cycle() {
+        let mut a = rig(Role::Master);
+        let b = rig(Role::Sub);
+        let c = rig(Role::Sub);
+        a.c.config.peers.push(peer(SUB, Role::Sub));
+        let original = a.dir.join("source.txt");
+        let forwarded = b.dir.join("source (1).txt");
+        let returned = c.dir.join("source (2).txt");
+        for file in [&original, &forwarded, &returned] { std::fs::write(file, b"cycle content").unwrap(); }
+        let sent = files_sig(&[original]).unwrap();
+        a.c.clip_sigs.insert(SUB.into(), sent.clone());
+        assert_eq!(files_sig(&[forwarded]).unwrap(), sent);
+        a.c.clip_received(OTHER, files_sig(&[returned]).unwrap());
+        assert!(!a.c.clip_wanted(SUB, &sent));
+    }
+
+    #[test]
+    fn file_signature_covers_only_the_files_selected_for_transfer() {
+        let mut r = rig(Role::Master);
+        r.c.config.peers.push(peer(SUB, Role::Sub));
+        let _rx = link(&mut r.c, SUB, Role::Sub);
+        let file = r.dir.join("valid.txt");
+        std::fs::write(&file, b"valid").unwrap();
+        *r.p.files.lock().unwrap() = vec![r.dir.clone(), file.clone(), r.dir.join("missing")];
+        r.c.send_clipboard(SUB);
+        assert!(r.c.outgoing.is_some());
+        assert_eq!(r.c.pending_clip[SUB].1, files_sig(&[file]).unwrap());
+    }
+
+    #[test]
+    fn file_signature_survives_receive_rename_and_checks_content_and_order() {
+        let r = rig(Role::Master);
+        let a = r.dir.join("original.txt");
+        let b = r.dir.join("original (1).txt");
+        let c = r.dir.join("other.txt");
+        std::fs::write(&a, b"same bytes").unwrap();
+        std::fs::write(&b, b"same bytes").unwrap();
+        std::fs::write(&c, b"different!").unwrap();
+        assert_eq!(files_sig(&[a.clone()]).unwrap(), files_sig(&[b.clone()]).unwrap());
+        assert_ne!(files_sig(&[a.clone(), c.clone()]).unwrap(), files_sig(&[c.clone(), a.clone()]).unwrap());
+        std::fs::write(&b, b"new bytes!").unwrap();
+        assert_ne!(files_sig(&[a]).unwrap(), files_sig(&[b]).unwrap());
+    }
+
+    #[test]
+    fn inbound_connection_keeps_live_ip_and_persists_combined_address() {
+        let mut r = rig(Role::Master);
+        let mut p = peer(SUB, Role::Sub);
+        p.last_addr = "10.0.0.1:49000".into();
+        r.c.config.peers.push(p);
+        let _rx = link(&mut r.c, SUB, Role::Sub);
+        let mut l = r.c.links.remove(SUB).unwrap();
+        l.outgoing = false;
+        l.addr = "10.0.0.2:47160".parse().unwrap();
+        r.c.config.peers[0].last_addr = "10.0.0.1:49000".into();
+        r.c.event(Event::Connected(SUB.into(), l, false));
+        assert_eq!(r.c.links[SUB].addr.to_string(), "10.0.0.2:49000");
+        assert_eq!(r.c.config.peers[0].last_addr, "10.0.0.2:49000");
+        assert_eq!(r.c.roster().iter().find(|m| m.id == SUB).unwrap().addr, "10.0.0.2:49000");
+    }
+
+    #[test]
+    fn pairing_uses_discovery_only_for_the_port_and_keeps_the_inbound_ip() {
+        for advertised in [None, Some(48000)] {
+            let mut r = rig(Role::Master);
+            let _rx = link(&mut r.c, SUB, Role::Sub);
+            let l = r.c.links.get_mut(SUB).unwrap();
+            l.outgoing = false;
+            l.listen_port = advertised;
+            l.addr = format!("10.0.0.2:{}", advertised.unwrap_or(47160)).parse().unwrap();
+            r.c.discovered.push(DiscoveredPeer { id: SUB.into(), name: "sub".into(), os: Os::Mac,
+                addresses: vec!["10.0.0.1:49000".parse().unwrap()], port: 49000,
+                fingerprint: SUB.repeat(4), seen: Instant::now() });
+            let mut pairing = Pairing::new(SUB.into(), "master", "sub");
+            pairing.local_accepted = true;
+            pairing.peer_accepted = true;
+            r.c.pairing = Some(pairing);
+            r.c.finish_pair();
+            assert_eq!(r.c.config.peers[0].last_addr, format!("10.0.0.2:{}", advertised.unwrap_or(49000)));
+        }
+    }
+
+    #[test]
+    fn inbound_advertised_port_wins_over_saved_port() {
+        let mut r = rig(Role::Master);
+        r.c.config.peers.push(peer(SUB, Role::Sub));
+        let _rx = link(&mut r.c, SUB, Role::Sub);
+        let mut l = r.c.links.remove(SUB).unwrap();
+        l.outgoing = false;
+        l.listen_port = Some(48000);
+        l.addr = "10.0.0.2:48000".parse().unwrap();
+        r.c.config.peers[0].last_addr = "10.0.0.1:49000".into();
+        r.c.event(Event::Connected(SUB.into(), l, false));
+        assert_eq!(r.c.config.peers[0].last_addr, "10.0.0.2:48000");
+    }
+
+    #[test]
+    fn reconnect_backoff_only_resets_after_matching_pong() {
+        let mut r = rig(Role::Master);
+        r.c.config.peers.push(peer(SUB, Role::Sub));
+        for attempt in 1..=5 {
+            let _rx = link(&mut r.c, SUB, Role::Sub);
+            r.c.disconnect(SUB, "immediate close");
+            assert_eq!(r.c.retry[SUB].attempt, attempt);
+        }
+        let _rx = link(&mut r.c, SUB, Role::Sub);
+        r.c.links.get_mut(SUB).unwrap().ping = Some((42, Instant::now()));
+        message(&mut r.c, SUB, Msg::Pong { t: 41 });
+        assert_eq!(r.c.retry[SUB].attempt, 5);
+        message(&mut r.c, SUB, Msg::Pong { t: 42 });
+        assert!(!r.c.retry.contains_key(SUB));
+        r.c.disconnect(SUB, "healthy close");
+        assert_eq!(r.c.retry[SUB].attempt, 1);
+    }
+
+    #[test]
     fn failed_clipboard_creation_and_disconnect_allow_retry() {
         let mut r = rig(Role::Master);
         r.c.config.peers.push(peer(SUB, Role::Sub));
@@ -2578,7 +2748,7 @@ mod tests {
         *r.p.files.lock().unwrap() = vec![missing.clone()];
         r.c.send_clipboard(SUB);
         assert!(r.c.outgoing.is_none());
-        assert!(r.c.clip_wanted(SUB, &files_sig(std::slice::from_ref(&missing))));
+        assert!(files_sig(std::slice::from_ref(&missing)).is_err());
         // A transfer that was queued but lost with its link must be retried too.
         r.p.files.lock().unwrap().clear();
         let text = "x".repeat(crate::transfer::INLINE_TEXT + 1);
@@ -2606,6 +2776,7 @@ mod tests {
         l.token = 2;
         r.c.event(Event::Connected(OTHER.into(), l, false));
         r.c.links.get_mut(SUB).unwrap().outgoing = false;
+        r.c.links.get_mut(SUB).unwrap().addr.set_port(47161);
         let roster = r.c.roster();
         assert!(roster.iter().any(|m| m.id == SUB) && !roster.iter().any(|m| m.id == OTHER));
         assert!(roster[0].features.iter().any(|f| f == "group"));
