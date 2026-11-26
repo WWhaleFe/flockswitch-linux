@@ -76,7 +76,7 @@ impl X11 {
                     }
                 };
                 let root = (x.XDefaultRootWindow)(d);
-                let raw = xi::XInput2::open().ok().and_then(|input| {
+                let mut raw = xi::XInput2::open().ok().and_then(|input| {
                     let (mut opcode, mut event, mut error) = (0, 0, 0);
                     if (x.XQueryExtension)(
                         d,
@@ -92,18 +92,25 @@ impl X11 {
                     if (input.XIQueryVersion)(d, &mut major, &mut minor) != xlib::Success as i32 {
                         return None;
                     }
-                    let mut bits = [0u8; 4];
-                    xi::XISetMask(&mut bits, xi::XI_RawMotion);
-                    let mut mask = xi::XIEventMask {
-                        deviceid: xi::XIAllMasterDevices,
-                        mask_len: bits.len() as i32,
-                        mask: bits.as_mut_ptr(),
-                    };
-                    if (input.XISelectEvents)(d, root, &mut mask, 1) != xlib::Success as i32 {
-                        return None;
-                    }
                     Some((input, opcode))
                 });
+                // Raw motion is wanted only while capturing: selected on grab, cleared on
+                // release, so moving the local mouse does not wake this thread when idle.
+                let select_raw = |raw: &Option<(xi::XInput2, i32)>, on: bool| -> bool {
+                    raw.as_ref().is_none_or(|(input, _)| {
+                        let mut bits = [0u8; 4];
+                        if on {
+                            xi::XISetMask(&mut bits, xi::XI_RawMotion);
+                        }
+                        let mut mask = xi::XIEventMask {
+                            deviceid: xi::XIAllMasterDevices,
+                            mask_len: bits.len() as i32,
+                            mask: bits.as_mut_ptr(),
+                        };
+                        (input.XISelectEvents)(d, root, &mut mask, 1) == xlib::Success as i32
+                    })
+                };
+                let mut motion_rest = (0.0, 0.0);
                 let screen = (x.XDefaultScreen)(d);
                 let park = (
                     (x.XDisplayWidth)(d, screen) / 2,
@@ -173,12 +180,17 @@ impl X11 {
                                             }
                                         }
                                     }
+                                    // Without raw motion the plain pointer events are used.
+                                    if !select_raw(&raw, true) {
+                                        raw = None;
+                                    }
                                     sink = Some(sender);
                                     let _ = ack.send(Ok(()));
                                 }
                             }
                             Command::Stop(ack) => {
                                 sink = None;
+                                select_raw(&raw, false);
                                 (x.XUngrabPointer)(d, xlib::CurrentTime);
                                 (x.XUngrabKeyboard)(d, xlib::CurrentTime);
                                 (x.XSync)(d, 0);
@@ -193,10 +205,13 @@ impl X11 {
                                     InputEvent::Motion { dx, dy } => {
                                         if let Some((px, py)) = crate::edge::platform::cursor() {
                                             let displays = displays();
+                                            // Whole pixels only; the fraction waits for the next event.
+                                            let wx = crate::net_logic::whole_pixels(&mut motion_rest.0, dx);
+                                            let wy = crate::net_logic::whole_pixels(&mut motion_rest.1, dy);
                                             if let Some((px, py)) = flock_net::geometry::clamp(
                                                 &displays,
-                                                px + dx,
-                                                py + dy,
+                                                px + wx,
+                                                py + wy,
                                             ) {
                                                 (test.XTestFakeMotionEvent)(
                                                     d, -1, px as i32, py as i32, 0,

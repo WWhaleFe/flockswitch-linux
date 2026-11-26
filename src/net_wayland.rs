@@ -6,9 +6,10 @@ use reis::{
     ei,
     event::{Device, DeviceCapability, EiEvent},
 };
+use rustix::event::{eventfd, EventfdFlags};
 use std::{
     collections::HashSet,
-    os::unix::net::UnixStream,
+    os::{fd::OwnedFd, unix::net::UnixStream},
     sync::{
         atomic::{AtomicBool, Ordering},
         mpsc::{self, Sender},
@@ -75,6 +76,12 @@ enum Command {
 /// releases sent after control ends do not). Wayland has no global cursor; the position
 /// this app set is only true while that control lasts.
 static REMOTE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// The EIS session ended with an error and nothing restarts it: the supervisor must
+/// drop this platform and start a new one.
+static EIS_FAILED: Mutex<Option<String>> = Mutex::new(None);
+pub fn eis_failed() -> Option<String> {
+    EIS_FAILED.lock().unwrap().clone()
+}
 pub fn remote_controlled() -> bool {
     REMOTE.load(Ordering::Acquire)
 }
@@ -90,6 +97,8 @@ pub fn remote_or_just_ended() -> bool {
 pub struct Wayland {
     clipboard: crate::clipboard::Clipboard,
     commands: Sender<Command>,
+    /// Wakes the EIS loop for a queued command; idle, it waits for the compositor only.
+    wake: Arc<OwnedFd>,
     model: Arc<Mutex<Model>>,
     worker: Mutex<Option<JoinHandle<()>>>,
     send: bool,
@@ -104,7 +113,10 @@ impl Wayland {
             !shared.stopped() && shared.config().network.on,
             "Network sharing was disabled"
         );
+        *EIS_FAILED.lock().unwrap() = None;
         let (commands, rx) = mpsc::channel();
+        let wake = Arc::new(eventfd(0, EventfdFlags::CLOEXEC | EventfdFlags::NONBLOCK)?);
+        let worker_wake = wake.clone();
         let model = Arc::new(Mutex::new(Model::default()));
         let state = model.clone();
         let cancelled = Arc::new(AtomicBool::new(false));
@@ -113,20 +125,30 @@ impl Wayland {
             .name("network-eis".into())
             .spawn(move || {
                 async_io::block_on(async {
-                    if let Err(e) = receive(shared, rx, state.clone(), cancel).await {
-                        state.lock().unwrap().error = Some(format!("{e:#}"));
+                    if let Err(e) = receive(shared, rx, worker_wake, state.clone(), cancel).await {
+                        let text = format!("{e:#}");
+                        state.lock().unwrap().error = Some(text.clone());
+                        *EIS_FAILED.lock().unwrap() = Some(text);
                     }
                 });
             })?;
         Ok(Self {
             clipboard: crate::clipboard::Clipboard::default(),
             commands,
+            wake,
             model,
             worker: Mutex::new(Some(worker)),
             send: support.send,
             capturing: AtomicBool::new(false),
             cancelled,
         })
+    }
+}
+impl Wayland {
+    fn command(&self, command: Command) {
+        if self.commands.send(command).is_ok() {
+            let _ = rustix::io::write(&*self.wake, &1u64.to_ne_bytes());
+        }
     }
 }
 impl Platform for Wayland {
@@ -155,7 +177,7 @@ impl Platform for Wayland {
             *REMOTE_ENDED.lock().unwrap() = Some(Instant::now());
         }
         self.model.lock().unwrap().cursor = Some((x, y));
-        let _ = self.commands.send(Command::Warp(x, y));
+        self.command(Command::Warp(x, y));
     }
     fn arm_edges(&self, sides: &[Side]) {
         capture().lock().unwrap().sides = if self.send { sides.to_vec() } else { vec![] };
@@ -196,7 +218,7 @@ impl Platform for Wayland {
         if matches!(event, InputEvent::Motion { .. } | InputEvent::Scroll { .. } | InputEvent::Key { down: true, .. } | InputEvent::Button { down: true, .. }) {
             REMOTE.store(true, Ordering::Release);
         }
-        let _ = self.commands.send(Command::Input(event.clone()));
+        self.command(Command::Input(event.clone()));
     }
     fn ready(&self) -> Result<(), String> {
         if self.capturing.load(Ordering::Acquire) && !capture().lock().unwrap().active {
@@ -216,7 +238,7 @@ impl Drop for Wayland {
     fn drop(&mut self) {
         disable();
         self.cancelled.store(true, Ordering::Release);
-        let _ = self.commands.send(Command::Quit);
+        self.command(Command::Quit);
         if let Some(h) = self.worker.lock().unwrap().take() {
             let _ = h.join();
         }
@@ -232,6 +254,7 @@ fn capture_displays() -> Vec<Rect> {
 async fn receive(
     shared: Arc<Shared>,
     rx: mpsc::Receiver<Command>,
+    wake: Arc<OwnedFd>,
     model: Arc<Mutex<Model>>,
     cancel: Arc<AtomicBool>,
 ) -> anyhow::Result<()> {
@@ -296,13 +319,20 @@ async fn receive(
             Gone,
             Tick,
         }
-        let mut events = stream::select(
+        let mut events = Box::pin(stream::select(
             events
                 .map(Ev::Ei)
                 .chain(stream::once(async { Ev::Gone }))
                 .boxed_local(),
-            async_io::Timer::interval(Duration::from_millis(4)).map(|_| Ev::Tick),
-        );
+            stream::unfold(async_io::Async::new(wake)?, |wake| async move {
+                wake.read_with(|fd| {
+                    rustix::io::read(fd, &mut [0u8; 8]).map_err(std::io::Error::from)
+                })
+                .await
+                .ok()?;
+                Some((Ev::Tick, wake))
+            }),
+        ));
         let mut emulation = Emulation {
             connection: connection.clone(),
             model: model.clone(),
@@ -312,7 +342,19 @@ async fn receive(
         };
         let mut sequence = 0u32;
         let mut scroll_active: Option<Instant> = None;
-        while let Some(event) = events.next().await {
+        loop {
+            // A scroll that stops is ended after a pause; that is the only timer.
+            let next = match scroll_active {
+                Some(t) => {
+                    let end = async_io::Timer::at(t + Duration::from_millis(150));
+                    match futures_util::future::select(events.next(), Box::pin(end)).await {
+                        futures_util::future::Either::Left((event, _)) => event,
+                        futures_util::future::Either::Right(_) => Some(Ev::Tick),
+                    }
+                }
+                None => events.next().await,
+            };
+            let Some(event) = next else { break };
             if shared.stopped() || !shared.config().network.on {
                 break;
             }

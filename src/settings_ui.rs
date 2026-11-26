@@ -1883,8 +1883,8 @@ impl SettingsApp {
         match backup::read(&file.path) {
             Ok(loaded) => {
                 log::info!("settings loaded from {}", file.path.display());
-                // What the setup check set aside belongs to this computer.
-                self.apply(|c| *c = Config { setup: c.setup.clone(), ..loaded });
+                // What the setup check set aside and the pairing state belong to this computer.
+                self.apply(|c| *c = backup::restore(c, loaded));
                 match self.error.take() {
                     None => {
                         self.backup_picker = None;

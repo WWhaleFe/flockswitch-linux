@@ -69,8 +69,10 @@ fn export_to(dir: &Path, cfg: &Config, host: &str, stamp: &str, when: &str) -> R
 
 /// The file's content: a header saying where it came from, then the settings.
 pub fn export_text(cfg: &Config, host: &str, when: &str) -> Result<String> {
-    // Setup choices and undelivered edits belong to this computer.
-    let settings = Config { setup: Default::default(), pending_key_rules: None, ..cfg.clone() }.to_text()?;
+    // Setup choices, undelivered edits and the pairing state belong to this computer.
+    let mut own = Config { setup: Default::default(), pending_key_rules: None, ..cfg.clone() };
+    keep_device_network(&mut own, &Config::default());
+    let settings = own.to_text()?;
     Ok(format!(
         "# flockswitch settings\n\
          # Saved by flockswitch {} for Linux on {host}, {when}\n\
@@ -78,6 +80,25 @@ pub fn export_text(cfg: &Config, host: &str, when: &str) -> Result<String> {
          # Channels are set per computer: check them after loading on another computer.\n\n{settings}",
         env!("CARGO_PKG_VERSION")
     ))
+}
+
+/// Puts `from`'s device-specific network state into `cfg`: paired computers, layout,
+/// role, on/off and the accepted notice only make sense with this computer's identity.
+fn keep_device_network(cfg: &mut Config, from: &Config) {
+    let (n, f) = (&mut cfg.network, &from.network);
+    n.peers = f.peers.clone();
+    n.layout = f.layout.clone();
+    n.role = f.role;
+    n.on = f.on;
+    n.notice_accepted = f.notice_accepted;
+}
+
+/// The settings to run after loading `loaded` on this computer (`current`): what the
+/// setup check set aside and the network state of this computer are kept.
+pub fn restore(current: &Config, loaded: Config) -> Config {
+    let mut next = Config { setup: current.setup.clone(), ..loaded };
+    keep_device_network(&mut next, current);
+    next
 }
 
 /// `flockswitch-settings-<host>-<stamp>.toml`, with the host name made safe for a file name.
@@ -577,6 +598,30 @@ mod tests {
         assert!(read(&file).unwrap_err().to_string().contains("too large"));
         assert!(read(&dir.join("missing.toml")).is_err());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pairing_state_stays_on_this_computer() {
+        let mut cfg = Config::default();
+        cfg.network.on = true;
+        cfg.network.notice_accepted = true;
+        cfg.network.role = flock_net::Role::Sub;
+        cfg.network.name = "desk".into();
+        cfg.network.peers.push(flock_net::PeerConfig::default());
+        cfg.network.layout.push(flock_net::layout::Cell { id: "abc123".into(), col: 1, row: 1 });
+        let text = export_text(&cfg, "desk", "2026-11-27 12:00:00").unwrap();
+        let loaded = parse(&text).unwrap();
+        assert!(loaded.network.peers.is_empty() && loaded.network.layout.is_empty());
+        assert!(!loaded.network.on && !loaded.network.notice_accepted);
+        assert_eq!(loaded.network.role, flock_net::Role::Master);
+        assert_eq!(loaded.network.name, "desk");
+        // Loading on this computer keeps its own pairing state, not the file's.
+        let mut other = Config::default();
+        other.network.on = true;
+        other.network.peers.push(flock_net::PeerConfig::default());
+        let next = restore(&other, loaded);
+        assert!(next.network.on && next.network.peers.len() == 1);
+        assert_eq!(next.network.name, "desk");
     }
 
     #[test]

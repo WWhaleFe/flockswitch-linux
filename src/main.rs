@@ -500,12 +500,15 @@ pub fn uninstall() {
         }
     }
     if let Some(dir) = Config::path().parent() {
-        if let Ok(entries) = std::fs::read_dir(dir) {
-            for e in entries.flatten() {
-                let _ = std::fs::remove_file(e.path());
+        // The folder is flockswitch's own: it holds the network key (net/identity.der)
+        // and the clipboard transfer work folders as well as the files.
+        if dir.file_name().is_some_and(|n| n == "flockswitch") {
+            if let Err(e) = std::fs::remove_dir_all(dir) {
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    log::warn!("could not remove {}: {e}", dir.display());
+                }
             }
         }
-        let _ = std::fs::remove_dir(dir);
     }
     log::info!("uninstalled settings and start-at-login");
 }

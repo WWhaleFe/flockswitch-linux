@@ -18,6 +18,15 @@ pub fn apply_master_settings(config: &mut Config, settings: &flock_net::MasterSe
     apply_app_settings(config, &settings.app);
 }
 
+/// The whole pixels to move for `delta`, with the fraction kept in `rest` for the next
+/// event: an X11 pointer sits on whole pixels, so slow motion would otherwise be lost.
+pub fn whole_pixels(rest: &mut f64, delta: f64) -> f64 {
+    let total = *rest + delta;
+    let whole = total.trunc();
+    *rest = total - whole;
+    whole
+}
+
 pub fn runtime_config(full: &Config, wayland: bool, config_dir: PathBuf) -> NetConfig {
     let mut config = full.network.clone();
     config.config_dir = config_dir;
@@ -152,6 +161,18 @@ impl NetState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn slow_motion_adds_up_to_whole_pixels() {
+        let mut rest = 0.0;
+        let moved: f64 = (0..12).map(|_| whole_pixels(&mut rest, 0.25)).sum();
+        assert_eq!(moved, 3.0);
+        let mut rest = 0.0;
+        let moved: f64 = (0..12).map(|_| whole_pixels(&mut rest, -0.25)).sum();
+        assert_eq!(moved, -3.0);
+        let mut rest = 0.5;
+        assert_eq!(whole_pixels(&mut rest, 1.75), 2.0);
+        assert_eq!(rest, 0.25);
+    }
     #[test]
     fn effect_settings_follow_the_master() {
         let mut master = Config::default();

@@ -215,7 +215,7 @@ pub fn spawn(shared: Arc<Shared>) -> JoinHandle<()> {
             let mut version = None;
             let mut cached = None;
             let mut edges_allowed = false;
-            let mut attempted = false;
+            let mut platform_retry = Instant::now() - Duration::from_secs(5);
             let mut retry = Instant::now() - Duration::from_secs(5);
             let mut key_retry = Instant::now() - Duration::from_secs(2);
             while !shared.stopped() {
@@ -240,12 +240,28 @@ pub fn spawn(shared: Arc<Shared>) -> JoinHandle<()> {
                             s.stop();
                         }
                         platform = None;
-                        attempted = false;
+                        platform_retry = Instant::now() - Duration::from_secs(5);
                         crate::net_wayland::disable();
                     }
                 } else {
-                    if !attempted {
-                        attempted = true;
+                    // The Wayland EIS session ends for good when the compositor drops it:
+                    // throw the platform away and build a new one after a pause.
+                    if platform.is_some() {
+                        if let Some(reason) = crate::net_wayland::eis_failed() {
+                            log::warn!("network: input session ended, restarting: {reason}");
+                            LIVE.lock().unwrap().take();
+                            if let Some(s) = service.take() {
+                                s.stop();
+                            }
+                            mode = "local".into();
+                            platform = None;
+                            platform_retry = Instant::now();
+                            publish_error(config, reason);
+                        }
+                    }
+                    // A failed start (portal not answering yet) is tried again later.
+                    if platform.is_none() && platform_retry.elapsed() >= Duration::from_secs(5) {
+                        platform_retry = Instant::now();
                         let result: anyhow::Result<Arc<dyn Platform>> =
                             if crate::edge_wayland::session_is_wayland() {
                                 crate::net_wayland::Wayland::new(shared.clone())
