@@ -78,6 +78,15 @@ static REMOTE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::ne
 pub fn remote_controlled() -> bool {
     REMOTE.load(Ordering::Acquire)
 }
+/// When the last remote control ended (the warp back at the edge it came in by).
+static REMOTE_ENDED: Mutex<Option<Instant>> = Mutex::new(None);
+/// The compositor may report the barrier that the controller's last push touched only
+/// after netcore has already handed control back; that touch is still theirs.
+const REMOTE_TAIL: Duration = Duration::from_millis(500);
+/// Controlled from elsewhere now, or a moment ago.
+pub fn remote_or_just_ended() -> bool {
+    remote_controlled() || REMOTE_ENDED.lock().unwrap().is_some_and(|t| t.elapsed() < REMOTE_TAIL)
+}
 pub struct Wayland {
     clipboard: crate::clipboard::Clipboard,
     commands: Sender<Command>,
@@ -135,7 +144,6 @@ impl Platform for Wayland {
         self.model.lock().unwrap().displays.clone()
     }
     fn cursor(&self) -> Option<(f64, f64)> {
-        if !crate::net::network_edges_allowed() { return None; }
         // Only while controlled from elsewhere is the position known (it is where this
         // app moved the pointer); netcore needs it then to find the way back. Otherwise
         // the edges come from the InputCapture barriers (take_edge_hit), and an old
@@ -143,7 +151,9 @@ impl Platform for Wayland {
         if remote_controlled() { self.model.lock().unwrap().cursor } else { None }
     }
     fn warp(&self, x: f64, y: f64) {
-        REMOTE.store(false, Ordering::Release);
+        if REMOTE.swap(false, Ordering::AcqRel) {
+            *REMOTE_ENDED.lock().unwrap() = Some(Instant::now());
+        }
         self.model.lock().unwrap().cursor = Some((x, y));
         let _ = self.commands.send(Command::Warp(x, y));
     }

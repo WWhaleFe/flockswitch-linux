@@ -345,7 +345,9 @@ impl Platform for X11 {
         displays()
     }
     fn cursor(&self) -> Option<(f64, f64)> {
-        if !crate::net::network_edges_allowed() { return None; }
+        // Always the real position: netcore needs it for the way back while controlled,
+        // whoever owns the edges. Leaving from here is the app's edge watcher's call
+        // (app_drives_edges is always set on X11), never netcore's.
         crate::edge::platform::cursor()
     }
     fn warp(&self, x: f64, y: f64) {

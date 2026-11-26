@@ -672,10 +672,16 @@ impl Portal {
         }
         let net_side = crate::net::side(crate::edge_wayland::edge_of(seg.side));
         let is_network = self.watch.network_wanted() && self.watch.network_sides().contains(&net_side);
-        if is_network && crate::net_wayland::remote_controlled() {
+        if is_network && crate::net_wayland::remote_or_just_ended() {
             // Another computer drives this pointer now: a barrier it touches is not a
             // crossing from here, and holding the pointer would block its way back.
             self.end_capture(live, Some(cap.position()), "controlled from another computer").await;
+            return;
+        }
+        if is_network && !crate::net_wayland::capture().lock().unwrap().sides.contains(&net_side) {
+            // Placed there but not connected (or the network service is not running):
+            // nothing to cross to, so the pointer is not held.
+            self.end_capture(live, Some(cap.position()), "no computer connected on that side").await;
             return;
         }
         if is_network {
@@ -766,8 +772,10 @@ impl Portal {
                 // "Hold Control to cross" without Control: libei reports a Control held
                 // beforehand within moments; after that the pointer is not kept here.
                 let no_control = bridge.deferred.is_some() && c.since.elapsed() > CONTROL_GRACE;
+                // Another computer took control while this one waited at the edge.
+                let taken = bridge.sink.is_none() && crate::net_wayland::remote_controlled();
                 if bridge.sink.is_some() { overlay::edge_end(); }
-                if bridge.release.is_some_and(|t| Instant::now() >= t) || !self.watch.network_wanted() || expired || no_control {
+                if bridge.release.is_some_and(|t| Instant::now() >= t) || !self.watch.network_wanted() || expired || no_control || taken {
                     Some(bridge.position.take().or(Some(c.cap.position())))
                 } else { None }
             };
@@ -833,8 +841,14 @@ impl Portal {
             let control = self.ctrl.held() || self.held_keys.contains(&29) || self.held_keys.contains(&97);
             let mut bridge = crate::net_wayland::capture().lock().unwrap();
             bridge.control = control;
-            if control {
-                if let Some(hit) = bridge.deferred.take() { bridge.hit = Some(hit); }
+            let promoted = control && bridge.deferred.take().map(|hit| bridge.hit = Some(hit)).is_some();
+            drop(bridge);
+            // Control came after the edge was reached: start the countdown drawing now.
+            let dwell = Duration::from_millis(self.watch.cfg.network.cross_delay_ms);
+            if let (true, Some(k), Some(c)) = (promoted && !dwell.is_zero(), live.xwayland, self.capture.as_ref()) {
+                let p = c.cap.edge_position();
+                overlay::edge_begin_at(&self.watch.cfg.edges, crate::edge_wayland::edge_of(c.cap.seg.side), None,
+                    Some((p.0 * k, p.1 * k)), Duration::ZERO, dwell, false);
             }
         }
         if self.capture.as_ref().is_some_and(|c| c.network) {
