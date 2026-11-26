@@ -3511,21 +3511,23 @@ impl SettingsApp {
         let width = ui.available_width();
         let pending = self.setup_pending_count();
         // The app icon, its name and version.
-        let (rect, _) = ui.allocate_exact_size(Vec2::new(width, 46.0), Sense::hover());
-        let icon = Rect::from_min_size(rect.min + Vec2::new(8.0, 2.0), Vec2::splat(34.0));
+        let (rect, _) = ui.allocate_exact_size(Vec2::new(width, 40.0), Sense::hover());
+        let icon = Rect::from_min_size(rect.min + Vec2::new(8.0, 2.0), Vec2::splat(32.0));
         egui::Image::new((self.icon.id(), icon.size())).corner_radius(9).paint_at(ui, icon);
         let painter = ui.painter();
-        painter.text(Pos2::new(icon.right() + 10.0, rect.top() + 6.0), Align2::LEFT_TOP, crate::APP_NAME, bold(15.0), p.text);
-        painter.text(Pos2::new(icon.right() + 10.0, rect.top() + 26.0), Align2::LEFT_TOP, env!("CARGO_PKG_VERSION"), mono(11.0), p.muted);
+        painter.text(Pos2::new(icon.right() + 10.0, rect.top() + 3.0), Align2::LEFT_TOP, crate::APP_NAME, bold(15.0), p.text);
+        painter.text(Pos2::new(icon.right() + 10.0, rect.top() + 22.0), Align2::LEFT_TOP, env!("CARGO_PKG_VERSION"), mono(11.0), p.muted);
 
         let mut go = None;
+        ui.spacing_mut().item_spacing.y = 0.0;
         for (i, (title, pages)) in Page::groups(t).into_iter().enumerate() {
-            ui.add_space(if i == 0 { 8.0 } else { 20.0 });
-            let (rect, _) = ui.allocate_exact_size(Vec2::new(width, 20.0), Sense::hover());
+            ui.add_space(if i == 0 { 4.0 } else { 16.0 });
+            let (rect, _) = ui.allocate_exact_size(Vec2::new(width, 16.0), Sense::hover());
             ui.painter().text(rect.left_center() + Vec2::new(12.0, 0.0), Align2::LEFT_CENTER, title, bold(12.0), p.muted);
-            ui.add_space(4.0);
+            ui.add_space(2.0);
             for (page, label) in pages {
-                let (rect, resp) = ui.allocate_exact_size(Vec2::new(width, 34.0), Sense::click());
+                ui.add_space(2.0);
+                let (rect, resp) = ui.allocate_exact_size(Vec2::new(width, 32.0), Sense::click());
                 let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
                 let on = page == self.page;
                 resp.widget_info(|| WidgetInfo::selected(Role::Tab, true, on, label));
@@ -3596,7 +3598,7 @@ impl SettingsApp {
             .fill(p.card)
             .stroke(Stroke::new(1.0, p.border))
             .corner_radius(10)
-            .inner_margin(Margin::same(12))
+            .inner_margin(Margin::same(10))
             .show(ui, |ui| {
                 ui.set_width(ui.available_width());
                 ui.spacing_mut().item_spacing.y = 4.0;
@@ -3610,11 +3612,12 @@ impl SettingsApp {
                     } else {
                         ui.painter().circle_filled(dot.center(), 4.0, p.off);
                     }
-                    ui.add(egui::Label::new(RichText::new(line).size(13.0).color(p.text)).wrap());
+                    ui.add(egui::Label::new(RichText::new(line).size(13.0).color(p.text)).truncate());
                 });
-                ui.label(RichText::new(net_line).size(12.0).color(p.muted));
-                ui.label(RichText::new(device).font(mono(11.0)).color(p.muted));
-            });
+                ui.add(egui::Label::new(RichText::new(net_line).size(12.0).color(p.muted)).truncate());
+            })
+            .response
+            .on_hover_text(device);
     }
 
     fn page_body(&mut self, ui: &mut Ui, t: &Texts, p: Palette) {
@@ -3658,8 +3661,9 @@ mod tests {
         let page = WINDOW_SIZE[0] - SIDEBAR_WIDTH - 2.0 * PAGE_PADDING.x - 10.0 - 2.0 * 18.0 - 2.0 * 14.0;
         assert!((page - 4.0 * 10.0) / 5.0 >= 100.0, "{page}");
         // The sidebar holds its three groups and eleven pages without scrolling.
-        let sidebar = 46.0 + (8.0 + 24.0) + 2.0 * (20.0 + 24.0) + 11.0 * 34.0 + 24.0 + 90.0;
-        assert!(sidebar + 32.0 <= WINDOW_SIZE[1], "{sidebar}");
+        let sidebar = 40.0 + (4.0 + 16.0 + 16.0) + 3.0 * (16.0 + 2.0) + 11.0 * 34.0 + 12.0 + 60.0;
+        // Down to 620 high (the smallest work-area fit on Windows) nothing scrolls.
+        assert!(sidebar + 32.0 <= WINDOW_SIZE[1].min(620.0), "{sidebar}");
     }
 
     #[test]
