@@ -6,6 +6,8 @@ use crate::proto::Msg;
 use anyhow::{bail, Context, Result};
 use base64::{engine::general_purpose::STANDARD, Engine};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::{
     fs::File,
     io::{Read, Write},
@@ -73,15 +75,26 @@ pub fn unique_path(dir: &Path, name: &str) -> PathBuf {
 
 enum Source {
     Bytes(Vec<u8>, usize),
-    Files(Vec<PathBuf>, usize, Option<File>),
+    Files(FileSource),
+}
+
+struct FileSource {
+    paths: Vec<PathBuf>,
+    sizes: Vec<u64>,
+    index: usize,
+    file: Option<File>,
+    read: u64,
+    hash: Sha256,
 }
 
 /// One transfer on its way out; `next` gives its messages in order.
 pub struct Outgoing {
     id: u32,
     start: Option<Msg>,
+    pending: Option<Msg>,
     source: Source,
     done: bool,
+    sent_sig: Option<Vec<u8>>,
     pub total: u64,
     pub sent: u64,
 }
@@ -114,11 +127,17 @@ impl Outgoing {
         if total > limit {
             bail!("too large: {total} bytes");
         }
+        let sizes = metas.iter().map(|m| m.size).collect();
+        let mut hash = Sha256::new();
+        hash.update(b"files");
+        hash.update((kept.len() as u64).to_le_bytes());
         Ok(Self {
             id,
             start: Some(Msg::ClipStart { id, kind: ClipKind::Files, files: metas }),
-            source: Source::Files(kept, 0, None),
+            pending: None,
+            source: Source::Files(FileSource { paths: kept, sizes, index: 0, file: None, read: 0, hash }),
             done: false,
+            sent_sig: None,
             total,
             sent: 0,
         })
@@ -126,7 +145,7 @@ impl Outgoing {
 
     /// The regular files that passed the count, name and size checks, in wire order.
     pub(crate) fn file_paths(&self) -> Option<&[PathBuf]> {
-        match &self.source { Source::Files(paths, ..) => Some(paths), _ => None }
+        match &self.source { Source::Files(files) => Some(&files.paths), _ => None }
     }
 
     /// An image (PNG) or long text, held in memory (both are bounded by their limits).
@@ -139,20 +158,29 @@ impl Outgoing {
                 kind,
                 files: vec![FileMeta { name: name.into(), size: total }],
             }),
+            pending: None,
             source: Source::Bytes(data, 0),
             done: false,
+            sent_sig: None,
             total,
             sent: 0,
         }
     }
 
+    /// Fingerprint of the exact file bytes handed to the transport.
+    pub(crate) fn sent_signature(&self) -> Option<&[u8]> { self.sent_sig.as_deref() }
+
     /// Whether the last message (ClipDone) was given out.
     pub fn finished(&self) -> bool {
-        self.done
+        self.done && self.pending.is_none()
     }
+
+    /// Retain a frame rejected by the bounded link queue without rereading its bytes.
+    pub(crate) fn retry(&mut self, msg: Msg) { self.pending = Some(msg); }
 
     /// The next message, or None when everything was given out.
     pub fn next(&mut self) -> Result<Option<Msg>> {
+        if let Some(msg) = self.pending.take() { return Ok(Some(msg)); }
         if let Some(start) = self.start.take() {
             return Ok(Some(start));
         }
@@ -171,21 +199,26 @@ impl Outgoing {
                     Some(piece)
                 }
             }
-            Source::Files(paths, index, file) => loop {
-                if *index >= paths.len() {
-                    break None;
-                }
-                if file.is_none() {
-                    *file = Some(File::open(&paths[*index]).with_context(|| format!("opening {}", paths[*index].display()))?);
+            Source::Files(source) => loop {
+                if source.index >= source.paths.len() { break None; }
+                if source.file.is_none() {
+                    source.file = Some(File::open(&source.paths[source.index])
+                        .with_context(|| format!("opening {}", source.paths[source.index].display()))?);
+                    source.hash.update(source.sizes[source.index].to_le_bytes());
+                    source.read = 0;
                 }
                 let mut buf = [0u8; CHUNK];
-                let n = file.as_mut().unwrap().read(&mut buf)?;
+                let n = source.file.as_mut().unwrap().read(&mut buf)?;
                 if n == 0 {
-                    *file = None;
-                    *index += 1;
+                    anyhow::ensure!(source.read == source.sizes[source.index], "clipboard file changed size");
+                    source.file = None;
+                    source.index += 1;
                     continue;
                 }
-                break Some((*index as u32, STANDARD.encode(&buf[..n]), n));
+                source.read += n as u64;
+                anyhow::ensure!(source.read <= source.sizes[source.index], "clipboard file changed size");
+                source.hash.update(&buf[..n]);
+                break Some((source.index as u32, STANDARD.encode(&buf[..n]), n));
             },
         };
         match piece {
@@ -195,6 +228,9 @@ impl Outgoing {
             }
             None => {
                 self.done = true;
+                if let Source::Files(files) = &self.source {
+                    self.sent_sig = Some(files.hash.clone().finalize().to_vec());
+                }
                 self.source = Source::Bytes(Vec::new(), 0);
                 Ok(Some(Msg::ClipDone { id }))
             }
@@ -268,32 +304,50 @@ impl Incoming {
     /// Checks every size; files move into `dest` (made if missing) under their own,
     /// unique names; an image or text is read back into memory.
     pub fn finish(self, dest: &Path) -> Result<Received> {
+        self.finish_with(dest, &mut || false)
+    }
+
+    pub(crate) fn finish_cancellable(self, dest: &Path, cancel: &AtomicBool) -> Result<Received> {
+        self.finish_with(dest, &mut || cancel.load(Ordering::Acquire))
+    }
+
+    fn finish_with(self, dest: &Path, cancelled: &mut impl FnMut() -> bool) -> Result<Received> {
+        anyhow::ensure!(!cancelled(), "cancelled");
         for (meta, written) in self.files.iter().zip(&self.written) {
-            if *written != meta.size {
-                bail!("{} is incomplete", meta.name);
-            }
+            if *written != meta.size { bail!("{} is incomplete", meta.name); }
         }
         let result = match self.kind {
             ClipKind::Files => {
                 std::fs::create_dir_all(dest)?;
-                let mut saved = Vec::new();
+                let mut saved = SavedPaths(Vec::new());
                 for (i, meta) in self.files.iter().enumerate() {
+                    anyhow::ensure!(!cancelled(), "cancelled");
                     let from = self.dir.join(i.to_string());
-                    if !from.exists() {
-                        File::create(&from)?;
-                    }
+                    if !from.exists() { File::create(&from)?; }
                     let to = unique_path(dest, &meta.name);
+                    // Track even a partially copied destination for rollback.
+                    saved.0.push(to.clone());
                     if std::fs::rename(&from, &to).is_err() {
-                        std::fs::copy(&from, &to)?;
+                        copy_cancellable(&from, &to, cancelled)?;
                     }
-                    saved.push(to);
                 }
-                Received::Files(saved)
+                anyhow::ensure!(!cancelled(), "cancelled");
+                Received::Files(std::mem::take(&mut saved.0))
             }
-            ClipKind::Image => Received::Image(std::fs::read(self.dir.join("0"))?),
-            ClipKind::Text => Received::Text(String::from_utf8(std::fs::read(self.dir.join("0"))?)?),
+            ClipKind::Image | ClipKind::Text => {
+                let mut data = Vec::new();
+                let mut file = File::open(self.dir.join("0"))?;
+                let mut chunk = [0; CHUNK];
+                loop {
+                    anyhow::ensure!(!cancelled(), "cancelled");
+                    let n = file.read(&mut chunk)?;
+                    if n == 0 { break; }
+                    data.extend_from_slice(&chunk[..n]);
+                }
+                if self.kind == ClipKind::Image { Received::Image(data) }
+                else { Received::Text(String::from_utf8(data)?) }
+            }
         };
-        let _ = std::fs::remove_dir_all(&self.dir);
         Ok(result)
     }
 
@@ -301,6 +355,26 @@ impl Incoming {
     pub fn abandon(self) {
         let _ = std::fs::remove_dir_all(&self.dir);
     }
+}
+
+/// A destination transaction, rolled back unless all files are committed.
+struct SavedPaths(Vec<PathBuf>);
+impl Drop for SavedPaths {
+    fn drop(&mut self) {
+        for path in &self.0 { let _ = std::fs::remove_file(path); }
+    }
+}
+fn copy_cancellable(from: &Path, to: &Path, cancelled: &mut impl FnMut() -> bool) -> Result<()> {
+    let mut input = File::open(from)?;
+    let mut output = File::create(to)?;
+    let mut buffer = [0; CHUNK];
+    loop {
+        anyhow::ensure!(!cancelled(), "cancelled");
+        let n = input.read(&mut buffer)?;
+        if n == 0 { break; }
+        output.write_all(&buffer[..n])?;
+    }
+    Ok(())
 }
 
 impl Drop for Incoming {
@@ -313,6 +387,51 @@ impl Drop for Incoming {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cancellation_between_published_files_rolls_back_the_destination() {
+        let work = temp("cancel-moves");
+        let dest = work.join("dest");
+        let incoming = Incoming::start(10, ClipKind::Files,
+            vec![FileMeta { name: "first".into(), size: 0 }, FileMeta { name: "second".into(), size: 0 }],
+            100, &work).unwrap();
+        let result = incoming.finish_with(&dest, &mut || dest.join("first").exists());
+        assert!(result.is_err());
+        assert_eq!(std::fs::read_dir(&dest).unwrap().count(), 0);
+        assert!(!work.join("incoming-10").exists());
+        std::fs::remove_dir_all(work).unwrap();
+    }
+
+    #[test]
+    fn fallback_copy_checks_cancellation_between_chunks() {
+        let work = temp("cancel-copy");
+        let from = work.join("source");
+        let to = work.join("destination");
+        std::fs::write(&from, vec![7; CHUNK * 8]).unwrap();
+        let saved = SavedPaths(vec![to.clone()]);
+        let mut checks = 0;
+        let result = copy_cancellable(&from, &to, &mut || { checks += 1; checks > 2 });
+        assert!(result.is_err());
+        assert_eq!(std::fs::metadata(&to).unwrap().len(), (CHUNK * 2) as u64);
+        drop(saved);
+        assert!(!to.exists());
+        assert!(from.exists());
+        std::fs::remove_dir_all(work).unwrap();
+    }
+
+    #[test]
+    fn changing_a_file_size_aborts_before_clip_done() {
+        let dir = temp("changed-size");
+        let path = dir.join("file");
+        std::fs::write(&path, b"before").unwrap();
+        let mut out = Outgoing::files(20, &[path.clone()], 100).unwrap();
+        assert!(matches!(out.next().unwrap(), Some(Msg::ClipStart { .. })));
+        std::fs::write(path, b"larger now").unwrap();
+        assert!(out.next().is_err());
+        assert!(!out.finished());
+        assert!(out.sent_signature().is_none());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn reused_transfer_ids_do_not_remove_another_workers_files() {

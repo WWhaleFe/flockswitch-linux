@@ -1275,3 +1275,75 @@ fn reconnect_after_a_simulated_pause_redials_at_once() {
     dialer.stop();
     other.stop();
 }
+
+#[test]
+fn five_thousand_burst_and_1000hz_motions_keep_the_session_during_clipboard_transfer() {
+    let da = TempDir::new();
+    let db = TempDir::new();
+    let a = FakePlatform::new(Os::Mac);
+    let b = FakePlatform::new(Os::Windows);
+    let ia = Identity::load_or_create(&da.0).unwrap();
+    let ib = Identity::load_or_create(&db.0).unwrap();
+    let mut ca = config(&da, "A");
+    let mut cb = config(&db, "B");
+    let sb = Service::start(cb.clone(), b.clone(), Hooks::default()).unwrap();
+    ca.peers.push(PeerConfig {
+        id: ib.id.clone(), fingerprint: ib.fingerprint.clone(), os: Os::Windows,
+        side: Some(Side::Right), last_addr: sb.local_addr().to_string(),
+        ..PeerConfig::default()
+    });
+    let sa = Service::start(ca, a.clone(), Hooks::default()).unwrap();
+    cb.peers.push(PeerConfig {
+        id: ia.id.clone(), fingerprint: ia.fingerprint.clone(), os: Os::Mac,
+        role: Role::Master, last_addr: sa.local_addr().to_string(),
+        ..PeerConfig::default()
+    });
+    sb.update_config(cb).unwrap();
+    wait("paired loopback link", || {
+        sa.status().peers.first().is_some_and(|p| p.connected)
+            && sb.status().peers.first().is_some_and(|p| p.connected)
+    });
+    let image = vec![7; transfer::CHUNK * 8 + 17];
+    *a.image.lock().unwrap() = Some(image.clone());
+    a.warp(99.0, 50.0);
+    wait("loopback control", || sa.state().mode == "controlling" && sb.state().mode == "controlled");
+    for _ in 0..5000 { a.send(InputEvent::Motion { dx: 1.0, dy: 0.0 }); }
+    let distance = || b.records().iter().filter_map(|e| match e {
+        InputEvent::Motion { dx, .. } => Some(dx), _ => None,
+    }).sum::<f64>();
+    wait("all burst motion delivered", || distance() == 5000.0);
+    let began = Instant::now();
+    for n in 0..3000 {
+        thread::sleep((began + Duration::from_millis(n)).saturating_duration_since(Instant::now()));
+        a.send(InputEvent::Motion { dx: 1.0, dy: 0.0 });
+        if n % 250 == 0 {
+            assert_eq!(sa.state().mode, "controlling");
+            assert_eq!(sb.state().mode, "controlled");
+        }
+    }
+    wait("all sustained motion delivered", || distance() == 8000.0);
+    wait("clipboard completed alongside input", || b.clipboard_image_png().as_ref() == Some(&image));
+    assert_eq!(sa.state().mode, "controlling");
+    assert_eq!(sb.state().mode, "controlled");
+    sa.stop();
+    sb.stop();
+}
+
+#[test]
+fn idle_listener_rebind_does_not_depend_on_a_self_connection() {
+    let dir = TempDir::new();
+    let platform = FakePlatform::new(Os::Mac);
+    let mut cfg = config(&dir, "A");
+    let service = Service::start(cfg.clone(), platform, Hooks::default()).unwrap();
+    cfg.port = service.local_addr().port();
+    for _ in 0..3 {
+        cfg.on = false;
+        service.update_config(cfg.clone()).unwrap();
+        wait("listener off", || !service.status().running);
+        cfg.on = true;
+        service.update_config(cfg.clone()).unwrap();
+        wait("listener rebound", || service.status().running && service.local_addr().port() == cfg.port);
+        assert!(service.status().me.error.is_none());
+    }
+    service.stop();
+}

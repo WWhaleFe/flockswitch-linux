@@ -13,7 +13,7 @@ use std::{
     net::{SocketAddr, TcpListener, TcpStream},
     sync::{
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
-        mpsc::{self, Receiver, Sender, SyncSender},
+        mpsc::{self, Receiver, Sender},
         Arc, Mutex,
     },
     thread::{self, JoinHandle},
@@ -21,10 +21,12 @@ use std::{
 };
 
 mod files;
+mod queue;
 
 const IDLE_POLL: Duration = Duration::from_millis(100);
 const OFF_POLL: Duration = Duration::from_millis(250);
 const LINK_QUEUE: usize = 256;
+const MAX_ACCEPTS_PER_IP: usize = 8;
 
 const POLL: Duration = Duration::from_millis(8);
 const HEARTBEAT: Duration = Duration::from_millis(500);
@@ -104,7 +106,7 @@ impl Service {
         let (tx, rx) = mpsc::channel();
         let (events, event_rx) = mpsc::channel();
         let (capture, captured) = mpsc::channel();
-        let listener = listener.map(|l| Acceptor::start(l, events.clone(), tx.clone()));
+        let listener = listener.map(|l| Acceptor::start(l, events.clone(), tx.clone())).transpose()?;
         let mut control = Control {
             config,
             platform,
@@ -133,6 +135,7 @@ impl Service {
             keys: HashSet::new(),
             clip_sigs: HashMap::new(),
             pending_clip: HashMap::new(),
+            deferred_clipboard: HashSet::new(),
             clip_origin: None,
             trusted: vec![],
             group: None,
@@ -282,53 +285,71 @@ struct Acceptor {
     addr: SocketAddr,
     handle: Option<JoinHandle<()>>,
 }
+
+/// Bound unauthenticated accepts from one IP before they can fill worker slots.
+#[derive(Default)]
+struct AcceptPace(HashMap<std::net::IpAddr, (Instant, usize)>);
+impl AcceptPace {
+    fn allow(&mut self, ip: std::net::IpAddr, now: Instant) -> bool {
+        let ip = ip.to_canonical();
+        if self.0.len() >= 1024 {
+            self.0.retain(|_, (since, _)| now.duration_since(*since) < DEAD);
+            if self.0.len() >= 1024 && !self.0.contains_key(&ip) { return false; }
+        }
+        let (since, count) = self.0.entry(ip).or_insert((now, 0));
+        if now.duration_since(*since) >= DEAD { *since = now; *count = 0; }
+        if *count >= MAX_ACCEPTS_PER_IP { return false; }
+        *count += 1;
+        true
+    }
+}
 impl Acceptor {
-    fn start(listener: TcpListener, events: Sender<Event>, wake: Sender<Command>) -> Self {
+    fn start(listener: TcpListener, events: Sender<Event>, wake: Sender<Command>) -> Result<Self> {
         let stop = Arc::new(AtomicBool::new(false));
         let stopped = stop.clone();
-        let addr = listener.local_addr().unwrap();
-        let handle = thread::spawn(move || loop {
-            let accepted = listener.accept();
-            if stopped.load(Ordering::Acquire) {
-                break;
-            }
-            match accepted {
-                Ok((socket, addr)) => {
-                    if events.send(Event::Accepted(socket, addr)).is_err() || wake.send(Command::Wake).is_err() {
-                        break;
+        let addr = listener.local_addr()?;
+        let handle = thread::Builder::new().name("flock-accept".into()).spawn(move || {
+            let mut pace = AcceptPace::default();
+            loop {
+                let accepted = listener.accept();
+                if stopped.load(Ordering::Acquire) { break; }
+                match accepted {
+                    Ok((socket, addr)) => {
+                        if pace.allow(addr.ip(), Instant::now())
+                            && (events.send(Event::Accepted(socket, addr)).is_err()
+                                || wake.send(Command::Wake).is_err()) { break; }
+                    }
+                    Err(e) => {
+                        log::warn!("listener: {e}");
+                        thread::sleep(IDLE_POLL);
                     }
                 }
-                Err(e) => {
-                    log::warn!("listener: {e}");
-                    thread::sleep(Duration::from_millis(100));
-                }
             }
-        });
-        Self { stop, addr, handle: Some(handle) }
+        })?;
+        Ok(Self { stop, addr, handle: Some(handle) })
     }
-    fn port(&self) -> u16 {
-        self.addr.port()
-    }
+    fn port(&self) -> u16 { self.addr.port() }
 }
 impl Drop for Acceptor {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Release);
-        // A blocked accept only returns for a connection: make one to ourselves.
+        // A blocked accept only returns for a connection: make one to ourselves, retrying
+        // when a full backlog or a busy loopback refuses it.
         let port = self.addr.port();
-        let poked = [SocketAddr::from(([127, 0, 0, 1], port)), SocketAddr::from(([0u16, 0, 0, 0, 0, 0, 0, 1], port))]
-            .iter()
-            .any(|a| TcpStream::connect_timeout(a, Duration::from_millis(500)).is_ok());
+        let targets = [SocketAddr::from(([127, 0, 0, 1], port)), SocketAddr::from(([0u16, 0, 0, 0, 0, 0, 0, 1], port))];
+        let poked = (0..5).any(|n| {
+            if n > 0 { thread::sleep(Duration::from_millis(50)); }
+            targets.iter().any(|a| TcpStream::connect_timeout(a, Duration::from_millis(200)).is_ok())
+        });
         if let Some(handle) = self.handle.take() {
-            if poked {
-                let _ = handle.join();
-            }
+            if poked { let _ = handle.join(); }
         }
     }
 }
 
 struct Link {
     token: u64,
-    tx: SyncSender<Msg>,
+    tx: queue::Sender,
     cancel: Arc<AtomicBool>,
     name: String,
     os: Os,
@@ -348,9 +369,13 @@ struct Link {
 }
 impl Link {
     fn send(&self, msg: Msg) {
-        if self.tx.try_send(msg).is_err() {
-            // A stalled writer must not grow memory or block the input service.
-            self.cancel.store(true, Ordering::Release);
+        if let Err(msg) = self.tx.try_send(msg) {
+            // Motion and other replaceable updates may be dropped under backpressure.
+            // Losing a state transition could leave keys or buttons held remotely.
+            if matches!(msg, Msg::Input(InputEvent::Key { .. } | InputEvent::Button { .. })
+                | Msg::Enter { .. } | Msg::Leave { .. } | Msg::ReleaseAll) {
+                self.cancel.store(true, Ordering::Release);
+            }
         }
     }
 }
@@ -420,6 +445,8 @@ struct Control {
     clip_sigs: HashMap<String, Vec<u8>>,
     /// Per peer: transfer id and hash queued but not yet flushed to its socket.
     pending_clip: HashMap<String, (u32, Vec<u8>)>,
+    /// Targets requested while a completed receive is still being finalized.
+    deferred_clipboard: HashSet<String>,
     /// Fingerprint of the content that last arrived, and the peer it came from.
     clip_origin: Option<(Vec<u8>, String, bool)>,
     /// On a sub: computers its master's roster vouches for (runtime only, `via_master`).
@@ -503,6 +530,7 @@ impl Control {
             client: self.client.clone(),
             server: self.server.clone(),
             events: self.events.clone(),
+            wake: self.wake.clone(),
             cancel: cancelled,
             addr,
             outgoing,
@@ -622,7 +650,8 @@ impl Control {
         self.publish(true);
     }
     fn poll_interval(&self) -> Duration {
-        if self.file_jobs.busy() || !self.links.is_empty() || !self.workers.is_empty()
+        if self.file_jobs.busy() || (!self.links.is_empty() && !self.config.app_drives_edges)
+            || self.edge_wait.is_some() || self.edge_hit.is_some()
             || !matches!(self.state, State::Local) || self.outgoing.is_some() || self.incoming.is_some()
         {
             POLL
@@ -690,6 +719,7 @@ impl Control {
             self.file_jobs.cancel_direction(1);
             self.outgoing = None;
             self.pending_clip.clear();
+            self.deferred_clipboard.clear();
             if let Some((_, incoming)) = self.incoming.take() { incoming.abandon(); }
         }
         self.config = config;
@@ -699,9 +729,16 @@ impl Control {
         if rebind {
             self.listener = None;
             if self.config.on {
-                match bind(self.config.port) {
+                // The old listener may need a moment to let go of the port.
+                let mut started = None;
+                for n in 0..10 {
+                    if n > 0 { thread::sleep(Duration::from_millis(50)); }
+                    started = Some(bind(self.config.port)
+                        .and_then(|l| Acceptor::start(l, self.events.clone(), self.wake.clone())));
+                    if started.as_ref().is_some_and(|r| r.is_ok()) || self.config.port == 0 { break; }
+                }
+                match started.unwrap() {
                     Ok(l) => {
-                        let l = Acceptor::start(l, self.events.clone(), self.wake.clone());
                         self.status.lock().unwrap().me.port = l.port();
                         self.listener = Some(l)
                     }
@@ -1774,7 +1811,10 @@ impl Control {
         if !self.config.share_clipboard || !self.links.contains_key(peer) {
             return;
         }
-        self.file_jobs.cancel_direction(0);
+        if self.file_jobs.receiving() {
+            self.deferred_clipboard.insert(peer.into());
+            return;
+        }
         let limit = u64::from(crate::transfer::LIMIT_MB) * 1024 * 1024;
         if limit > 0 {
             let mut files = self.platform.clipboard_files();
@@ -1893,16 +1933,19 @@ impl Control {
             match out.next() {
                 Ok(Some(msg)) => {
                     let done = matches!(msg, Msg::ClipDone { .. });
-                    if matches!(msg, Msg::ClipChunk { .. }) {
+                    let chunk = matches!(msg, Msg::ClipChunk { .. });
+                    if chunk {
                         link.bulk.fetch_add(1, Ordering::AcqRel);
                     }
-                    if link.tx.try_send(msg).is_err() {
-                        self.pending_clip.remove(peer.as_str());
-                        self.outgoing = None;
-                        self.transfer_note("send", "files", "failed");
+                    if let Err(msg) = link.tx.try_send(msg) {
+                        if chunk { link.bulk.fetch_sub(1, Ordering::AcqRel); }
+                        out.retry(msg);
                         return;
                     }
                     if done {
+                        if let Some(sig) = out.sent_signature() {
+                            self.pending_clip.insert(peer.clone(), (out.id(), sig.to_vec()));
+                        }
                         break;
                     }
                 }
@@ -2003,8 +2046,13 @@ impl Control {
         });
     }
     fn poll_file_jobs(&mut self) {
+        if let Some(done) = self.file_jobs.poll() { self.apply_file_job(done); }
+        if !self.file_jobs.receiving() {
+            for peer in std::mem::take(&mut self.deferred_clipboard) { self.send_clipboard(&peer); }
+        }
+    }
+    fn apply_file_job(&mut self, done: files::Completion) {
         use crate::transfer::Received;
-        let Some(done) = self.file_jobs.poll() else { return };
         if !self.config.on || !self.config.share_clipboard
             || !self.links.get(&done.peer).is_some_and(|l| l.token == done.token)
         { return; }
@@ -2012,12 +2060,14 @@ impl Control {
             Ok(files::Content::Send(out, sig)) => {
                 if self.clip_wanted(&done.peer, &sig) { self.begin_send(&done.peer, "files", out, sig); }
             }
-            Ok(files::Content::Receive(received, sig, dest)) => {
-                match received {
+            Ok(files::Content::Receive(mut receipt)) => {
+                let current = done.revision == self.transfer_revision;
+                let sig = receipt.sig.take();
+                match receipt.received.take().unwrap() {
                     Received::Files(paths) => {
                         // Completion and relay fingerprints precede clipboard files.
                         if let Some(sig) = sig { self.clip_received(&done.peer, sig); }
-                        self.transfer_finished(Some(dest.display().to_string()));
+                        if current { self.transfer_finished(Some(receipt.dest.display().to_string())); }
                         self.platform.set_clipboard_files(&paths);
                     }
                     other => {
@@ -2027,7 +2077,7 @@ impl Control {
                             Received::Files(_) => unreachable!(),
                         }
                         if let Some(sig) = sig { self.clip_received(&done.peer, sig); }
-                        self.transfer_finished(None);
+                        if current { self.transfer_finished(None); }
                     }
                 }
             }
@@ -2150,6 +2200,7 @@ struct Worker {
     client: Arc<rustls::ClientConfig>,
     server: Arc<rustls::ServerConfig>,
     events: Sender<Event>,
+    wake: Sender<Command>,
     cancel: Arc<AtomicBool>,
     addr: SocketAddr,
     outgoing: bool,
@@ -2157,6 +2208,11 @@ struct Worker {
     expected: Option<String>,
 }
 impl Worker {
+    fn emit(&self, event: Event) -> Result<()> {
+        self.events.send(event)?;
+        let _ = self.wake.send(Command::Wake);
+        Ok(())
+    }
     fn run(self, socket: Option<TcpStream>) {
         let token = NEXT_LINK.fetch_add(1, Ordering::Relaxed);
         let mut remote = None;
@@ -2164,10 +2220,10 @@ impl Worker {
             log::debug!("network link {}: {e:#}", self.addr);
         }
         if let Some(id) = remote {
-            let _ = self.events.send(Event::Closed(id, token));
+            let _ = self.emit(Event::Closed(id, token));
         }
         if self.outgoing {
-            let _ = self.events.send(Event::DialDone(self.addr));
+            let _ = self.emit(Event::DialDone(self.addr));
         }
     }
     fn transport(
@@ -2218,33 +2274,16 @@ impl Worker {
                 listen_port: Some(self.listen_port),
             },
         )?;
-        let (tx, rx) = mpsc::sync_channel(LINK_QUEUE);
+        let (tx, rx) = queue::channel();
         let mut tx = Some(tx);
         let bulk = Arc::new(AtomicUsize::new(0));
         let mut pending_clip = None;
+        let mut queued = None;
         let mut bytes = Vec::new();
         let mut chunk = [0; 8192];
         loop {
             let cancelled = self.cancel.load(Ordering::Acquire);
-            // A new message only once the socket took everything before it, so a
-            // transfer never piles up ahead of the input that follows it.
-            for _ in 0..128 {
-                if conn.wants_write() {
-                    break;
-                }
-                match rx.try_recv() {
-                    Ok(msg) => {
-                        proto::write_frame(conn.writer(), &msg)?;
-                        if let Msg::ClipDone { id } = msg {
-                            pending_clip = Some(id);
-                        }
-                        if matches!(msg, Msg::ClipChunk { .. }) {
-                            bulk.fetch_sub(1, Ordering::AcqRel);
-                        }
-                    }
-                    Err(_) => break,
-                }
-            }
+            write_link_batch(&mut conn, &mut socket, &rx, &mut queued, &bulk, &mut pending_clip)?;
             if cancelled {
                 conn.send_close_notify();
             }
@@ -2261,7 +2300,7 @@ impl Worker {
             }
             if !conn.wants_write() {
                 if let (Some(id), Some(peer)) = (pending_clip.take(), remote.as_ref()) {
-                    self.events.send(Event::ClipSent(peer.clone(), token, id))?;
+                    self.emit(Event::ClipSent(peer.clone(), token, id))?;
                 }
             }
             match conn.read_tls(&mut socket) {
@@ -2317,7 +2356,7 @@ impl Worker {
                     // Keep the socket's real IP and the advertised listening port.
                     let mut addr = self.addr;
                     if !self.outgoing { addr.set_port(listen_port.unwrap_or(47160)); }
-                    self.events.send(Event::Connected(
+                    self.emit(Event::Connected(
                         id,
                         Link {
                             token,
@@ -2341,7 +2380,7 @@ impl Worker {
                         self.pair,
                     ))?;
                 } else {
-                    self.events.send(Event::Message(
+                    self.emit(Event::Message(
                         remote.as_ref().unwrap().clone(),
                         token,
                         msg,
@@ -2352,9 +2391,49 @@ impl Worker {
                 remote.is_some() || Instant::now() < deadline,
                 "Hello timeout"
             );
-            thread::sleep(Duration::from_millis(2));
+            if queued.is_none() { queued = rx.recv_timeout(Duration::from_millis(2)).ok(); }
+            else { thread::sleep(Duration::from_millis(2)); }
         }
     }
+}
+/// Flush small frames in one wake, while bounding clipboard work and socket backlog.
+fn write_link_batch(
+    conn: &mut rustls::Connection,
+    socket: &mut impl std::io::Write,
+    rx: &queue::Receiver,
+    queued: &mut Option<Msg>,
+    bulk: &AtomicUsize,
+    pending_clip: &mut Option<u32>,
+) -> Result<()> {
+    // Drain small frames while the socket accepts them. A large clipboard
+    // chunk yields to reading, keeping input responsive in both directions.
+    for _ in 0..128 {
+        while conn.wants_write() {
+            match conn.write_tls(&mut *socket) {
+                Ok(0) => anyhow::bail!("socket closed"),
+                Ok(_) => {}
+                Err(e) if transient(&e) => break,
+                Err(e) => return Err(e.into()),
+            }
+        }
+        if conn.wants_write() {
+            break;
+        }
+        match queued.take().map(Ok).unwrap_or_else(|| rx.try_recv()) {
+            Ok(msg) => {
+                proto::write_frame(conn.writer(), &msg)?;
+                if let Msg::ClipDone { id } = msg {
+                    *pending_clip = Some(id);
+                }
+                if matches!(msg, Msg::ClipChunk { .. }) {
+                    bulk.fetch_sub(1, Ordering::AcqRel);
+                    break;
+                }
+            }
+            Err(_) => break,
+        }
+    }
+    Ok(())
 }
 fn transient(e: &std::io::Error) -> bool {
     matches!(
@@ -2518,6 +2597,7 @@ mod tests {
             keys: HashSet::new(),
             clip_sigs: HashMap::new(),
             pending_clip: HashMap::new(),
+            deferred_clipboard: HashSet::new(),
             clip_origin: None,
             trusted: vec![],
             group: None,
@@ -2554,8 +2634,8 @@ mod tests {
     fn peer(id: &str, role: Role) -> PeerConfig {
         PeerConfig { id: id.into(), fingerprint: id.repeat(4), role, os: Os::Mac, ..PeerConfig::default() }
     }
-    fn link(c: &mut Control, id: &str, role: Role) -> Receiver<Msg> {
-        let (tx, rx) = mpsc::sync_channel(LINK_QUEUE);
+    fn link(c: &mut Control, id: &str, role: Role) -> queue::Receiver {
+        let (tx, rx) = queue::channel();
         c.event(Event::Connected(id.into(), Link {
             token: 1, tx, cancel: Arc::new(AtomicBool::new(false)), name: id.into(), os: Os::Mac,
             role, features: proto::FEATURES.iter().map(|s| s.to_string()).collect(), fp: id.repeat(4),
@@ -2581,6 +2661,59 @@ mod tests {
             .map(|(id, can_send)| Member { id: id.into(), name: id.into(), os: Os::Windows, fingerprint: id.repeat(4), addr: String::new(), can_send, features: proto::FEATURES.iter().map(|s| s.to_string()).collect() }).collect()
     }
     fn key(usage: u16, down: bool) -> InputEvent { InputEvent::Key { usage, down } }
+
+    #[test]
+    fn accept_pacing_is_per_ip_bounded_and_recovers() {
+        let mut pace = AcceptPace::default();
+        let now = Instant::now();
+        let a = "192.168.1.2".parse().unwrap();
+        let b = "192.168.1.3".parse().unwrap();
+        for _ in 0..MAX_ACCEPTS_PER_IP { assert!(pace.allow(a, now)); }
+        assert!(!pace.allow(a, now));
+        assert!(!pace.allow("::ffff:192.168.1.2".parse().unwrap(), now));
+        assert!(pace.allow(b, now));
+        assert!(pace.allow(a, now + DEAD));
+        for n in 0..1100u32 {
+            pace.allow(std::net::Ipv4Addr::from(0x0a000001 + n).into(), now + DEAD);
+        }
+        assert_eq!(pace.0.len(), 1024);
+        assert!(pace.allow(b, now + DEAD * 2));
+    }
+
+    #[test]
+    fn app_driven_local_edges_idle_until_network_or_control_work_arrives() {
+        let mut r = rig(Role::Master);
+        r.c.config.peers.push(peer(SUB, Role::Sub));
+        let _rx = link(&mut r.c, SUB, Role::Sub);
+        r.c.config.app_drives_edges = true;
+        assert_eq!(r.c.poll_interval(), IDLE_POLL);
+        controlling(&mut r.c, SUB);
+        assert_eq!(r.c.poll_interval(), POLL);
+        r.c.state = State::Local;
+        r.c.edge_wait = Some((Side::Right, Instant::now()));
+        assert_eq!(r.c.poll_interval(), POLL);
+    }
+
+    #[test]
+    fn coalescing_preserves_button_order_and_full_queue_motion_does_not_cancel() {
+        let mut r = rig(Role::Master);
+        r.c.config.peers.push(peer(SUB, Role::Sub));
+        let rx = link(&mut r.c, SUB, Role::Sub);
+        rx.try_iter().for_each(drop);
+        let link = &r.c.links[SUB];
+        let motion = |dx| Msg::Input(InputEvent::Motion { dx, dy: 0.0 });
+        link.send(motion(1.0));
+        link.send(motion(2.0));
+        link.send(Msg::Input(InputEvent::Button { button: MouseButton::Left, down: true }));
+        link.send(motion(4.0));
+        assert_eq!(rx.try_iter().collect::<Vec<_>>(), vec![motion(3.0),
+            Msg::Input(InputEvent::Button { button: MouseButton::Left, down: true }), motion(4.0)]);
+        for _ in 0..LINK_QUEUE { link.send(Msg::Input(key(4, true))); }
+        link.send(motion(10.0));
+        link.send(Msg::Ping { t: 1 });
+        assert!(!link.cancel.load(Ordering::Acquire));
+        assert_eq!(rx.try_iter().count(), LINK_QUEUE);
+    }
 
     #[test]
     fn service_backs_off_only_without_live_work() {
@@ -2680,6 +2813,122 @@ mod tests {
         r.c.publish(true);
         assert_eq!(std::fs::metadata(&path).unwrap().modified().unwrap(), modified);
         assert_eq!(std::fs::read(path).unwrap(), bytes);
+    }
+
+    #[test]
+    fn five_thousand_motions_preserve_distance_without_cancelling() {
+        let mut r = rig(Role::Master);
+        r.c.config.peers.push(peer(SUB, Role::Sub));
+        let rx = link(&mut r.c, SUB, Role::Sub);
+        rx.try_iter().for_each(drop);
+        let link = &r.c.links[SUB];
+        for _ in 0..5000 {
+            link.send(Msg::Input(InputEvent::Motion { dx: 1.0, dy: -2.0 }));
+        }
+        assert!(!link.cancel.load(Ordering::Acquire));
+        let (mut x, mut y) = (0.0, 0.0);
+        for msg in rx.try_iter() {
+            if let Msg::Input(InputEvent::Motion { dx, dy }) = msg { x += dx; y += dy; }
+        }
+        assert_eq!((x, y), (5000.0, -10000.0));
+    }
+
+    #[test]
+    fn rejected_chunk_does_not_leak_bulk_count() {
+        let mut r = rig(Role::Master);
+        r.c.config.peers.push(peer(SUB, Role::Sub));
+        let rx = link(&mut r.c, SUB, Role::Sub);
+        rx.try_iter().for_each(drop);
+        for _ in 0..LINK_QUEUE - 1 { r.c.links[SUB].send(Msg::Input(key(4, true))); }
+        r.c.begin_send(SUB, "image", crate::transfer::Outgoing::bytes(7,
+            crate::transfer::ClipKind::Image, "image", vec![1; 20]), vec![1]);
+        r.c.flush_transfer();
+        assert_eq!(r.c.links[SUB].bulk.load(Ordering::Acquire), 0);
+        r.c.flush_transfer();
+        assert_eq!(r.c.links[SUB].bulk.load(Ordering::Acquire), 0);
+        assert!(!r.c.links[SUB].cancel.load(Ordering::Acquire));
+        assert!(r.c.outgoing.is_some());
+        rx.try_iter().for_each(drop);
+        r.c.flush_transfer();
+        let frames: Vec<_> = rx.try_iter().collect();
+        assert_eq!(frames.iter().filter(|m| matches!(m, Msg::ClipChunk { .. })).count(), 1);
+        assert!(matches!(frames.last(), Some(Msg::ClipDone { .. })));
+        assert!(r.c.outgoing.is_none());
+    }
+
+    #[test]
+    fn already_synced_peer_does_not_cancel_another_peers_file_preparation() {
+        let mut r = rig(Role::Master);
+        r.c.config.peers.extend([peer(SUB, Role::Sub), peer(OTHER, Role::Sub)]);
+        let _b = link(&mut r.c, SUB, Role::Sub);
+        let _c = link(&mut r.c, OTHER, Role::Sub);
+        let path = r.dir.join("file");
+        std::fs::write(&path, b"clipboard").unwrap();
+        *r.p.files.lock().unwrap() = vec![path.clone()];
+        r.c.clip_sigs.insert(OTHER.into(), files_sig(&[path]).unwrap());
+        let release = r.c.file_jobs.hold_worker("disk");
+        r.c.send_clipboard(SUB);
+        r.c.send_clipboard(OTHER);
+        release.send(()).unwrap();
+        finish_file_jobs(&mut r.c);
+        assert_eq!(r.c.outgoing.as_ref().map(|(peer, _)| peer.as_str()), Some(SUB));
+    }
+
+    fn queue_empty_receive(c: &mut Control) {
+        c.clip_start(SUB, 9, crate::transfer::ClipKind::Files,
+            vec![crate::transfer::FileMeta { name: "received".into(), size: 0 }]);
+        c.clip_done(SUB, 9);
+    }
+
+    #[test]
+    fn crossing_during_receive_relays_the_completed_files() {
+        let mut r = rig(Role::Master);
+        r.c.config.peers.extend([peer(SUB, Role::Sub), peer(OTHER, Role::Sub)]);
+        let _b = link(&mut r.c, SUB, Role::Sub);
+        let _c = link(&mut r.c, OTHER, Role::Sub);
+        let release = r.c.file_jobs.hold_worker("disk");
+        queue_empty_receive(&mut r.c);
+        r.c.send_clipboard(OTHER);
+        release.send(()).unwrap();
+        finish_file_jobs(&mut r.c);
+        assert_eq!(r.c.outgoing.as_ref().map(|(peer, _)| peer.as_str()), Some(OTHER));
+        assert_eq!(r.c.pending_clip[OTHER].1, r.c.clip_sigs[SUB]);
+    }
+
+    #[test]
+    fn older_receive_does_not_finish_a_newer_send_status() {
+        let mut r = rig(Role::Master);
+        r.c.config.peers.push(peer(SUB, Role::Sub));
+        let _rx = link(&mut r.c, SUB, Role::Sub);
+        let release = r.c.file_jobs.hold_worker("disk");
+        queue_empty_receive(&mut r.c);
+        r.c.begin_send(SUB, "image", crate::transfer::Outgoing::bytes(11,
+            crate::transfer::ClipKind::Image, "image", vec![1; 20]), vec![1]);
+        release.send(()).unwrap();
+        finish_file_jobs(&mut r.c);
+        let status = r.c.status.lock().unwrap();
+        let transfer = status.transfer.as_ref().unwrap();
+        assert_eq!(transfer.stage, "running");
+        assert_eq!(transfer.direction, "send");
+        assert_eq!(transfer.done_bytes, 0);
+        assert!(transfer.saved_in.is_none());
+        assert_eq!(r.p.files.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn file_signature_matches_the_bytes_actually_sent_after_a_change() {
+        let mut r = rig(Role::Master);
+        r.c.config.peers.push(peer(SUB, Role::Sub));
+        let _rx = link(&mut r.c, SUB, Role::Sub);
+        let path = r.dir.join("file");
+        std::fs::write(&path, b"before").unwrap();
+        *r.p.files.lock().unwrap() = vec![path.clone()];
+        r.c.send_clipboard(SUB);
+        finish_file_jobs(&mut r.c);
+        std::fs::write(&path, b"after!").unwrap();
+        r.c.flush_transfer();
+        assert!(r.c.outgoing.is_none());
+        assert_eq!(r.c.pending_clip[SUB].1, files_sig(&[path]).unwrap());
     }
 
     #[test]

@@ -1,8 +1,9 @@
-//! At most one disk worker and one waiting job per direction. No worker stays idle.
+//! One disk worker, one waiting receive and one send request per linked peer.
 use super::{clip_sig, files_sig_cancellable};
 use crate::transfer::{Incoming, Outgoing, Received};
 use anyhow::Result;
 use std::{
+    collections::VecDeque,
     path::PathBuf,
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -38,20 +39,35 @@ impl Work {
             }
             Self::Receive { incoming, dest } => {
                 anyhow::ensure!(!cancel.load(Ordering::Acquire), "cancelled");
-                let received = incoming.finish(&dest)?;
-                let sig = match &received {
-                    Received::Files(paths) => files_sig_cancellable(paths, cancel).ok(),
+                let received = incoming.finish_cancellable(&dest, cancel)?;
+                let mut receipt = Receipt { received: Some(received), sig: None, dest };
+                receipt.sig = match receipt.received.as_ref().unwrap() {
+                    Received::Files(paths) => Some(files_sig_cancellable(paths, cancel)?),
                     Received::Image(png) => Some(clip_sig(b"image", &[png])),
                     Received::Text(text) => Some(clip_sig(b"text", &[text.as_bytes()])),
                 };
-                Ok(Content::Receive(received, sig, dest))
+                anyhow::ensure!(!cancel.load(Ordering::Acquire), "cancelled");
+                Ok(Content::Receive(receipt))
             }
         }
     }
 }
 pub(super) enum Content {
     Send(Outgoing, Vec<u8>),
-    Receive(Received, Option<Vec<u8>>, PathBuf),
+    Receive(Receipt),
+}
+/// Owns published files until the service accepts this completion.
+pub(super) struct Receipt {
+    pub received: Option<Received>,
+    pub sig: Option<Vec<u8>>,
+    pub dest: PathBuf,
+}
+impl Drop for Receipt {
+    fn drop(&mut self) {
+        if let Some(Received::Files(paths)) = &self.received {
+            for path in paths { let _ = std::fs::remove_file(path); }
+        }
+    }
 }
 pub(super) struct Job {
     pub peer: String,
@@ -77,7 +93,8 @@ pub(super) struct Completion {
 #[derive(Default)]
 pub(super) struct Jobs {
     running: Option<Running>,
-    waiting: [Option<Job>; 2],
+    receive: Option<Job>,
+    sends: VecDeque<Job>,
 }
 impl Jobs {
     #[cfg(test)]
@@ -98,11 +115,20 @@ impl Jobs {
     }
     pub fn submit(&mut self, job: Job) {
         let direction = job.work.direction();
-        self.cancel_direction(direction);
-        self.waiting[direction] = Some(job);
+        if direction == 0 {
+            self.sends.retain(|old| old.peer != job.peer);
+            if let Some(r) = &self.running {
+                if r.direction == 0 && r.peer == job.peer { r.cancel.store(true, Ordering::Release); }
+            }
+            self.sends.push_back(job);
+        } else {
+            self.cancel_direction(direction);
+            self.receive = Some(job);
+        }
     }
     pub fn cancel_direction(&mut self, direction: usize) -> bool {
-        let mut cancelled = self.waiting[direction].take().is_some();
+        let mut cancelled = if direction == 1 { self.receive.take().is_some() }
+            else { let queued = !self.sends.is_empty(); self.sends.clear(); queued };
         if let Some(r) = &self.running {
             if r.direction == direction {
                 cancelled |= !r.cancel.swap(true, Ordering::AcqRel);
@@ -112,11 +138,10 @@ impl Jobs {
     }
     pub fn cancel_peer(&mut self, peer: &str) -> bool {
         let mut receiving = false;
-        for job in &mut self.waiting {
-            if job.as_ref().is_some_and(|j| j.peer == peer) {
-                receiving |= job.as_ref().unwrap().work.direction() == 1;
-                *job = None;
-            }
+        self.sends.retain(|job| job.peer != peer);
+        if self.receive.as_ref().is_some_and(|job| job.peer == peer) {
+            self.receive = None;
+            receiving = true;
         }
         if let Some(r) = &self.running {
             if r.peer == peer {
@@ -127,7 +152,11 @@ impl Jobs {
         receiving
     }
     pub fn busy(&self) -> bool {
-        self.running.is_some() || self.waiting.iter().any(Option::is_some)
+        self.running.is_some() || self.receive.is_some() || !self.sends.is_empty()
+    }
+    pub fn receiving(&self) -> bool {
+        self.receive.is_some() || self.running.as_ref().is_some_and(|r|
+            r.direction == 1 && !r.cancel.load(Ordering::Acquire))
     }
     pub fn poll(&mut self) -> Option<Completion> {
         if self
@@ -152,7 +181,7 @@ impl Jobs {
         }
         if self.running.is_none() {
             // Finish a received clipboard before preparing another outgoing one.
-            if let Some(job) = self.waiting[1].take().or_else(|| self.waiting[0].take()) {
+            if let Some(job) = self.receive.take().or_else(|| self.sends.pop_front()) {
                 let direction = job.work.direction();
                 let cancel = Arc::new(AtomicBool::new(false));
                 let flag = cancel.clone();
@@ -186,7 +215,8 @@ impl Jobs {
         None
     }
     pub fn stop(&mut self) {
-        self.waiting = [None, None];
+        self.receive = None;
+        self.sends.clear();
         if let Some(r) = self.running.take() {
             r.cancel.store(true, Ordering::Release);
             let _ = r.handle.join();
@@ -207,7 +237,7 @@ mod tests {
     #[test]
     fn only_the_latest_job_waits_and_cancelled_workers_are_reaped() {
         let mut jobs = Jobs::default();
-        let release = jobs.hold_worker("old");
+        let release = jobs.hold_worker("new");
         for id in 1..100 {
             jobs.submit(Job {
                 peer: "new".into(),
@@ -226,8 +256,8 @@ mod tests {
             .unwrap()
             .cancel
             .load(Ordering::Acquire));
-        assert_eq!(jobs.waiting.iter().flatten().count(), 1);
-        assert_eq!(jobs.waiting[0].as_ref().unwrap().revision, 99);
+        assert_eq!(jobs.sends.len(), 1);
+        assert_eq!(jobs.sends.front().unwrap().revision, 99);
         release.send(()).unwrap();
         let deadline = Instant::now() + Duration::from_secs(2);
         let mut completed = vec![];
@@ -240,6 +270,27 @@ mod tests {
         }
         assert_eq!(completed, [99]);
         assert!(jobs.running.is_none());
+    }
+
+    #[test]
+    fn cancelling_a_completed_receive_removes_published_files() {
+        let dir = std::env::temp_dir().join(format!("flock-completed-receive-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let incoming = Incoming::start(43, crate::transfer::ClipKind::Files,
+            vec![crate::transfer::FileMeta { name: "empty".into(), size: 0 }], 100, &dir).unwrap();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let flag = cancel.clone();
+        let dest = dir.join("dest");
+        let handle = thread::spawn(move || Work::Receive { incoming, dest }.run(&flag));
+        while !handle.is_finished() { thread::yield_now(); }
+        assert!(dir.join("dest/empty").exists());
+        let mut jobs = Jobs::default();
+        jobs.running = Some(Running { peer: "gone".into(), token: 1, revision: 1,
+            direction: 1, cancel, handle });
+        jobs.cancel_direction(1);
+        jobs.poll();
+        assert!(!dir.join("dest/empty").exists());
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
