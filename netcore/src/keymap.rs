@@ -254,12 +254,21 @@ pub(crate) struct KeyMapper {
     swallow: HashSet<u16>,
     /// Source keys rewritten as a whole chord: each press repeats it, the release is dropped.
     rewritten: HashSet<u16>,
+    /// Source keys whose press went out as itself; their repeats stay plain, so a chord
+    /// started later cannot swallow the release.
+    sent: HashSet<u16>,
+    /// Source modifiers lifted from the receiver and pressed again by a chord: their
+    /// release is masked at a Windows or Linux receiver.
+    restored: HashSet<u16>,
     caps: Option<Caps>,
+    caps_hold_ms: Option<u64>,
 }
 struct Ctx<'a> {
     src: Os,
     dst: Os,
     rules: &'a DirRules,
+    /// Modifiers `around` lifted and put back during this call.
+    lifted: std::cell::RefCell<Vec<u16>>,
 }
 impl Ctx<'_> {
     fn map_mod(&self, usage: u16) -> u16 {
@@ -269,10 +278,31 @@ impl Ctx<'_> {
     /// back after.
     fn around(&self, held: &HashSet<u16>, release: impl Fn(u16) -> bool, out: Vec<InputEvent>) -> Vec<InputEvent> {
         let lifted: Vec<u16> = (LCTRL..=0xe7).filter(|u| held.contains(u) && release(*u)).collect();
-        let mut events: Vec<_> = lifted.iter().map(|&u| key(self.map_mod(u), false)).collect();
+        let mut events = vec![];
+        let mut masked = false;
+        for &u in &lifted {
+            let to = self.map_mod(u);
+            if !masked && self.needs_mask(to) {
+                // Ctrl still down at the receiver once the lifts so far are done?
+                let ctrl = held.iter().any(|&h| !lifted.iter().take_while(|&&l| l != u).any(|&l| l == h) && is_kind(self.map_mod(h), 0));
+                if !ctrl {
+                    events.extend(tap(LCTRL));
+                }
+                masked = true;
+            }
+            events.push(key(to, false));
+        }
+        self.lifted.borrow_mut().extend(&lifted);
         events.extend(out);
         events.extend(lifted.iter().map(|&u| key(self.map_mod(u), true)));
         events
+    }
+}
+impl Ctx<'_> {
+    /// Windows and Linux open a menu or the Start/Activities view when Alt or the Win key
+    /// goes up on its own; a Ctrl tap before the release is what they count as a key between.
+    fn needs_mask(&self, dst_modifier: u16) -> bool {
+        matches!(self.dst, Os::Windows | Os::Linux) && (is_kind(dst_modifier, 2) || is_kind(dst_modifier, 3))
     }
 }
 fn is_kind(usage: u16, kind: u16) -> bool {
@@ -280,36 +310,65 @@ fn is_kind(usage: u16, kind: u16) -> bool {
 }
 impl KeyMapper {
     pub(crate) fn map(&mut self, event: InputEvent, src: Os, dst: Os, rules: &DirRules, now: Instant) -> Vec<InputEvent> {
+        let cx = Ctx { src, dst, rules, lifted: Default::default() };
+        let out = self.map_with(event, &cx, now);
+        self.restored.extend(cx.lifted.take());
+        out
+    }
+    /// The held modifiers the receiver really has: a swallowed key never went out.
+    fn live(&self) -> HashSet<u16> {
+        self.held.difference(&self.swallow).copied().collect()
+    }
+    fn map_with(&mut self, event: InputEvent, cx: &Ctx, now: Instant) -> Vec<InputEvent> {
         let InputEvent::Key { usage, down } = event else { return vec![event] };
-        let cx = Ctx { src, dst, rules };
+        let rules = cx.rules;
         if !down {
             self.held.remove(&usage);
+            self.sent.remove(&usage);
             if usage == CAPS {
+                let hold = self.caps_hold_ms.take();
                 match self.caps.take() {
-                    Some(Caps::Pending(at)) if at.elapsed_at(now) >= CAPS_LONG_PRESS => return tap(CAPS).into(),
-                    Some(Caps::Pending(_)) => return hangul_tap(rules.hangul_dst),
+                    Some(Caps::Pending(at)) if hold.map(Duration::from_millis).unwrap_or_else(|| at.elapsed_at(now)) >= CAPS_LONG_PRESS => return tap(CAPS).into(),
+                    Some(Caps::Pending(_)) => return cx.around(&self.live(), |_| true, hangul_tap(rules.hangul_dst)),
                     Some(Caps::Real) => return vec![key(CAPS, false)],
                     None => {}
                 }
             }
             if self.swallow.remove(&usage) || self.rewritten.remove(&usage) {
+                self.restored.remove(&usage);
                 return vec![];
             }
-            return vec![key(cx.map_mod(usage), false)];
+            let to = cx.map_mod(usage);
+            if self.restored.remove(&usage) && cx.needs_mask(to) && !self.live().iter().any(|&h| is_kind(cx.map_mod(h), 0)) {
+                // Pressed again after a chord: its release must not look like a lone Alt or Win tap.
+                return [tap(LCTRL).to_vec(), vec![key(to, false)]].concat();
+            }
+            return vec![key(to, false)];
+        }
+        if self.sent.contains(&usage) {
+            // Auto-repeat of a key already sent as itself.
+            return vec![key(cx.map_mod(usage), true)];
         }
         self.held.insert(usage);
         if self.swallow.contains(&usage) || (usage == CAPS && self.caps.is_some()) {
             return vec![];
         }
-        if let Some(events) = self.hangul(&cx, usage, now) {
+        if let Some(events) = self.hangul(cx, usage, now) {
             return events;
         }
-        if let Some(events) = self.chords(&cx, usage) {
+        if let Some(events) = self.chords(cx, usage) {
             self.rewritten.insert(usage);
             return events;
         }
         self.rewritten.remove(&usage);
+        self.sent.insert(usage);
         vec![key(cx.map_mod(usage), true)]
+    }
+    /// A duration measured by capture for this release, including collapsed down/up pairs.
+    pub(crate) fn caps_hold_ms(&mut self, ms: u64) {
+        if matches!(self.caps, Some(Caps::Pending(_))) {
+            self.caps_hold_ms = Some(ms);
+        }
     }
     /// Time-driven part: a Caps Lock held long enough turns into a real Caps Lock.
     pub(crate) fn tick(&mut self, now: Instant) -> Vec<InputEvent> {
@@ -322,7 +381,8 @@ impl KeyMapper {
         vec![]
     }
     fn hangul(&mut self, cx: &Ctx, usage: u16, now: Instant) -> Option<Vec<InputEvent>> {
-        let (rules, mods) = (cx.rules, Mods::of(&self.held));
+        let (rules, held) = (cx.rules, self.live());
+        let mods = Mods::of(&held);
         let dst = rules.hangul_dst;
         let listed = |k| rules.hangul_src.contains(&k);
         let plain = match usage {
@@ -340,7 +400,7 @@ impl KeyMapper {
                 return Some(vec![]);
             }
             self.swallow.insert(usage);
-            return Some(hangul_tap(dst));
+            return Some(cx.around(&held, |u| u != usage, hangul_tap(dst)));
         }
         let chord = if listed(HangulKey::ShiftSpace) && mods.only(false, true, false, false) {
             HangulKey::ShiftSpace
@@ -351,21 +411,19 @@ impl KeyMapper {
         } else {
             return None;
         };
-        if chord == dst {
-            return None;
-        }
         self.swallow.insert(SPACE);
         let lift = |u: u16| match chord {
             HangulKey::ShiftSpace => is_kind(u, 1),
             HangulKey::ControlSpace => is_kind(u, 0),
             _ => is_kind(u, 3),
         };
-        Some(cx.around(&self.held, lift, hangul_tap(dst)))
+        Some(cx.around(&held, lift, hangul_tap(dst)))
     }
     /// Hanja, navigation and capture chords. These match on the source keys, so they
     /// come before the modifier table, and write destination keys directly.
     fn chords(&self, cx: &Ctx, usage: u16) -> Option<Vec<InputEvent>> {
-        let (rules, mods, held) = (cx.rules, Mods::of(&self.held), &self.held);
+        let (rules, held) = (cx.rules, &self.live());
+        let mods = Mods::of(held);
         let (mac_src, mac_dst) = (cx.src == Os::Mac, cx.dst == Os::Mac);
         let nav = rules.nav;
         let edge = |to: u16| tap(to).to_vec();
@@ -374,10 +432,11 @@ impl KeyMapper {
             if mac_src && usage == RETURN && mods.only(false, false, true, false) {
                 return Some(cx.around(held, |u| is_kind(u, 2), tap(LANG2).into()));
             }
-            if !mac_src && mac_dst && (usage == LANG2 || (cx.src == Os::Linux && usage == F9)) {
+            let bare = mods.only(false, false, false, false);
+            if !mac_src && mac_dst && bare && (usage == LANG2 || (cx.src == Os::Linux && usage == F9)) {
                 return Some(with_mod(LALT, RETURN));
             }
-            if !mac_src && !mac_dst && cx.src == Os::Linux && usage == F9 {
+            if !mac_src && !mac_dst && bare && cx.src == Os::Linux && usage == F9 {
                 return Some(tap(LANG2).into());
             }
         }
@@ -1000,7 +1059,7 @@ mod rules_tests {
         // Mac Control+Space to Windows Lang1: Control reaches Windows as Win, so that is lifted.
         let rules = DirRules { mod_mode: ModMode::Function, hangul_src: vec![HangulKey::ControlSpace], ..DirRules::default_for(Os::Mac, Os::Windows) };
         let out = run_at(Os::Mac, Os::Windows, &rules, vec![k(0xe0, true), k(SPACE, true), k(SPACE, false), k(0xe0, false)]);
-        assert_eq!(out, vec![k(0xe3, true), k(0xe3, false), k(LANG1, true), k(LANG1, false), k(0xe3, true), k(0xe3, false)]);
+        assert_eq!(out, vec![k(0xe3, true), k(0xe0, true), k(0xe0, false), k(0xe3, false), k(LANG1, true), k(LANG1, false), k(0xe3, true), k(0xe0, true), k(0xe0, false), k(0xe3, false)]);
         // Linux Super+Space to Mac Caps Lock.
         let rules = DirRules { hangul_src: vec![HangulKey::SuperSpace], ..DirRules::default_for(Os::Linux, Os::Mac) };
         let out = run_at(Os::Linux, Os::Mac, &rules, vec![k(0xe7, true), k(SPACE, true), k(SPACE, true), k(0xe7, false), k(SPACE, false)]);
@@ -1020,7 +1079,7 @@ mod rules_tests {
     fn hanja_both_ways() {
         let rules = DirRules { hanja: true, ..off(Os::Mac, Os::Windows) };
         let out = run_at(Os::Mac, Os::Linux, &rules, vec![k(0xe2, true), k(RETURN, true), k(RETURN, false), k(0xe2, false)]);
-        assert_eq!(out, vec![k(0xe2, true), k(0xe2, false), k(LANG2, true), k(LANG2, false), k(0xe2, true), k(0xe2, false)]);
+        assert_eq!(out, vec![k(0xe2, true), k(0xe0, true), k(0xe0, false), k(0xe2, false), k(LANG2, true), k(LANG2, false), k(0xe2, true), k(0xe0, true), k(0xe0, false), k(0xe2, false)]);
         // Off for the Mac source by default.
         let out = run_at(Os::Mac, Os::Windows, &DirRules::default_for(Os::Mac, Os::Windows), vec![k(RETURN, true), k(RETURN, false)]);
         assert_eq!(out, taps(RETURN));
@@ -1049,7 +1108,7 @@ mod rules_tests {
             k(0xe4, false), k(END, true), k(END, false), k(0xe4, true)]);
         // Option+Left -> Ctrl+Left (Option is Alt, lifted).
         let out = run_at(Os::Mac, Os::Windows, &r, vec![k(0xe2, true), k(LEFT, true), k(LEFT, false)]);
-        assert_eq!(out, vec![k(0xe2, true), k(0xe2, false), k(0xe0, true), k(LEFT, true), k(LEFT, false), k(0xe0, false), k(0xe2, true)]);
+        assert_eq!(out, vec![k(0xe2, true), k(0xe0, true), k(0xe0, false), k(0xe2, false), k(0xe0, true), k(LEFT, true), k(LEFT, false), k(0xe0, false), k(0xe2, true)]);
         // Command+Up/Down -> Ctrl+Home/End.
         for (usage, to) in [(UP, HOME), (DOWN, END)] {
             let out = run_at(Os::Mac, Os::Windows, &r, vec![k(0xe3, true), k(usage, true)]);
@@ -1148,5 +1207,133 @@ mod rules_tests {
         let r = function(Os::Mac, Os::Windows);
         let out = run_at(Os::Mac, Os::Windows, &r, vec![k(0xe3, true), k(0x04, true), k(0x04, false), k(0xe3, false), k(0xe0, true), k(0xe0, false)]);
         assert_eq!(out, vec![k(0xe0, true), k(0x04, true), k(0x04, false), k(0xe0, false), k(0xe3, true), k(0xe3, false)]);
+    }
+    #[test]
+    fn identical_hangul_chords_use_destination_modifiers_after_mapping() {
+        for mode in [ModMode::Function, ModMode::Position, ModMode::Off] {
+            for (chord, modifier) in [(HangulKey::ControlSpace, LCTRL), (HangulKey::SuperSpace, LGUI), (HangulKey::ShiftSpace, LSHIFT)] {
+                for right in [0, 4] {
+                    let source_mod = modifier + right;
+                    let rules = DirRules { mod_mode: mode, hangul_src: vec![chord], hangul_dst: chord,
+                        mods: BTreeMap::from([(source_mod, LALT)]), ..DirRules::default_for(Os::Windows, Os::Mac) };
+                    let out = run_at(Os::Windows, Os::Mac, &rules,
+                        vec![k(source_mod, true), k(SPACE, true), k(SPACE, true), k(SPACE, false), k(source_mod, false)]);
+                    assert_eq!(out, vec![k(LALT, true), k(LALT, false), k(modifier, true), k(SPACE, true),
+                        k(SPACE, false), k(modifier, false), k(LALT, true), k(LALT, false)], "{mode:?} {chord:?}");
+                }
+            }
+        }
+        let rules = DirRules { hangul_src: vec![HangulKey::ControlSpace], hangul_dst: HangulKey::ControlSpace,
+            ..DirRules::default_for(Os::Windows, Os::Mac) };
+        assert_eq!(run_at(Os::Windows, Os::Mac, &rules, vec![k(LCTRL, true), k(SPACE, true), k(SPACE, false), k(LCTRL, false)]),
+            vec![k(LGUI, true), k(LGUI, false), k(LCTRL, true), k(SPACE, true), k(SPACE, false), k(LCTRL, false), k(LGUI, true), k(LGUI, false)]);
+    }
+
+    #[test]
+    fn single_hangul_key_restores_all_held_destination_modifiers() {
+        for (src, dst, modifier, chord) in [
+            (Os::Windows, Os::Android, LSHIFT, HangulKey::ShiftSpace),
+            (Os::Linux, Os::Android, LCTRL, HangulKey::ControlSpace),
+            (Os::Windows, Os::Mac, LCTRL, HangulKey::SuperSpace),
+        ] {
+            let rules = DirRules { hangul_dst: chord, ..DirRules::default_for(src, dst) };
+            let mapped = map_modifier(src, dst, &rules, modifier);
+            let mapped_right = map_modifier(src, dst, &rules, modifier + 4);
+            let mut expected = vec![k(mapped, true), k(mapped_right, true), k(mapped, false), k(mapped_right, false)];
+            expected.extend(hangul_tap(chord));
+            expected.extend([k(mapped, true), k(mapped_right, true), k(4, true), k(4, false), k(mapped, false), k(mapped_right, false)]);
+            let out = run_at(src, dst, &rules, vec![k(modifier, true), k(modifier + 4, true), k(LANG1, true), k(LANG1, true),
+                k(LANG1, false), k(4, true), k(4, false), k(modifier, false), k(modifier + 4, false)]);
+            assert_eq!(out, expected, "{src:?}>{dst:?}");
+        }
+    }
+
+    #[test]
+    fn collapsed_caps_events_use_hold_hint_at_300ms_boundary() {
+        for long_press in [true, false] {
+            for duration in [0, 120, 299, 300, 700] {
+                let rules = DirRules { caps_long_press: long_press, ..off(Os::Mac, Os::Windows) };
+                let mut mapper = KeyMapper::default();
+                let now = Instant::now();
+                let mut out = mapper.map(k(CAPS, true), Os::Mac, Os::Windows, &rules, now);
+                mapper.caps_hold_ms(duration);
+                out.extend(mapper.map(k(CAPS, false), Os::Mac, Os::Windows, &rules, now));
+                assert_eq!(out, if long_press && duration >= 300 { taps(CAPS) } else { taps(LANG1) }, "{duration}ms, enabled={long_press}");
+                // A hint only describes one completed press, never the next one.
+                let mut next = mapper.map(k(CAPS, true), Os::Mac, Os::Windows, &rules, now);
+                next.extend(mapper.map(k(CAPS, false), Os::Mac, Os::Windows, &rules, now));
+                assert_eq!(next, taps(LANG1));
+            }
+        }
+    }
+
+    #[test]
+    fn a_held_key_that_became_a_chord_on_repeat_is_still_released() {
+        // Backspace goes out as is; Cmd pressed later must not turn its repeats into a chord.
+        let r = DirRules::default_for(Os::Mac, Os::Windows);
+        let out = run_at(Os::Mac, Os::Windows, &r, vec![k(BACKSPACE, true), k(0xe3, true), k(BACKSPACE, true), k(0xe3, false), k(BACKSPACE, false)]);
+        assert_eq!(out, vec![k(BACKSPACE, true), k(0xe0, true), k(BACKSPACE, true), k(0xe0, false), k(BACKSPACE, false)]);
+        // The same for a key a hangul chord would swallow (Space, then Shift) and an arrow.
+        let out = run_at(Os::Mac, Os::Windows, &r, vec![k(SPACE, true), k(0xe1, true), k(SPACE, true), k(0xe1, false), k(SPACE, false)]);
+        assert_eq!(out, vec![k(SPACE, true), k(0xe1, true), k(SPACE, true), k(0xe1, false), k(SPACE, false)]);
+        let out = run_at(Os::Mac, Os::Windows, &r, vec![k(LEFT, true), k(0xe3, true), k(LEFT, true), k(LEFT, false), k(0xe3, false)]);
+        assert_eq!(out, vec![k(LEFT, true), k(0xe0, true), k(LEFT, true), k(LEFT, false), k(0xe0, false)]);
+        // PC to Mac: Home held, then Ctrl and Left in other keys do not leave Home stuck.
+        let r = DirRules::default_for(Os::Windows, Os::Mac);
+        let out = run_at(Os::Windows, Os::Mac, &r, vec![k(LEFT, true), k(0xe0, true), k(LEFT, true), k(LEFT, false), k(0xe0, false)]);
+        assert_eq!(out, vec![k(LEFT, true), k(0xe3, true), k(LEFT, true), k(LEFT, false), k(0xe3, false)]);
+        // A key that was rewritten from its first press still repeats its chord and ends clean.
+        let r = DirRules::default_for(Os::Mac, Os::Windows);
+        let out = run_at(Os::Mac, Os::Windows, &r, vec![k(0xe3, true), k(LEFT, true), k(LEFT, true), k(LEFT, false), k(0xe3, false)]);
+        let chord = vec![k(0xe0, false), k(HOME, true), k(HOME, false), k(0xe0, true)];
+        assert_eq!(out, [vec![k(0xe0, true)], chord.clone(), chord, vec![k(0xe0, false)]].concat());
+    }
+    #[test]
+    fn a_swallowed_right_alt_is_not_a_held_modifier() {
+        let r = DirRules { hangul_src: vec![HangulKey::RightAlt], hangul_dst: HangulKey::CapsLock, ..DirRules::default_for(Os::Windows, Os::Mac) };
+        let out = run_at(Os::Windows, Os::Mac, &r, vec![k(RALT, true), k(HOME, true), k(HOME, false), k(RALT, false)]);
+        let mut expected = taps(CAPS);
+        expected.extend(with_mod(LGUI, LEFT));
+        assert_eq!(out, expected);
+        // Mac to PC with Hanja: the swallowed key is not lifted and put back (stuck Alt).
+        let r = DirRules { hanja: true, hangul_src: vec![HangulKey::RightAlt], hangul_dst: HangulKey::Lang1, ..DirRules::default_for(Os::Windows, Os::Windows) };
+        let out = run_at(Os::Windows, Os::Windows, &r, vec![k(RALT, true), k(RETURN, true), k(RETURN, false), k(RALT, false)]);
+        assert_eq!(out, [taps(LANG1), vec![k(RETURN, true), k(RETURN, false)]].concat());
+    }
+    #[test]
+    fn hanja_keys_need_no_modifier_held() {
+        let r = DirRules::default_for(Os::Linux, Os::Mac);
+        assert_eq!(run_at(Os::Linux, Os::Mac, &r, vec![k(F9, true), k(F9, false)]), with_mod(LALT, RETURN));
+        assert_eq!(run_at(Os::Linux, Os::Mac, &r, vec![k(LANG2, true), k(LANG2, false)]), with_mod(LALT, RETURN));
+        // IDE shortcuts keep their keys, with the modifiers mapped as usual.
+        for (held, mapped) in [(0xe0, 0xe3), (0xe1, 0xe1), (0xe2, 0xe2), (0xe3, 0xe0)] {
+            let out = run_at(Os::Linux, Os::Mac, &r, vec![k(held, true), k(F9, true), k(F9, false), k(held, false)]);
+            assert_eq!(out, vec![k(mapped, true), k(F9, true), k(F9, false), k(mapped, false)], "{held:x}");
+        }
+        let r = DirRules::default_for(Os::Linux, Os::Windows);
+        let out = run_at(Os::Linux, Os::Windows, &r, vec![k(0xe0, true), k(F9, true), k(F9, false), k(0xe0, false)]);
+        assert_eq!(out, vec![k(0xe0, true), k(F9, true), k(F9, false), k(0xe0, false)]);
+        assert_eq!(run_at(Os::Linux, Os::Windows, &r, vec![k(F9, true), k(F9, false)]), taps(LANG2));
+    }
+    #[test]
+    fn lifting_alt_or_win_is_masked_for_windows_and_linux_only() {
+        let mask = vec![k(LCTRL, true), k(LCTRL, false)];
+        // Option+Left from a Mac: Alt is lifted for Ctrl+Left and put back, each Alt-up masked.
+        let r = DirRules::default_for(Os::Mac, Os::Windows);
+        let out = run_at(Os::Mac, Os::Windows, &r, vec![k(0xe2, true), k(LEFT, true), k(LEFT, false), k(0xe2, false)]);
+        assert_eq!(out, [vec![k(0xe2, true)], mask.clone(), vec![k(0xe2, false)], with_mod(LCTRL, LEFT)[..4].to_vec(), vec![k(0xe2, true)], mask.clone(), vec![k(0xe2, false)]].concat());
+        // Control+Space on a Mac becomes Win held at the PC: Start must not open.
+        let r = DirRules { hangul_src: vec![HangulKey::ControlSpace], ..DirRules::default_for(Os::Mac, Os::Linux) };
+        let out = run_at(Os::Mac, Os::Linux, &r, vec![k(LCTRL, true), k(SPACE, true), k(SPACE, false), k(LCTRL, false)]);
+        assert_eq!(out, [vec![k(LGUI, true)], mask.clone(), vec![k(LGUI, false)], taps(LANG1), vec![k(LGUI, true)], mask.clone(), vec![k(LGUI, false)]].concat());
+        // A plain Alt tap the user made stays an Alt tap, and Android or a Mac are not masked.
+        let r = DirRules::default_for(Os::Windows, Os::Windows);
+        assert_eq!(run_at(Os::Windows, Os::Windows, &r, vec![k(0xe2, true), k(0xe2, false)]), vec![k(0xe2, true), k(0xe2, false)]);
+        let r = DirRules::default_for(Os::Mac, Os::Android);
+        let out = run_at(Os::Mac, Os::Android, &r, vec![k(0xe2, true), k(LEFT, true), k(LEFT, false), k(0xe2, false)]);
+        assert_eq!(out, vec![k(0xe2, true), k(0xe2, false), k(LCTRL, true), k(LEFT, true), k(LEFT, false), k(LCTRL, false), k(0xe2, true), k(0xe2, false)]);
+        let r = DirRules::default_for(Os::Windows, Os::Mac);
+        let out = run_at(Os::Windows, Os::Mac, &r, vec![k(0xe0, true), k(LEFT, true), k(LEFT, false), k(0xe0, false)]);
+        assert!(!out.windows(2).any(|w| w == [k(0xe0, true), k(0xe0, false)]));
     }
 }

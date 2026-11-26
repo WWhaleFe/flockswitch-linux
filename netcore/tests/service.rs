@@ -1009,7 +1009,7 @@ fn roster_trust_accepts_listed_rejects_unlisted_and_drops_after_a_change() {
 struct Raw {
     stream: rustls::StreamOwned<rustls::ClientConnection, std::net::TcpStream>,
     id: String,
-    _dir: TempDir,
+    _dir: Option<TempDir>,
 }
 impl Raw {
     fn identity() -> (TempDir, Identity) {
@@ -1018,6 +1018,15 @@ impl Raw {
         (d, i)
     }
     fn connect(dir: TempDir, addr: std::net::SocketAddr) -> Self {
+        let mut raw = Self::hello(&dir, addr, vec![]);
+        raw._dir = Some(dir);
+        raw
+    }
+    /// A connection that only advertises the 2.1 "group" feature, as a 2.1 sub does.
+    fn advertise(dir: &TempDir, addr: std::net::SocketAddr) -> Self {
+        Self::hello(dir, addr, vec!["group".into()])
+    }
+    fn hello(dir: &TempDir, addr: std::net::SocketAddr, features: Vec<String>) -> Self {
         use flock_net::proto::{write_frame, Msg, PROTO_VERSION};
         let identity = Identity::load_or_create(&dir.0).unwrap();
         let socket = std::net::TcpStream::connect(addr).unwrap();
@@ -1031,10 +1040,10 @@ impl Raw {
             os: Os::Windows,
             app_version: "test".into(),
             role: Role::Sub,
-            features: vec![],
+            features,
         })
         .unwrap();
-        Self { stream, id: identity.id, _dir: dir }
+        Self { stream, id: identity.id, _dir: None }
     }
     fn send(&mut self, msg: &flock_net::proto::Msg) {
         flock_net::proto::write_frame(&mut self.stream, msg).unwrap();
@@ -1091,6 +1100,9 @@ fn a_sub_rejects_enter_from_a_roster_member_that_may_not_send() {
     g.mcfg.peers.push(mk(&i1, true));
     g.mcfg.peers.push(mk(&i2, false));
     g.m.svc.update_config(g.mcfg.clone()).unwrap();
+    // Only members that said "group" are vouched for.
+    let _adv1 = Raw::advertise(&d1, g.m.svc.local_addr());
+    let _adv2 = Raw::advertise(&d2, g.m.svc.local_addr());
     let a = &g.subs[0];
     wait("roster reaches the sub", || a.svc.status().peers.iter().filter(|p| p.via_master).count() == 2);
     assert!(a.svc.status().peers.iter().any(|p| p.id == i2.id && !p.can_send));

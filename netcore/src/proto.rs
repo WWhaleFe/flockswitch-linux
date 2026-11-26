@@ -181,7 +181,7 @@ mod tests {
         assert!(features.is_empty());
         let group = Msg::Group {
             cells: vec![crate::Cell { id: "a".into(), col: 2, row: 1 }],
-            roster: vec![crate::Member { id: "a".into(), name: "A".into(), os: Os::Mac, fingerprint: "f".into(), addr: String::new(), can_send: false }],
+            roster: vec![crate::Member { id: "a".into(), name: "A".into(), os: Os::Mac, fingerprint: "f".into(), addr: String::new(), can_send: false, features: vec![] }],
         };
         let rules = Msg::KeyRules([("mac>windows".to_string(), crate::DirRules::default())].into());
         for msg in [group, rules] {

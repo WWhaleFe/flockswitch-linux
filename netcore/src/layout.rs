@@ -27,6 +27,9 @@ pub struct Member {
     pub addr: String,
     #[serde(default = "yes")]
     pub can_send: bool,
+    /// Optional features the computer advertised in its Hello (see `proto::FEATURES`).
+    #[serde(default)]
+    pub features: Vec<String>,
 }
 pub(crate) fn yes() -> bool {
     true
@@ -57,8 +60,14 @@ pub fn cells_from_sides(master: &str, peers: &[PeerConfig]) -> Vec<Cell> {
 pub fn with_master(cells: &[Cell], master: &str) -> Vec<Cell> {
     let mut cells = valid_cells(cells);
     if !cells.iter().any(|c| c.id == master) {
-        cells.push(Cell { id: master.into(), col: MASTER_CELL.0, row: MASTER_CELL.1 });
-        cells = valid_cells(&cells);
+        // The middle if free, else the free cell nearest to it.
+        let free = (0..ROWS)
+            .flat_map(|row| (0..COLS).map(move |col| (col, row)))
+            .filter(|&at| !cells.iter().any(|c| (c.col, c.row) == at))
+            .min_by_key(|&(col, row)| col.abs_diff(MASTER_CELL.0) + row.abs_diff(MASTER_CELL.1));
+        if let Some((col, row)) = free {
+            cells.push(Cell { id: master.into(), col, row });
+        }
     }
     cells
 }
@@ -133,5 +142,25 @@ mod tests {
         assert_eq!(cells, vec![cell("c", 1, 1), cell("e", 4, 2)]);
         assert_eq!(with_master(&[cell("x", 0, 0)], "m"), vec![cell("x", 0, 0), cell("m", 2, 1)]);
         assert_eq!(with_master(&[cell("m", 0, 0)], "m"), vec![cell("m", 0, 0)]);
+    }
+    #[test]
+    fn master_never_loses_its_cell() {
+        // Someone else holds the middle: the master takes the nearest free cell.
+        let cells = with_master(&[cell("x", 2, 1), cell("y", 1, 1)], "m");
+        assert!(cells.iter().any(|c| c.id == "m"));
+        assert_eq!(cells.len(), 3);
+        assert_eq!(cells.iter().find(|c| c.id == "m").map(|c| (c.col, c.row)), Some((2, 0)));
+        // Every cell taken near the middle still leaves the master somewhere.
+        let mut full = vec![];
+        for row in 0..ROWS {
+            for col in 0..COLS {
+                if (col, row) != (4, 2) {
+                    full.push(cell(&format!("p{col}{row}"), col, row));
+                }
+            }
+        }
+        let cells = with_master(&full, "m");
+        assert_eq!(cells.len(), full.len() + 1);
+        assert_eq!(cells.iter().find(|c| c.id == "m").map(|c| (c.col, c.row)), Some((4, 2)));
     }
 }

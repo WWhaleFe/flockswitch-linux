@@ -27,6 +27,8 @@ const DEAD: Duration = Duration::from_secs(2);
 const WAKE_JUMP: Duration = Duration::from_secs(5);
 /// After a wake-up, links silent for this long are closed.
 const WAKE_STALE: Duration = Duration::from_secs(4);
+/// An incoming clipboard transfer that got nothing for this long is given up.
+const INCOMING_STALL: Duration = Duration::from_secs(30);
 /// How long the status says "reconnecting" at most.
 const RECONNECT_SHOWN: Duration = Duration::from_secs(10);
 /// Seconds to wait before dial attempt number `attempt` (0 is the first retry), at most 8.
@@ -117,8 +119,10 @@ impl Service {
             pair_status: None,
             master: None,
             told: HashMap::new(),
+            peer_features: HashMap::new(),
             keys: HashSet::new(),
             clip_sigs: HashMap::new(),
+            pending_clip: HashMap::new(),
             clip_origin: None,
             trusted: vec![],
             group: None,
@@ -127,6 +131,7 @@ impl Service {
             last_wall: SystemTime::now(),
             outgoing: None,
             incoming: None,
+            incoming_at: Instant::now(),
             next_transfer: 1,
             buttons: HashSet::new(),
             captured_keys: HashSet::new(),
@@ -289,6 +294,8 @@ enum Event {
     Message(String, u64, Msg),
     Closed(String, u64),
     DialDone(SocketAddr),
+    /// ClipDone has left rustls's output buffer on this link.
+    ClipSent(String, u64, u32),
 }
 #[derive(Clone)]
 enum State {
@@ -333,12 +340,16 @@ struct Control {
     master: Option<MasterSettings>,
     /// On a master: what each sub was last told (its side and the settings).
     told: HashMap<String, (Option<Side>, MasterSettings, (Vec<Cell>, Vec<Member>))>,
+    /// Features each peer advertised the last time it connected (kept across blips).
+    peer_features: HashMap<String, Vec<String>>,
     keys: HashSet<u16>,
     /// Per peer: fingerprint of the clipboard content last sent to or received from it,
     /// so unchanged content is not sent again.
     clip_sigs: HashMap<String, Vec<u8>>,
+    /// Per peer: transfer id and hash queued but not yet flushed to its socket.
+    pending_clip: HashMap<String, (u32, Vec<u8>)>,
     /// Fingerprint of the content that last arrived, and the peer it came from.
-    clip_origin: Option<(Vec<u8>, String)>,
+    clip_origin: Option<(Vec<u8>, String, bool)>,
     /// On a sub: computers its master's roster vouches for (runtime only, `via_master`).
     trusted: Vec<PeerConfig>,
     /// On a sub: the layout and roster the master last sent.
@@ -351,6 +362,8 @@ struct Control {
     outgoing: Option<(String, crate::transfer::Outgoing)>,
     /// A clipboard transfer on its way in, from this peer.
     incoming: Option<(String, crate::transfer::Incoming)>,
+    /// When the incoming transfer last made progress.
+    incoming_at: Instant,
     next_transfer: u32,
     buttons: HashSet<MouseButton>,
     captured_keys: HashSet<u16>,
@@ -449,7 +462,7 @@ impl Control {
             let wall = SystemTime::now() + self.skew;
             if wall.duration_since(self.last_wall).is_ok_and(|d| d >= WAKE_JUMP) {
                 log::info!("clock jumped: reconnecting");
-                self.reconnect(Some(WAKE_STALE));
+                self.reconnect(Some((WAKE_STALE, wall.duration_since(self.last_wall).unwrap_or_default())));
             }
             self.last_wall = wall;
             if self.config.on {
@@ -490,6 +503,7 @@ impl Control {
                 self.maintenance();
                 self.poll_cursor();
             }
+            self.enforce_send_permission();
             if let State::Controlling { peer, .. } = &self.state {
                 let events = self.mapper.tick(Instant::now());
                 if let Some(l) = self.links.get(peer) {
@@ -553,9 +567,9 @@ impl Control {
         }
         config.config_dir = self.config.config_dir.clone();
         config.peers.retain(|p| !p.via_master);
-        if config.role != Role::Sub || !config.peers.iter().any(|p| p.role == Role::Master) {
-            self.trusted.clear();
-            self.group = None;
+        let master_id = |c: &NetConfig| c.peers.iter().find(|p| p.role == Role::Master).map(|p| p.id.clone());
+        if config.role != Role::Sub || master_id(&config).is_none() || master_id(&config) != master_id(&self.config) {
+            self.clear_group();
         }
         let rebind = config.on != self.config.on || config.port != self.config.port;
         let rediscover =
@@ -584,6 +598,7 @@ impl Control {
             self.pairing = None;
         }
         self.config = config;
+        self.enforce_send_permission();
         self.sync_sides();
         if rebind {
             self.listener = None;
@@ -640,8 +655,7 @@ impl Control {
                 let was_master = self.config.peers.iter().any(|p| p.id == unpair && p.role == Role::Master);
                 self.config.peers.retain(|p| p.id != unpair);
                 if was_master {
-                    self.trusted.clear();
-                    self.group = None;
+                    self.clear_group();
                 }
                 self.disconnect(&unpair, "unpaired");
                 (self.hooks.on_unpaired)(unpair);
@@ -748,6 +762,15 @@ impl Control {
     }
     fn event(&mut self, event: Event) {
         match event {
+            Event::ClipSent(id, token, transfer) => {
+                if self.links.get(&id).is_some_and(|l| l.token == token)
+                    && self.pending_clip.get(&id).is_some_and(|(tid, _)| *tid == transfer)
+                {
+                    if let Some((_, sig)) = self.pending_clip.remove(&id) {
+                        self.clip_sigs.insert(id, sig);
+                    }
+                }
+            }
             Event::DialDone(addr) => {
                 self.inflight.remove(&addr);
             }
@@ -756,8 +779,10 @@ impl Control {
                     return;
                 }
                 if let Some(p) = self.config.peers.iter().chain(&self.trusted).find(|p| p.id == id) {
-                    if p.fingerprint != link.fp {
-                        log::warn!("fingerprint mismatch for {id}");
+                    // A roster entry vouches for one role; a pairing is pinned by fingerprint.
+                    let roster_only = p.via_master && !self.config.peers.iter().any(|q| q.id == id);
+                    if p.fingerprint != link.fp || (roster_only && p.role != link.role) {
+                        log::warn!("fingerprint or role mismatch for {id}");
                         return;
                     }
                     link.paired = true;
@@ -775,6 +800,7 @@ impl Control {
                     self.disconnect(&id, "duplicate");
                 }
                 self.retry.remove(&id);
+                self.peer_features.insert(id.clone(), link.features.clone());
                 self.links.insert(id.clone(), link);
                 if pair {
                     if let Some(l) = self.links.get(&id) {
@@ -790,6 +816,8 @@ impl Control {
             }
             Event::Message(id, token, msg) => {
                 let can_send = self.peer_can_send(&id);
+                let from_master = self.config.role == Role::Sub
+                    && self.config.peers.iter().any(|p| p.id == id && p.role == Role::Master && !p.via_master);
                 let Some(l) = self.links.get_mut(&id) else {
                     return;
                 };
@@ -824,7 +852,7 @@ impl Control {
                     }
                     Msg::Ping { t } => l.send(Msg::Pong { t }),
                     Msg::Layout { side } => {
-                        if self.config.role == Role::Sub && l.role == Role::Master {
+                        if from_master {
                             let mine = side.map(Side::opposite);
                             if let Some(p) = self.config.peers.iter_mut().find(|p| p.id == id) {
                                 if p.side != mine {
@@ -835,8 +863,7 @@ impl Control {
                         }
                     }
                     Msg::Group { cells, roster } => {
-                        let from_master = self.config.peers.iter().any(|p| p.id == id && p.role == Role::Master);
-                        if self.config.role == Role::Sub && from_master {
+                        if from_master {
                             self.apply_group(&id, cells, roster);
                         }
                     }
@@ -846,7 +873,12 @@ impl Control {
                         }
                     }
                     Msg::MasterSettings(settings) => {
-                        if self.config.role == Role::Sub && l.role == Role::Master {
+                        if from_master {
+                            let mut next = self.config.clone();
+                            settings.apply_to(&mut next);
+                            if next.all_rules() != self.config.all_rules() || next.lang1_on_mac != self.config.lang1_on_mac {
+                                self.local(true);
+                            }
                             settings.apply_to(&mut self.config);
                             self.status.lock().unwrap().following = Some(settings.master_name.clone());
                             if self.master.as_ref() != Some(&settings) {
@@ -914,10 +946,18 @@ impl Control {
                     Msg::ClipChunk { id: tid, file, data } => self.clip_chunk(&id, tid, file, &data),
                     Msg::ClipDone { id: tid } => self.clip_done(&id, tid),
                     Msg::Input(event) => {
-                        if matches!(&self.state,State::Controlled{peer,..} if peer==&id)
+                        // A 2.1 sender applied the key rules itself; only a 2.0 one leaves
+                        // Lang1 for this Mac to turn into Caps Lock.
+                        let legacy = !l.features.iter().any(|f| f == "keyrules");
+                        if !can_send {
+                            l.send(Msg::ReleaseAll);
+                            if self.state.peer() == Some(&id) {
+                                self.local(false);
+                            }
+                        } else if matches!(&self.state,State::Controlled{peer,..} if peer==&id)
                             && event.valid()
                         {
-                            self.inject(event);
+                            self.inject(event, legacy);
                         }
                     }
                     Msg::ReleaseAll => {
@@ -940,6 +980,18 @@ impl Control {
                 reason: reason.into(),
             });
         }
+        if self.outgoing.as_ref().is_some_and(|(peer, _)| peer == id) {
+            self.outgoing = None;
+            self.transfer_note("send", "files", "failed");
+        }
+        if self.incoming.as_ref().is_some_and(|(peer, _)| peer == id) {
+            if let Some((_, incoming)) = self.incoming.take() {
+                incoming.abandon();
+            }
+            self.transfer_note("receive", "files", "failed");
+        }
+        self.clip_sigs.remove(id);
+        self.pending_clip.remove(id);
         if self.pairing.as_ref().is_some_and(|p| p.peer == id) {
             self.pairing = None;
             if let Some(s) = &mut self.pair_status {
@@ -992,11 +1044,21 @@ impl Control {
             fingerprint: self.identity.fingerprint.clone(),
             addr: String::new(),
             can_send: true,
+            features: proto::FEATURES.iter().map(|s| s.to_string()).collect(),
         }];
         for p in self.config.peers.iter().filter(|p| p.role == Role::Sub) {
-            let addr = match (&p.last_addr, self.links.get(&p.id)) {
-                (a, Some(l)) if a.is_empty() => l.addr.to_string(),
-                (a, _) => a.clone(),
+            // Only subs that said "group" in their Hello can take part; a 2.0 one would
+            // drop every link the others open to it.
+            let Some(features) = self.peer_features.get(&p.id).filter(|f| f.iter().any(|f| f == "group")) else {
+                continue;
+            };
+            let stored: Option<SocketAddr> = p.last_addr.parse().ok();
+            let addr = match (self.links.get(&p.id), stored) {
+                // A live link tells where the computer really is now; an inbound one only
+                // knows the port as the default, so keep a stored port.
+                (Some(l), Some(s)) if !l.outgoing => SocketAddr::new(l.addr.ip(), s.port()).to_string(),
+                (Some(l), _) => l.addr.to_string(),
+                (None, _) => p.last_addr.clone(),
             };
             roster.push(Member {
                 id: p.id.clone(),
@@ -1005,6 +1067,7 @@ impl Control {
                 fingerprint: p.fingerprint.clone(),
                 addr,
                 can_send: p.can_send,
+                features: features.clone(),
             });
         }
         roster
@@ -1064,6 +1127,40 @@ impl Control {
         }
         self.known_peer(id).is_none_or(|p| p.can_send)
     }
+    /// Revoke an active session as soon as a config or roster removes its permission.
+    fn enforce_send_permission(&mut self) {
+        let allowed = match &self.state {
+            State::Controlling { .. } => self.me_can_send(),
+            State::Controlled { peer, .. } => self.peer_can_send(peer),
+            State::Local => true,
+        };
+        if !allowed {
+            self.local(true);
+        }
+        if !self.me_can_send() {
+            if self.edge_hit.is_some() {
+                self.platform.stop_capture();
+            }
+            self.edge_hit = None;
+            self.edge_wait = None;
+            self.platform.arm_edges(&[]);
+            self.armed.clear();
+        }
+    }
+    /// The paired master's authority is gone, including every derived live link.
+    fn clear_group(&mut self) {
+        let dropped: Vec<String> = self.links.iter()
+            .filter(|(id, l)| l.paired && !self.config.peers.iter().any(|p| p.id == **id))
+            .map(|(id, _)| id.clone()).collect();
+        self.trusted.clear();
+        self.group = None;
+        self.master = None;
+        self.status.lock().unwrap().following = None;
+        for id in dropped {
+            self.disconnect(&id, "master removed");
+            self.retry.remove(&id);
+        }
+    }
     /// The open link on the other side of the neighbouring cell on `side`.
     fn neighbour_peer(&self, side: Side) -> Option<String> {
         if !self.me_can_send() {
@@ -1100,7 +1197,7 @@ impl Control {
             .filter(|(id, l)| {
                 l.paired
                     && !self.config.peers.iter().any(|p| p.id == **id)
-                    && !trusted.iter().any(|t| t.id == **id && t.fingerprint == l.fp)
+                    && !trusted.iter().any(|t| t.id == **id && t.fingerprint == l.fp && t.role == l.role)
             })
             .map(|(id, _)| id.clone())
             .collect();
@@ -1109,7 +1206,7 @@ impl Control {
             self.retry.remove(id);
         }
         for (id, l) in self.links.iter_mut().filter(|(_, l)| !l.paired) {
-            if let Some(t) = trusted.iter().find(|t| t.id == *id && t.fingerprint == l.fp) {
+            if let Some(t) = trusted.iter().find(|t| t.id == *id && t.fingerprint == l.fp && t.role == l.role) {
                 l.paired = true;
                 if !l.outgoing {
                     if let Ok(addr) = t.last_addr.parse() {
@@ -1120,6 +1217,7 @@ impl Control {
         }
         self.trusted = trusted;
         self.group = Some((layout::valid_cells(&cells), roster));
+        self.enforce_send_permission();
     }
     /// Key rules were edited (here, or by a sub): a master saves and hands them on, a sub
     /// passes them to its master.
@@ -1145,7 +1243,7 @@ impl Control {
     }
     /// Closes links that are not fully up (and, after a wake-up, silent ones), resets the
     /// dial backoff, redials everyone now and browses again.
-    fn reconnect(&mut self, stale: Option<Duration>) {
+    fn reconnect(&mut self, stale: Option<(Duration, Duration)>) {
         if !self.config.on {
             return;
         }
@@ -1154,7 +1252,7 @@ impl Control {
             .iter()
             .filter(|(id, l)| {
                 let pairing = self.pairing.as_ref().is_some_and(|p| &p.peer == *id);
-                (!l.paired && !pairing) || stale.is_some_and(|s| l.last_rx.elapsed() >= s)
+                (!l.paired && !pairing) || stale.is_some_and(|(s, slept)| l.last_rx.elapsed() + slept >= s)
             })
             .map(|(id, _)| id.clone())
             .collect();
@@ -1168,8 +1266,18 @@ impl Control {
         }
         self.dial_peers();
     }
+    /// A sender that moved on or went quiet leaves a half transfer behind: remove it.
+    fn drop_stalled_incoming(&mut self, now: Instant) {
+        if self.incoming.is_some() && now.saturating_duration_since(self.incoming_at) >= INCOMING_STALL {
+            if let Some((_, incoming)) = self.incoming.take() {
+                incoming.abandon();
+            }
+            self.transfer_note("receive", "files", "failed");
+        }
+    }
     fn maintenance(&mut self) {
         self.tell_subs();
+        self.drop_stalled_incoming(Instant::now());
         if self.pairing.as_ref().is_some_and(|p| p.expired()) {
             self.fail_pair();
         }
@@ -1226,19 +1334,31 @@ impl Control {
             {
                 continue;
             }
-            let discovered = self
-                .discovered
-                .iter()
-                .find(|d| d.id == p.id && d.fingerprint == p.fingerprint)
-                .and_then(|d| d.addresses.first())
-                .copied();
-            if let Some(addr) = discovered.or_else(|| p.last_addr.parse().ok()) {
+            if let Some(addr) = self.dial_address(&p) {
                 if !self.inflight.contains(&addr) {
                     self.spawn_link(None, addr, false, Some(p.id.clone()));
                     self.schedule_retry(&p.id);
                 }
             }
         }
+    }
+    fn dial_address(&self, peer: &PeerConfig) -> Option<SocketAddr> {
+        let mut candidates = Vec::new();
+        for addr in self.discovered.iter()
+            .filter(|d| d.id == peer.id && d.fingerprint == peer.fingerprint)
+            .flat_map(|d| d.addresses.iter().copied())
+            .chain(peer.last_addr.parse::<SocketAddr>().ok())
+            .filter(|a| crate::is_local_network(a.ip()))
+        {
+            if !candidates.contains(&addr) {
+                candidates.push(addr);
+            }
+        }
+        if candidates.is_empty() {
+            return None;
+        }
+        let attempt = self.retry.get(&peer.id).map_or(0, |r| r.attempt);
+        Some(candidates[attempt % candidates.len()])
     }
     fn local(&mut self, notify: bool) {
         let old = std::mem::replace(&mut self.state, State::Local);
@@ -1281,10 +1401,10 @@ impl Control {
             });
         }
     }
-    fn inject(&mut self, mut event: InputEvent) {
+    fn inject(&mut self, mut event: InputEvent, legacy: bool) {
         match &mut event {
             InputEvent::Key { usage, down } => {
-                if self.platform.os() == Os::Mac {
+                if legacy && self.platform.os() == Os::Mac {
                     let Some(u) = keymap::mac_received_usage(*usage, &self.config.lang1_on_mac)
                     else {
                         return;
@@ -1319,6 +1439,13 @@ impl Control {
         self.platform.inject(&event);
     }
     fn capture_event(&mut self, mut event: InputEvent) {
+        let now = self.platform.captured_at(&event).unwrap_or_else(Instant::now);
+        let caps_hold = if matches!(event, InputEvent::Key { usage: 0x39, down: false }) {
+            self.platform.caps_hold_ms()
+        } else {
+            None
+        };
+        self.enforce_send_permission();
         let State::Controlling { peer, .. } = &self.state else {
             return;
         };
@@ -1341,7 +1468,10 @@ impl Control {
         if let Some(l) = self.links.get(&peer) {
             match self.config.rules_for(self.platform.os(), l.os) {
                 Some(rules) => {
-                    for event in self.mapper.map(event, self.platform.os(), l.os, &rules, Instant::now()) {
+                    if let Some(ms) = caps_hold {
+                        self.mapper.caps_hold_ms(ms);
+                    }
+                    for event in self.mapper.map(event, self.platform.os(), l.os, &rules, now) {
                         l.send(Msg::Input(event));
                     }
                 }
@@ -1529,10 +1659,9 @@ impl Control {
                 if !self.clip_wanted(peer, &sig) {
                     return;
                 }
-                self.clip_sigs.insert(peer.into(), sig);
                 let id = self.take_transfer_id();
                 match Outgoing::files(id, &files, limit) {
-                    Ok(out) => self.begin_send(peer, "files", out),
+                    Ok(out) => self.begin_send(peer, "files", out, sig),
                     Err(e) => {
                         log::info!("clipboard files not sent: {e:#}");
                         let large = e.to_string().starts_with("too large");
@@ -1546,13 +1675,12 @@ impl Control {
                 if !self.clip_wanted(peer, &sig) {
                     return;
                 }
-                self.clip_sigs.insert(peer.into(), sig);
                 if png.len() as u64 > limit {
                     self.transfer_note("send", "image", "too_large");
                     return;
                 }
                 let id = self.take_transfer_id();
-                self.begin_send(peer, "image", Outgoing::bytes(id, ClipKind::Image, "clipboard.png", png));
+                self.begin_send(peer, "image", Outgoing::bytes(id, ClipKind::Image, "clipboard.png", png), sig);
                 return;
             }
         }
@@ -1563,14 +1691,15 @@ impl Control {
         if !self.clip_wanted(peer, &sig) {
             return;
         }
-        self.clip_sigs.insert(peer.into(), sig);
         if text.len() <= INLINE_TEXT {
             if let Some(l) = self.links.get(peer) {
-                l.send(Msg::Clipboard { text });
+                if l.tx.send(Msg::Clipboard { text }).is_ok() {
+                    self.clip_sigs.insert(peer.into(), sig);
+                }
             }
         } else if text.len() as u64 <= MAX_TEXT {
             let id = self.take_transfer_id();
-            self.begin_send(peer, "text", Outgoing::bytes(id, ClipKind::Text, "clipboard.txt", text.into_bytes()));
+            self.begin_send(peer, "text", Outgoing::bytes(id, ClipKind::Text, "clipboard.txt", text.into_bytes()), sig);
         } else {
             self.transfer_note("send", "text", "too_large");
         }
@@ -1578,7 +1707,8 @@ impl Control {
     /// Content just arrived from `peer`: it has it, and this is where it came from.
     fn clip_received(&mut self, peer: &str, sig: Vec<u8>) {
         self.clip_sigs.insert(peer.into(), sig.clone());
-        self.clip_origin = Some((sig, peer.into()));
+        let from_sub = self.known_peer(peer).is_some_and(|p| p.role == Role::Sub);
+        self.clip_origin = Some((sig, peer.into(), from_sub));
     }
     /// Whether clipboard content `sig` should go to `peer`: it does not have it yet, and
     /// with relay off it did not come from another sub (when `peer` is a sub too).
@@ -1586,10 +1716,13 @@ impl Control {
         if self.clip_sigs.get(peer).map(Vec::as_slice) == Some(sig) {
             return false;
         }
+        if self.pending_clip.get(peer).is_some_and(|(_, pending)| pending.as_slice() == sig) {
+            return false;
+        }
         if !self.config.clipboard_relay {
             let is_sub = |id: &str| self.known_peer(id).is_some_and(|p| p.role == Role::Sub);
-            if let Some((origin, from)) = &self.clip_origin {
-                if origin.as_slice() == sig && from != peer && is_sub(from) && is_sub(peer) {
+            if let Some((origin, from, from_sub)) = &self.clip_origin {
+                if origin.as_slice() == sig && from != peer && *from_sub && is_sub(peer) {
                     return false;
                 }
             }
@@ -1600,7 +1733,7 @@ impl Control {
         self.next_transfer = self.next_transfer.wrapping_add(1).max(1);
         self.next_transfer
     }
-    fn begin_send(&mut self, peer: &str, kind: &str, out: crate::transfer::Outgoing) {
+    fn begin_send(&mut self, peer: &str, kind: &str, out: crate::transfer::Outgoing, sig: Vec<u8>) {
         self.status.lock().unwrap().transfer = Some(TransferStatus {
             direction: "send".into(),
             kind: kind.into(),
@@ -1611,6 +1744,10 @@ impl Control {
         });
         // A newer transfer replaces one still going; the peer drops the old one when the
         // new one starts.
+        if let Some((old_peer, _)) = self.outgoing.take() {
+            self.pending_clip.remove(&old_peer);
+        }
+        self.pending_clip.insert(peer.into(), (out.id(), sig));
         self.outgoing = Some((peer.into(), out));
     }
     fn transfer_note(&mut self, direction: &str, kind: &str, stage: &str) {
@@ -1628,6 +1765,7 @@ impl Control {
     fn flush_transfer(&mut self) {
         let Some((peer, out)) = &mut self.outgoing else { return };
         let Some(link) = self.links.get(peer.as_str()) else {
+            self.pending_clip.remove(peer.as_str());
             self.outgoing = None;
             self.transfer_note("send", "files", "failed");
             return;
@@ -1639,7 +1777,12 @@ impl Control {
                     if matches!(msg, Msg::ClipChunk { .. }) {
                         link.bulk.fetch_add(1, Ordering::AcqRel);
                     }
-                    link.send(msg);
+                    if link.tx.send(msg).is_err() {
+                        self.pending_clip.remove(peer.as_str());
+                        self.outgoing = None;
+                        self.transfer_note("send", "files", "failed");
+                        return;
+                    }
                     if done {
                         break;
                     }
@@ -1647,6 +1790,7 @@ impl Control {
                 Ok(None) => break,
                 Err(e) => {
                     log::warn!("clipboard transfer: {e:#}");
+                    self.pending_clip.remove(peer.as_str());
                     self.outgoing = None;
                     self.transfer_note("send", "files", "failed");
                     return;
@@ -1694,6 +1838,7 @@ impl Control {
                     saved_in: None,
                 });
                 self.incoming = Some((peer.into(), incoming));
+                self.incoming_at = Instant::now();
             }
             Err(e) => {
                 log::info!("clipboard transfer refused: {e:#}");
@@ -1707,6 +1852,7 @@ impl Control {
         if from != peer || incoming.id != id {
             return;
         }
+        self.incoming_at = Instant::now();
         if let Err(e) = incoming.chunk(file, data) {
             log::warn!("clipboard transfer: {e:#}");
             if let Some((_, i)) = self.incoming.take() {
@@ -1927,6 +2073,7 @@ impl Worker {
         let (tx, rx) = mpsc::channel();
         let mut tx = Some(tx);
         let bulk = Arc::new(AtomicUsize::new(0));
+        let mut pending_clip = None;
         let mut bytes = Vec::new();
         let mut chunk = [0; 8192];
         loop {
@@ -1940,6 +2087,9 @@ impl Worker {
                 match rx.try_recv() {
                     Ok(msg) => {
                         proto::write_frame(conn.writer(), &msg)?;
+                        if let Msg::ClipDone { id } = msg {
+                            pending_clip = Some(id);
+                        }
                         if matches!(msg, Msg::ClipChunk { .. }) {
                             bulk.fetch_sub(1, Ordering::AcqRel);
                         }
@@ -1960,6 +2110,11 @@ impl Worker {
             }
             if cancelled {
                 return Ok(());
+            }
+            if !conn.wants_write() {
+                if let (Some(id), Some(peer)) = (pending_clip.take(), remote.as_ref()) {
+                    self.events.send(Event::ClipSent(peer.clone(), token, id))?;
+                }
             }
             match conn.read_tls(&mut socket) {
                 Ok(0) => anyhow::bail!("socket closed"),
@@ -2098,4 +2253,445 @@ mod tests {
         assert_eq!(waits, [1, 2, 4, 8, 8, 8, 8, 8]);
         assert_eq!(backoff_secs(usize::MAX), 8);
     }
+    #[derive(Default)]
+    struct TestPlatform {
+        injected: Mutex<Vec<InputEvent>>,
+        text: Mutex<Option<String>>,
+        files: Mutex<Vec<std::path::PathBuf>>,
+        stopped: AtomicUsize,
+        mac: AtomicBool,
+    }
+    impl Platform for TestPlatform {
+        fn os(&self) -> Os { if self.mac.load(Ordering::Relaxed) { Os::Mac } else { Os::Windows } }
+        fn displays(&self) -> Vec<Rect> { vec![Rect::new(0.0, 0.0, 100.0, 100.0)] }
+        fn cursor(&self) -> Option<(f64, f64)> { Some((50.0, 50.0)) }
+        fn warp(&self, _: f64, _: f64) {}
+        fn start_capture(&self, _: Sender<InputEvent>) -> Result<()> { Ok(()) }
+        fn stop_capture(&self) { self.stopped.fetch_add(1, Ordering::Relaxed); }
+        fn inject(&self, event: &InputEvent) { self.injected.lock().unwrap().push(event.clone()); }
+        fn ready(&self) -> Result<(), String> { Ok(()) }
+        fn clipboard_text(&self) -> Option<String> { self.text.lock().unwrap().clone() }
+        fn set_clipboard_text(&self, text: &str) { *self.text.lock().unwrap() = Some(text.into()); }
+        fn clipboard_files(&self) -> Vec<std::path::PathBuf> { self.files.lock().unwrap().clone() }
+    }
+    struct Rig { c: Control, p: Arc<TestPlatform>, dir: std::path::PathBuf }
+    impl Drop for Rig {
+        fn drop(&mut self) {
+            for (cancel, _) in &self.c.workers { cancel.store(true, Ordering::Release); }
+            for (_, worker) in self.c.workers.drain(..) { worker.join().unwrap(); }
+            if let Some((_, incoming)) = self.c.incoming.take() { incoming.abandon(); }
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+    fn rig(role: Role) -> Rig {
+        static SEQ: AtomicUsize = AtomicUsize::new(0);
+        let dir = std::env::temp_dir().join(format!("flock-control-{}-{}", std::process::id(), SEQ.fetch_add(1, Ordering::Relaxed)));
+        let config = NetConfig { on: true, notice_accepted: true, discovery: false, role, config_dir: dir.clone(), ..NetConfig::default() };
+        let p = Arc::new(TestPlatform::default());
+        let platform: Arc<dyn Platform> = p.clone();
+        let hooks = Hooks::default();
+        let identity = Identity::load_or_create(&dir).unwrap();
+        let server = tls::server_config(&identity).unwrap();
+        let client = tls::client_config(&identity).unwrap();
+        let listener = None;
+        let name = "test".into();
+        let port = 0;
+        let status = Arc::new(Mutex::new(Status {
+            running: config.on,
+            me: MeStatus {
+                id: identity.id.clone(),
+                name,
+                port,
+                error: None,
+            },
+            discovered: vec![],
+            peers: vec![],
+            state: StateStatus {
+                mode: "local".into(),
+                peer: None,
+            },
+            pairing: None,
+            transfer: None,
+            following: None,
+            layout: vec![],
+            reconnecting: false,
+            keys: config.all_rules(),
+        }));
+        let (_, rx) = mpsc::channel();
+        let (events, event_rx) = mpsc::channel();
+        let (capture, captured) = mpsc::channel();
+        let control = Control {
+            config,
+            platform,
+            hooks,
+            identity,
+            server,
+            client,
+            listener,
+            status: status.clone(),
+            events,
+            event_rx,
+            rx,
+            capture,
+            captured,
+            links: HashMap::new(),
+            workers: vec![],
+            inflight: HashSet::new(),
+            retry: HashMap::new(),
+            state: State::Local,
+            pairing: None,
+            pair_status: None,
+            master: None,
+            told: HashMap::new(),
+            peer_features: HashMap::new(),
+            keys: HashSet::new(),
+            clip_sigs: HashMap::new(),
+            pending_clip: HashMap::new(),
+            clip_origin: None,
+            trusted: vec![],
+            group: None,
+            reconnecting: None,
+            skew: Duration::ZERO,
+            last_wall: SystemTime::now(),
+            outgoing: None,
+            incoming: None,
+            incoming_at: Instant::now(),
+            next_transfer: 1,
+            buttons: HashSet::new(),
+            captured_keys: HashSet::new(),
+            mapper: KeyMapper::default(),
+            discovery: None,
+            discovered: vec![],
+            edge_wait: None,
+            last_cursor: None,
+            armed: Vec::new(),
+            edge_hit: None,
+            outward: false,
+            started: Instant::now(),
+            last_write: Instant::now() - Duration::from_secs(1),
+            written: None,
+            written_permissions: None,
+            readiness_error: None,
+        };
+        Rig { c: control, p, dir }
+    }
+    const MASTER: &str = "aaaaaaaaaaaaaaaa";
+    const SUB: &str = "bbbbbbbbbbbbbbbb";
+    const OTHER: &str = "cccccccccccccccc";
+    fn peer(id: &str, role: Role) -> PeerConfig {
+        PeerConfig { id: id.into(), fingerprint: id.repeat(4), role, os: Os::Mac, ..PeerConfig::default() }
+    }
+    fn link(c: &mut Control, id: &str, role: Role) -> Receiver<Msg> {
+        let (tx, rx) = mpsc::channel();
+        c.event(Event::Connected(id.into(), Link {
+            token: 1, tx, cancel: Arc::new(AtomicBool::new(false)), name: id.into(), os: Os::Mac,
+            role, features: proto::FEATURES.iter().map(|s| s.to_string()).collect(), fp: id.repeat(4),
+            addr: "127.0.0.1:47160".parse().unwrap(), outgoing: true, paired: false,
+            last_rx: Instant::now(), last_ping: Instant::now(), ping: None, rtt: None,
+            bulk: Arc::new(AtomicUsize::new(0)),
+        }, false));
+        rx
+    }
+    fn message(c: &mut Control, id: &str, msg: Msg) { c.event(Event::Message(id.into(), 1, msg)); }
+    fn controlling(c: &mut Control, id: &str) { c.state = State::Controlling { peer: id.into(), side: Side::Right, pos: 0.5 }; }
+    fn controlled(c: &mut Control, id: &str) { c.state = State::Controlled { peer: id.into(), entered: Side::Left }; }
+    fn roster(c: &Control, sender_allowed: bool) -> Vec<Member> {
+        [(MASTER, true), (SUB, sender_allowed), (c.identity.id.as_str(), sender_allowed)].into_iter()
+            .map(|(id, can_send)| Member { id: id.into(), name: id.into(), os: Os::Windows, fingerprint: id.repeat(4), addr: String::new(), can_send, features: proto::FEATURES.iter().map(|s| s.to_string()).collect() }).collect()
+    }
+    fn key(usage: u16, down: bool) -> InputEvent { InputEvent::Key { usage, down } }
+
+    #[test]
+    fn roster_sub_cannot_impersonate_master_or_inject_settings() {
+        let mut r = rig(Role::Sub);
+        r.c.config.peers.push(peer(MASTER, Role::Master));
+        let members = roster(&r.c, true);
+        r.c.apply_group(MASTER, vec![], members);
+        let _rx = link(&mut r.c, SUB, Role::Master);
+        assert!(!r.c.open(SUB), "roster roles must be checked against Hello");
+        // Even an already present link with a forged role cannot supply settings.
+        r.c.trusted.clear();
+        let _rx = link(&mut r.c, OTHER, Role::Master);
+        r.c.links.get_mut(OTHER).unwrap().paired = true;
+        let mut settings = MasterSettings::of(&r.c.config, "attacker");
+        settings.clipboard_relay = false;
+        message(&mut r.c, OTHER, Msg::MasterSettings(settings));
+        assert!(r.c.master.is_none());
+        assert!(r.c.config.clipboard_relay);
+    }
+
+    #[test]
+    fn unpair_master_revokes_roster_links_and_transfers() {
+        let mut r = rig(Role::Sub);
+        r.c.config.peers.push(peer(MASTER, Role::Master));
+        let members = roster(&r.c, true);
+        r.c.apply_group(MASTER, vec![], members);
+        let rx = link(&mut r.c, SUB, Role::Sub);
+        controlled(&mut r.c, SUB);
+        r.c.inject(key(0xe3, true), false);
+        r.c.incoming = Some((SUB.into(), crate::transfer::Incoming::start(7, crate::transfer::ClipKind::Text,
+            vec![crate::transfer::FileMeta { name: "text".into(), size: 3 }], 100, &r.dir).unwrap()));
+        r.c.outgoing = Some((SUB.into(), crate::transfer::Outgoing::bytes(8, crate::transfer::ClipKind::Text, "text", vec![1; 3])));
+        r.c.master = Some(MasterSettings::of(&r.c.config, "old master"));
+        r.c.request(Request::Unpair { unpair: MASTER.into() });
+        assert!(!r.c.links.contains_key(SUB));
+        assert!(matches!(r.c.state, State::Local));
+        assert!(r.c.incoming.is_none() && r.c.outgoing.is_none());
+        assert!(r.c.master.is_none());
+        assert!(!r.dir.join("incoming-7").exists());
+        assert!(r.p.injected.lock().unwrap().contains(&key(0xe3, false)));
+        assert!(rx.try_iter().any(|m| matches!(m, Msg::ReleaseAll)));
+        message(&mut r.c, SUB, Msg::Clipboard { text: "forbidden".into() });
+        assert!(r.p.text.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn live_can_send_revocation_ends_sender_and_receiver_sessions() {
+        // Master receiver: changing saved permission releases keys already held.
+        let mut r = rig(Role::Master);
+        r.c.config.peers.push(peer(SUB, Role::Sub));
+        let rx = link(&mut r.c, SUB, Role::Sub);
+        controlled(&mut r.c, SUB);
+        r.c.inject(key(0xe0, true), false);
+        let mut config = r.c.config.clone();
+        config.peers[0].can_send = false;
+        r.c.update(config);
+        assert!(matches!(r.c.state, State::Local));
+        assert!(r.p.injected.lock().unwrap().contains(&key(0xe0, false)));
+        assert!(rx.try_iter().any(|m| matches!(m, Msg::ReleaseAll)));
+        // Sub sender: the new roster disables the active capture.
+        let mut r = rig(Role::Sub);
+        r.c.config.peers.push(peer(MASTER, Role::Master));
+        let members = roster(&r.c, true);
+        r.c.apply_group(MASTER, vec![], members);
+        let rx = link(&mut r.c, SUB, Role::Sub);
+        controlling(&mut r.c, SUB);
+        let members = roster(&r.c, false);
+        r.c.apply_group(MASTER, vec![], members);
+        assert!(matches!(r.c.state, State::Local));
+        assert!(r.p.stopped.load(Ordering::Relaxed) > 0);
+        assert!(rx.try_iter().any(|m| matches!(m, Msg::ReleaseAll)));
+        // Sub receiver: the same update revokes the remote sender.
+        let members = roster(&r.c, true);
+        r.c.apply_group(MASTER, vec![], members);
+        controlled(&mut r.c, SUB);
+        r.c.inject(key(0xe1, true), false);
+        let members = roster(&r.c, false);
+        r.c.apply_group(MASTER, vec![], members);
+        assert!(matches!(r.c.state, State::Local));
+        assert!(r.p.injected.lock().unwrap().contains(&key(0xe1, false)));
+    }
+
+    #[test]
+    fn mac_receiver_keeps_lang1_from_2_1_senders_and_converts_it_for_2_0() {
+        let mut r = rig(Role::Master);
+        r.p.mac.store(true, Ordering::Relaxed);
+        r.c.config.peers.push(peer(SUB, Role::Sub));
+        let _rx = link(&mut r.c, SUB, Role::Sub);
+        controlled(&mut r.c, SUB);
+        message(&mut r.c, SUB, Msg::Input(key(keymap::LANG1, true)));
+        assert_eq!(r.p.injected.lock().unwrap().last(), Some(&key(keymap::LANG1, true)), "2.1 senders map once, on their side");
+        // With the old switch off a 2.1 sender's Lang1 is still not dropped.
+        r.c.config.lang1_on_mac = "off".into();
+        message(&mut r.c, SUB, Msg::Input(key(keymap::LANG1, false)));
+        assert_eq!(r.p.injected.lock().unwrap().last(), Some(&key(keymap::LANG1, false)));
+        // A 2.0 sender knows nothing of rules: the old receiver-side switch applies.
+        r.c.links.get_mut(SUB).unwrap().features.clear();
+        message(&mut r.c, SUB, Msg::Input(key(keymap::LANG1, true)));
+        assert_eq!(r.p.injected.lock().unwrap().last(), Some(&key(keymap::LANG1, false)));
+        r.c.config.lang1_on_mac = "capslock".into();
+        message(&mut r.c, SUB, Msg::Input(key(keymap::LANG1, true)));
+        assert_eq!(r.p.injected.lock().unwrap().last(), Some(&key(0x39, true)));
+    }
+
+    #[test]
+    fn input_paths_recheck_send_permission() {
+        let mut r = rig(Role::Master);
+        let mut p = peer(SUB, Role::Sub);
+        p.can_send = false;
+        r.c.config.peers.push(p);
+        let rx = link(&mut r.c, SUB, Role::Sub);
+        controlled(&mut r.c, SUB);
+        message(&mut r.c, SUB, Msg::Input(key(4, true)));
+        assert!(r.p.injected.lock().unwrap().is_empty());
+        assert!(matches!(r.c.state, State::Local));
+        assert!(rx.try_iter().any(|m| matches!(m, Msg::ReleaseAll)));
+        r.c.config.role = Role::Sub;
+        r.c.group = Some((vec![], roster(&r.c, false)));
+        controlling(&mut r.c, SUB);
+        r.c.capture_event(key(4, true));
+        assert!(matches!(r.c.state, State::Local));
+        assert!(!rx.try_iter().any(|m| matches!(m, Msg::Input(_))));
+    }
+
+    #[test]
+    fn master_settings_release_old_mapping_before_changing_rules() {
+        let mut r = rig(Role::Sub);
+        r.c.config.peers.push(peer(MASTER, Role::Master));
+        let master_rx = link(&mut r.c, MASTER, Role::Master);
+        r.c.trusted.push(peer(SUB, Role::Sub));
+        let rx = link(&mut r.c, SUB, Role::Sub);
+        controlling(&mut r.c, SUB);
+        r.c.capture_event(key(0xe0, true));
+        assert!(rx.try_iter().any(|m| matches!(m, Msg::Input(InputEvent::Key { usage: 0xe3, down: true }))));
+        let mut settings = MasterSettings::of(&r.c.config, "master");
+        settings.keys.get_mut("windows>mac").unwrap().mod_mode = keymap::ModMode::Off;
+        message(&mut r.c, MASTER, Msg::MasterSettings(settings));
+        assert!(matches!(r.c.state, State::Local));
+        assert!(rx.try_iter().any(|m| matches!(m, Msg::ReleaseAll)));
+        r.c.capture_event(key(0xe0, false));
+        assert!(!rx.try_iter().any(|m| matches!(m, Msg::Input(_))));
+        assert!(master_rx.try_iter().next().is_none());
+        // Explicit 2.1 rule changes also end the session, same settings do not.
+        controlling(&mut r.c, SUB);
+        let same = MasterSettings::of(&r.c.config, "master");
+        message(&mut r.c, MASTER, Msg::MasterSettings(same.clone()));
+        assert!(matches!(r.c.state, State::Controlling { .. }));
+        let mut changed = same;
+        changed.keys.get_mut("windows>mac").unwrap().hangul_src.clear();
+        message(&mut r.c, MASTER, Msg::MasterSettings(changed));
+        assert!(matches!(r.c.state, State::Local));
+    }
+
+    #[test]
+    fn relay_off_preserves_sub_origin_after_unpair() {
+        let mut r = rig(Role::Master);
+        r.c.config.clipboard_relay = false;
+        r.c.config.peers = vec![peer(SUB, Role::Sub), peer(OTHER, Role::Sub)];
+        let _a = link(&mut r.c, SUB, Role::Sub);
+        let b = link(&mut r.c, OTHER, Role::Sub);
+        message(&mut r.c, SUB, Msg::Clipboard { text: "private".into() });
+        r.c.request(Request::Unpair { unpair: SUB.into() });
+        r.c.send_clipboard(OTHER);
+        assert!(b.try_iter().next().is_none());
+        *r.p.text.lock().unwrap() = Some("local edit".into());
+        r.c.send_clipboard(OTHER);
+        assert!(b.try_iter().any(|m| matches!(m, Msg::Clipboard { text } if text == "local edit")));
+    }
+
+    #[test]
+    fn failed_clipboard_creation_and_disconnect_allow_retry() {
+        let mut r = rig(Role::Master);
+        r.c.config.peers.push(peer(SUB, Role::Sub));
+        let _rx = link(&mut r.c, SUB, Role::Sub);
+        let missing = r.dir.join("missing.txt");
+        *r.p.files.lock().unwrap() = vec![missing.clone()];
+        r.c.send_clipboard(SUB);
+        assert!(r.c.outgoing.is_none());
+        assert!(r.c.clip_wanted(SUB, &files_sig(std::slice::from_ref(&missing))));
+        // A transfer that was queued but lost with its link must be retried too.
+        r.p.files.lock().unwrap().clear();
+        let text = "x".repeat(crate::transfer::INLINE_TEXT + 1);
+        *r.p.text.lock().unwrap() = Some(text.clone());
+        r.c.send_clipboard(SUB);
+        assert!(r.c.outgoing.is_some());
+        r.c.disconnect(SUB, "lost");
+        assert!(r.c.outgoing.is_none());
+        assert!(r.c.clip_wanted(SUB, &clip_sig(b"text", &[text.as_bytes()])));
+    }
+
+    #[test]
+    fn roster_lists_only_group_capable_members_with_the_live_address() {
+        let mut r = rig(Role::Master);
+        let mut a = peer(SUB, Role::Sub);
+        a.last_addr = "10.9.9.9:47161".into();
+        let mut b = peer(OTHER, Role::Sub);
+        b.last_addr = "10.9.9.8:47162".into();
+        r.c.config.peers = vec![a, b];
+        let _a = link(&mut r.c, SUB, Role::Sub);
+        let _b = link(&mut r.c, OTHER, Role::Sub);
+        // A 2.0 sub says nothing in its Hello: it must not be vouched for.
+        let mut l = r.c.links.remove(OTHER).unwrap();
+        l.features.clear();
+        l.token = 2;
+        r.c.event(Event::Connected(OTHER.into(), l, false));
+        r.c.links.get_mut(SUB).unwrap().outgoing = false;
+        let roster = r.c.roster();
+        assert!(roster.iter().any(|m| m.id == SUB) && !roster.iter().any(|m| m.id == OTHER));
+        assert!(roster[0].features.iter().any(|f| f == "group"));
+        // Inbound link: its ip is real, its port is the fixed default, so the stored port stays.
+        let ours = roster.iter().find(|m| m.id == SUB).unwrap();
+        assert_eq!(ours.addr, "127.0.0.1:47161");
+        // An outgoing link knows the real address; no stored address is needed either.
+        r.c.links.get_mut(SUB).unwrap().outgoing = true;
+        r.c.links.get_mut(SUB).unwrap().addr = "192.168.1.20:47199".parse().unwrap();
+        assert_eq!(r.c.roster().iter().find(|m| m.id == SUB).unwrap().addr, "192.168.1.20:47199");
+        r.c.config.peers[0].last_addr.clear();
+        r.c.links.get_mut(SUB).unwrap().outgoing = false;
+        assert_eq!(r.c.roster().iter().find(|m| m.id == SUB).unwrap().addr, "192.168.1.20:47199");
+        // Without a link the stored address is all there is, and it survives a blip.
+        r.c.config.peers[0].last_addr = "10.9.9.9:47161".into();
+        r.c.disconnect(SUB, "blip");
+        let roster = r.c.roster();
+        assert_eq!(roster.iter().find(|m| m.id == SUB).map(|m| m.addr.as_str()), Some("10.9.9.9:47161"));
+    }
+
+    #[test]
+    fn clipboard_is_sent_again_after_the_peer_reconnects() {
+        let mut r = rig(Role::Master);
+        r.c.config.peers.push(peer(SUB, Role::Sub));
+        let rx = link(&mut r.c, SUB, Role::Sub);
+        *r.p.text.lock().unwrap() = Some("same".into());
+        r.c.send_clipboard(SUB);
+        r.c.send_clipboard(SUB);
+        assert_eq!(rx.try_iter().filter(|m| matches!(m, Msg::Clipboard { .. })).count(), 1);
+        // The peer restarted and lost it: an unchanged clipboard must go out again.
+        r.c.disconnect(SUB, "lost");
+        assert!(r.c.clip_sigs.is_empty());
+        let rx = link(&mut r.c, SUB, Role::Sub);
+        r.c.send_clipboard(SUB);
+        assert_eq!(rx.try_iter().filter(|m| matches!(m, Msg::Clipboard { .. })).count(), 1);
+    }
+
+    #[test]
+    fn wake_closes_links_that_were_silent_across_the_sleep() {
+        // Instant stops during sleep, so the jump size must count towards the silence.
+        let mut r = rig(Role::Master);
+        r.c.config.peers.push(peer(SUB, Role::Sub));
+        let _rx = link(&mut r.c, SUB, Role::Sub);
+        r.c.links.get_mut(SUB).unwrap().paired = true;
+        r.c.reconnect(Some((WAKE_STALE, Duration::from_millis(5))));
+        assert!(r.c.links.contains_key(SUB), "a link heard from just now stays");
+        r.c.reconnect(Some((WAKE_STALE, Duration::from_secs(60))));
+        assert!(!r.c.links.contains_key(SUB));
+    }
+
+    #[test]
+    fn stalled_incoming_transfer_is_dropped_with_its_files() {
+        let mut r = rig(Role::Master);
+        r.c.config.peers.push(peer(SUB, Role::Sub));
+        let _rx = link(&mut r.c, SUB, Role::Sub);
+        r.c.links.get_mut(SUB).unwrap().paired = true;
+        let files = vec![crate::transfer::FileMeta { name: "a.bin".into(), size: 10 }];
+        message(&mut r.c, SUB, Msg::ClipStart { id: 5, kind: crate::transfer::ClipKind::Files, files });
+        assert!(r.c.incoming.is_some());
+        r.c.drop_stalled_incoming(Instant::now() + INCOMING_STALL / 2);
+        assert!(r.c.incoming.is_some());
+        r.c.drop_stalled_incoming(Instant::now() + INCOMING_STALL + Duration::from_secs(1));
+        assert!(r.c.incoming.is_none());
+        assert!(!r.dir.join("flockswitch").join("incoming-5").exists());
+        assert_eq!(r.c.status.lock().unwrap().transfer.as_ref().map(|t| t.stage.as_str()), Some("failed"));
+    }
+
+    #[test]
+    fn reconnect_cycles_all_discovered_and_saved_addresses() {
+        let mut r = rig(Role::Master);
+        let mut p = peer(SUB, Role::Sub);
+        p.last_addr = "127.0.0.1:47163".into();
+        let a: SocketAddr = "127.0.0.1:47161".parse().unwrap();
+        let b: SocketAddr = "[::1]:47162".parse().unwrap();
+        let saved = p.last_addr.parse().unwrap();
+        r.c.discovered.push(DiscoveredPeer { id: SUB.into(), name: SUB.into(), os: Os::Mac,
+            fingerprint: p.fingerprint.clone(), addresses: vec![a, a, b], port: 47161, seen: Instant::now() });
+        for expected in [a, b, saved, a, b, saved] {
+            assert_eq!(r.c.dial_address(&p), Some(expected));
+            r.c.schedule_retry(SUB);
+        }
+        r.c.discovered[0].fingerprint = "bad".into();
+        assert_eq!(r.c.dial_address(&p), Some(saved));
+        r.c.retry.clear();
+        r.c.discovered[0].fingerprint = p.fingerprint.clone();
+        assert_eq!(r.c.dial_address(&p), Some(a));
+    }
+
 }

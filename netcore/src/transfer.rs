@@ -87,6 +87,9 @@ pub struct Outgoing {
 }
 
 impl Outgoing {
+    pub(crate) fn id(&self) -> u32 {
+        self.id
+    }
     /// Regular files only (folders and anything unreadable are left out). Err when nothing
     /// is left or the total is over `limit` bytes.
     pub fn files(id: u32, paths: &[PathBuf], limit: u64) -> Result<Self> {

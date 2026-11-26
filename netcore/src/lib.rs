@@ -87,6 +87,15 @@ pub trait Platform: Send + Sync + 'static {
         }
     }
     fn start_capture(&self, sink: Sender<InputEvent>) -> anyhow::Result<()>;
+    /// Optional monotonic capture time for the event being consumed, in sink order.
+    /// None uses the service's current time. Queue timestamps alongside the existing
+    /// InputEvents when their original down/up timing must survive a delayed consumer.
+    fn captured_at(&self, _event: &InputEvent) -> Option<std::time::Instant> { None }
+    /// On a Caps Lock key-up only: consume the measured hold duration for that press.
+    /// Mac capture that emits an immediate down/up pair supplies this hint to preserve
+    /// long presses. None uses the down/up event times. No new InputEvent is required.
+    /// See CAPS_LONG_PRESS.md for the capture contract and the legacy fallback.
+    fn caps_hold_ms(&self) -> Option<u64> { None }
     fn stop_capture(&self);
     fn inject(&self, ev: &InputEvent);
     fn ready(&self) -> Result<(), String>;
@@ -180,7 +189,10 @@ pub struct MasterSettings {
 fn enabled_by_default() -> bool { true }
 
 impl Default for MasterSettings {
-    fn default() -> Self { Self::of(&NetConfig::default(), "") }
+    fn default() -> Self {
+        // A 2.0 master sends no `keys`: empty means its 2.0 fields stand for the rules.
+        Self { keys: BTreeMap::new(), ..Self::of(&NetConfig::default(), "") }
+    }
 }
 impl MasterSettings {
     pub fn of(config: &NetConfig, master_name: &str) -> Self {
@@ -201,7 +213,7 @@ impl MasterSettings {
             mac_capslock_to_hangul: old.mac_capslock_to_hangul,
             mac_shift_space_to_hangul: old.mac_shift_space_to_hangul,
             lang1_on_mac: old.lang1_on_mac,
-            keys: config.keys.clone(),
+            keys: config.all_rules(),
             clipboard_relay: config.clipboard_relay,
             share_clipboard: config.share_clipboard,
             clipboard_limit_mb: config.clipboard_limit_mb,
@@ -528,7 +540,15 @@ mod tests {
         assert_eq!(check_port(80, DEFAULT_PORT), Err(PortProblem::Reserved));
         assert_eq!(check_port(47851, DEFAULT_PORT), Err(PortProblem::Ours));
         assert_eq!(check_port(5353, DEFAULT_PORT), Err(PortProblem::Ours));
-        let busy = std::net::TcpListener::bind(("0.0.0.0", 0)).unwrap();
+        assert_eq!(check_port(DEFAULT_PORT, DEFAULT_PORT), Ok(()));
+        let busy = match std::net::TcpListener::bind(("0.0.0.0", 0)) {
+            Ok(busy) => busy,
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                eprintln!("port_checks: socket assertions unavailable: {e}");
+                return;
+            }
+            Err(e) => panic!("binding test port: {e}"),
+        };
         let port = busy.local_addr().unwrap().port();
         assert_eq!(check_port(port, DEFAULT_PORT), Err(PortProblem::InUse));
         assert_eq!(check_port(port, port), Ok(()));
@@ -663,11 +683,14 @@ mod v2_1_tests {
         let settings: MasterSettings = serde_json::from_str(&json).unwrap();
         let mut sub = NetConfig::default();
         settings.apply_to(&mut sub);
-        assert_eq!(sub.keys, master.keys);
+        assert_eq!(sub.keys.get("mac>windows"), master.keys.get("mac>windows"));
+        assert_eq!(sub.keys.get("windows>mac"), master.keys.get("windows>mac"));
         assert!(!sub.clipboard_relay);
         assert_eq!(sub.rules_for(Os::Mac, Os::Windows), master.rules_for(Os::Mac, Os::Windows));
-        // Untouched pairs fall back to the sub's mirrored 2.0 fields, which are the master's.
-        assert_eq!(sub.rules_for(Os::Mac, Os::Linux).unwrap().mod_mode, ModMode::Off);
+        // Every direction travels with its effective rules, also those not edited.
+        assert_eq!(settings.keys.len(), 9);
+        assert_eq!(sub.rules_for(Os::Mac, Os::Linux), master.rules_for(Os::Mac, Os::Linux));
+        assert_eq!(sub.all_rules(), master.all_rules());
     }
     #[test]
     fn status_from_2_0_still_reads() {
