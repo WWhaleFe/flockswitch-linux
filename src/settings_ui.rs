@@ -3582,18 +3582,13 @@ impl SettingsApp {
                 None => t.status_sub_none.to_string(),
             }
         };
-        let (line, here) = match &at {
+        let (name, here) = match &at {
             MouseAt::Here => (t.status_this.to_string(), true),
             MouseAt::There(name) => (name.clone(), false),
             MouseAt::Controlled(name) => (name.clone(), true),
         };
-        // Line 2 leads with "mouse here"; without that prefix when it would not fit.
-        let net_line = {
-            let full = format!("{} · {net_line}", t.status_mouse_here);
-            let avail = ui.available_width() - 20.0;
-            let width = ui.painter().layout_no_wrap(full.clone(), FontId::proportional(12.0), p.muted).size().x;
-            if width <= avail { full } else { net_line }
-        };
+        // Line 1 says where the mouse is: "마우스 · ThinkPad".
+        let line = format!("{} · {name}", t.status_mouse_here);
         let device = match &self.status.trigger {
             Some(name) => match self.status.channel {
                 Some(c) => format!("{name} · {}", crate::i18n::fill(t.status_channel, &[&c.to_string()])),
