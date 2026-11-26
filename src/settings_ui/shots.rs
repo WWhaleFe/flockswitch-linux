@@ -67,7 +67,7 @@ const ME: &str = "1f6c0a52e9d34b78";
 /// The other three, in the order they are paired: id, Korean name, English name, system.
 const OTHERS: [(&str, &str, &str, Os); 3] = [
     ("a3d95e17c0b24f86", "Mac mini", "Mac mini", Os::Mac),
-    ("5b82f4a09c1e7d63", "Windows 데스크톱", "Windows desktop", Os::Windows),
+    ("5b82f4a09c1e7d63", "Windows PC", "Windows PC", Os::Windows),
     ("c47e1b93a5d02f68", "Galaxy S25", "Galaxy S25", Os::Android),
 ];
 /// The direction shown on the keyboard page (index among the two of the pair).
