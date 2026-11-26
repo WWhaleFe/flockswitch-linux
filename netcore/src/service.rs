@@ -2,6 +2,7 @@ use crate::{
     discovery::{DiscoveredPeer, Discovery},
     identity::Identity,
     pairing::Pairing,
+    keymap::KeyMapper,
     proto::{Msg, PROTO_VERSION},
     tls, *,
 };
@@ -16,12 +17,22 @@ use std::{
         Arc, Mutex,
     },
     thread::{self, JoinHandle},
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime},
 };
 
 const POLL: Duration = Duration::from_millis(8);
 const HEARTBEAT: Duration = Duration::from_millis(500);
 const DEAD: Duration = Duration::from_secs(2);
+/// A wall-clock jump this big between two ticks means the computer slept or was locked.
+const WAKE_JUMP: Duration = Duration::from_secs(5);
+/// After a wake-up, links silent for this long are closed.
+const WAKE_STALE: Duration = Duration::from_secs(4);
+/// How long the status says "reconnecting" at most.
+const RECONNECT_SHOWN: Duration = Duration::from_secs(10);
+/// Seconds to wait before dial attempt number `attempt` (0 is the first retry), at most 8.
+pub(crate) fn backoff_secs(attempt: usize) -> u64 {
+    [1, 2, 4, 8][attempt.min(3)]
+}
 static NEXT_LINK: AtomicU64 = AtomicU64::new(1);
 
 pub struct Service {
@@ -33,6 +44,9 @@ enum Command {
     Config(NetConfig),
     Request(Request),
     Cross(Side, f64),
+    Reconnect,
+    KeyRules(std::collections::BTreeMap<String, DirRules>),
+    ClockJump(Duration),
     Stop,
 }
 impl Service {
@@ -73,6 +87,9 @@ impl Service {
             pairing: None,
             transfer: None,
             following: None,
+            layout: vec![],
+            reconnecting: false,
+            keys: config.all_rules(),
         }));
         let (tx, rx) = mpsc::channel();
         let (events, event_rx) = mpsc::channel();
@@ -101,13 +118,19 @@ impl Service {
             master: None,
             told: HashMap::new(),
             keys: HashSet::new(),
-            clip_sig: None,
+            clip_sigs: HashMap::new(),
+            clip_origin: None,
+            trusted: vec![],
+            group: None,
+            reconnecting: None,
+            skew: Duration::ZERO,
+            last_wall: SystemTime::now(),
             outgoing: None,
             incoming: None,
             next_transfer: 1,
             buttons: HashSet::new(),
             captured_keys: HashSet::new(),
-            mac_hangul: keymap::MacHangul::default(),
+            mapper: KeyMapper::default(),
             discovery: None,
             discovered: vec![],
             edge_wait: None,
@@ -150,6 +173,20 @@ impl Service {
         self.tx
             .send(Command::Cross(side, pos))
             .context("service stopped")
+    }
+    /// Close links that are not fully up, reset the dial backoff, redial every peer now
+    /// and browse for computers again. Apps call this on wake and unlock.
+    pub fn reconnect(&self) -> Result<()> {
+        self.tx.send(Command::Reconnect).context("service stopped")
+    }
+    /// Send edited key rules: a master saves and hands them on, a sub sends them to its master.
+    pub fn send_key_rules(&self, keys: std::collections::BTreeMap<String, DirRules>) -> Result<()> {
+        self.tx.send(Command::KeyRules(keys)).context("service stopped")
+    }
+    /// Test hook: acts as if the wall clock jumped forward, like after sleep.
+    #[doc(hidden)]
+    pub fn simulate_clock_jump(&self, by: Duration) -> Result<()> {
+        self.tx.send(Command::ClockJump(by)).context("service stopped")
     }
     /// Queue a live update. The original config_dir remains fixed.
     pub fn update_config(&self, config: NetConfig) -> Result<()> {
@@ -206,6 +243,9 @@ fn bind(port: u16) -> Result<TcpListener> {
     let dual_stack = (|| -> std::io::Result<TcpListener> {
         let socket = Socket::new(Domain::IPV6, Type::STREAM, Some(Protocol::TCP))?;
         socket.set_only_v6(false)?;
+        // As std does for IPv4: a restart may bind the port again at once.
+        #[cfg(unix)]
+        socket.set_reuse_address(true)?;
         socket.bind(&SocketAddr::from(([0u16; 8], port)).into())?;
         socket.listen(64)?;
         Ok(socket.into())
@@ -222,6 +262,7 @@ struct Link {
     name: String,
     os: Os,
     role: Role,
+    features: Vec<String>,
     fp: String,
     addr: SocketAddr,
     outgoing: bool,
@@ -291,11 +332,21 @@ struct Control {
     /// On a sub: the settings its master handed over, kept over the sub's own.
     master: Option<MasterSettings>,
     /// On a master: what each sub was last told (its side and the settings).
-    told: HashMap<String, (Option<Side>, MasterSettings)>,
+    told: HashMap<String, (Option<Side>, MasterSettings, (Vec<Cell>, Vec<Member>))>,
     keys: HashSet<u16>,
-    /// Fingerprint of the clipboard content last sent or received, so unchanged content
-    /// is not sent again.
-    clip_sig: Option<Vec<u8>>,
+    /// Per peer: fingerprint of the clipboard content last sent to or received from it,
+    /// so unchanged content is not sent again.
+    clip_sigs: HashMap<String, Vec<u8>>,
+    /// Fingerprint of the content that last arrived, and the peer it came from.
+    clip_origin: Option<(Vec<u8>, String)>,
+    /// On a sub: computers its master's roster vouches for (runtime only, `via_master`).
+    trusted: Vec<PeerConfig>,
+    /// On a sub: the layout and roster the master last sent.
+    group: Option<(Vec<Cell>, Vec<Member>)>,
+    reconnecting: Option<Instant>,
+    /// Added to the wall clock (test hook for a simulated sleep).
+    skew: Duration,
+    last_wall: SystemTime,
     /// A clipboard transfer on its way out, to this peer.
     outgoing: Option<(String, crate::transfer::Outgoing)>,
     /// A clipboard transfer on its way in, from this peer.
@@ -303,7 +354,7 @@ struct Control {
     next_transfer: u32,
     buttons: HashSet<MouseButton>,
     captured_keys: HashSet<u16>,
-    mac_hangul: keymap::MacHangul,
+    mapper: KeyMapper,
     discovery: Option<Discovery>,
     discovered: Vec<DiscoveredPeer>,
     edge_wait: Option<(Side, Instant)>,
@@ -386,12 +437,21 @@ impl Control {
                     Ok(Command::Request(r)) => self.request(r),
                     Ok(Command::Config(c)) => self.update(c),
                     Ok(Command::Cross(side, pos)) => self.cross_on_request(side, pos),
+                    Ok(Command::Reconnect) => self.reconnect(None),
+                    Ok(Command::KeyRules(keys)) => self.key_rules_edited(keys),
+                    Ok(Command::ClockJump(by)) => self.skew += by,
                     Err(_) => break,
                 }
             }
             if stop {
                 break;
             }
+            let wall = SystemTime::now() + self.skew;
+            if wall.duration_since(self.last_wall).is_ok_and(|d| d >= WAKE_JUMP) {
+                log::info!("clock jumped: reconnecting");
+                self.reconnect(Some(WAKE_STALE));
+            }
+            self.last_wall = wall;
             if self.config.on {
                 for _ in 0..16 {
                     let result = self.listener.as_ref().map(|l| l.accept());
@@ -429,6 +489,14 @@ impl Control {
             if self.config.on {
                 self.maintenance();
                 self.poll_cursor();
+            }
+            if let State::Controlling { peer, .. } = &self.state {
+                let events = self.mapper.tick(Instant::now());
+                if let Some(l) = self.links.get(peer) {
+                    for event in events {
+                        l.send(Msg::Input(event));
+                    }
+                }
             }
             self.flush_transfer();
             self.publish(false);
@@ -476,6 +544,7 @@ impl Control {
             self.status.lock().unwrap().following = None;
         }
         if config.swap_cmd_ctrl != self.config.swap_cmd_ctrl
+            || config.keys != self.config.keys
             || config.lang1_on_mac != self.config.lang1_on_mac
             || config.mac_capslock_to_hangul != self.config.mac_capslock_to_hangul
             || config.mac_shift_space_to_hangul != self.config.mac_shift_space_to_hangul
@@ -483,6 +552,11 @@ impl Control {
             self.local(true);
         }
         config.config_dir = self.config.config_dir.clone();
+        config.peers.retain(|p| !p.via_master);
+        if config.role != Role::Sub || !config.peers.iter().any(|p| p.role == Role::Master) {
+            self.trusted.clear();
+            self.group = None;
+        }
         let rebind = config.on != self.config.on || config.port != self.config.port;
         let rediscover =
             rebind || config.discovery != self.config.discovery || config.name != self.config.name;
@@ -494,6 +568,7 @@ impl Control {
                     || !config
                         .peers
                         .iter()
+                        .chain(&self.trusted)
                         .any(|p| p.id == **id && p.fingerprint == l.fp)
                         && l.paired
             })
@@ -509,6 +584,7 @@ impl Control {
             self.pairing = None;
         }
         self.config = config;
+        self.sync_sides();
         if rebind {
             self.listener = None;
             if self.config.on {
@@ -561,9 +637,19 @@ impl Control {
                 }
             }
             Request::Unpair { unpair } => {
+                let was_master = self.config.peers.iter().any(|p| p.id == unpair && p.role == Role::Master);
                 self.config.peers.retain(|p| p.id != unpair);
+                if was_master {
+                    self.trusted.clear();
+                    self.group = None;
+                }
                 self.disconnect(&unpair, "unpaired");
                 (self.hooks.on_unpaired)(unpair);
+            }
+            Request::Action { action } => {
+                if action == "reconnect" {
+                    self.reconnect(None);
+                }
             }
         }
     }
@@ -669,7 +755,7 @@ impl Control {
                 if !self.config.on || id == self.identity.id {
                     return;
                 }
-                if let Some(p) = self.config.peers.iter().find(|p| p.id == id) {
+                if let Some(p) = self.config.peers.iter().chain(&self.trusted).find(|p| p.id == id) {
                     if p.fingerprint != link.fp {
                         log::warn!("fingerprint mismatch for {id}");
                         return;
@@ -703,6 +789,7 @@ impl Control {
                 }
             }
             Event::Message(id, token, msg) => {
+                let can_send = self.peer_can_send(&id);
                 let Some(l) = self.links.get_mut(&id) else {
                     return;
                 };
@@ -747,6 +834,17 @@ impl Control {
                             }
                         }
                     }
+                    Msg::Group { cells, roster } => {
+                        let from_master = self.config.peers.iter().any(|p| p.id == id && p.role == Role::Master);
+                        if self.config.role == Role::Sub && from_master {
+                            self.apply_group(&id, cells, roster);
+                        }
+                    }
+                    Msg::KeyRules(keys) => {
+                        if self.config.role == Role::Master && l.role == Role::Sub {
+                            self.key_rules_edited(keys);
+                        }
+                    }
                     Msg::MasterSettings(settings) => {
                         if self.config.role == Role::Sub && l.role == Role::Master {
                             settings.apply_to(&mut self.config);
@@ -766,7 +864,9 @@ impl Control {
                         }
                     }
                     Msg::Enter { side, pos } => {
-                        if matches!(self.state, State::Local)
+                        if !can_send {
+                            l.send(Msg::ReleaseAll);
+                        } else if matches!(self.state, State::Local)
                             && pos.is_finite()
                             && self.platform.ready().is_ok()
                         {
@@ -804,10 +904,10 @@ impl Control {
                         }
                     }
                     Msg::Clipboard { text } => {
-                        let sig = clip_sig(b"text", &[text.as_bytes()]);
-                        if self.config.share_clipboard && self.clip_sig.as_ref() != Some(&sig) {
+                        if self.config.share_clipboard {
+                            let sig = clip_sig(b"text", &[text.as_bytes()]);
                             self.platform.set_clipboard_text(&text);
-                            self.clip_sig = Some(sig);
+                            self.clip_received(&id, sig);
                         }
                     }
                     Msg::ClipStart { id: tid, kind, files } => self.clip_start(&id, tid, kind, files),
@@ -853,30 +953,220 @@ impl Control {
             attempt: 0,
             next: Instant::now(),
         });
-        let seconds = [1, 2, 5, 10][retry.attempt.min(3)];
+        let seconds = backoff_secs(retry.attempt);
         retry.attempt += 1;
         retry.next = Instant::now() + Duration::from_secs(seconds);
     }
-    /// On a master: tells each connected sub where it sits and which settings to use,
-    /// whenever that changed (or the sub just connected).
+    /// On a master: tells each connected sub where it sits, who else is in the group and
+    /// which settings to use, whenever that changed (or the sub just connected).
     fn tell_subs(&mut self) {
         if self.config.role != Role::Master {
             self.told.clear();
             return;
         }
+        self.sync_sides();
         let settings = MasterSettings::of(&self.config, &computer_name(&self.config));
+        let group = (self.my_cells(), self.roster());
         self.told.retain(|id, _| self.links.get(id).is_some_and(|l| l.paired));
         for p in &self.config.peers {
             let Some(l) = self.links.get(&p.id).filter(|l| l.paired && l.role == Role::Sub) else {
                 continue;
             };
-            let now = (p.side, settings.clone());
+            let now = (p.side, settings.clone(), group.clone());
             if self.told.get(&p.id) != Some(&now) {
                 l.send(Msg::Layout { side: p.side });
                 l.send(Msg::MasterSettings(settings.clone()));
+                if l.features.iter().any(|f| f == "group") {
+                    l.send(Msg::Group { cells: group.0.clone(), roster: group.1.clone() });
+                }
                 self.told.insert(p.id.clone(), now);
             }
         }
+    }
+    /// The master and its subs, as handed to every sub.
+    fn roster(&self) -> Vec<Member> {
+        let mut roster = vec![Member {
+            id: self.identity.id.clone(),
+            name: computer_name(&self.config),
+            os: self.platform.os(),
+            fingerprint: self.identity.fingerprint.clone(),
+            addr: String::new(),
+            can_send: true,
+        }];
+        for p in self.config.peers.iter().filter(|p| p.role == Role::Sub) {
+            let addr = match (&p.last_addr, self.links.get(&p.id)) {
+                (a, Some(l)) if a.is_empty() => l.addr.to_string(),
+                (a, _) => a.clone(),
+            };
+            roster.push(Member {
+                id: p.id.clone(),
+                name: p.name.clone(),
+                os: p.os,
+                fingerprint: p.fingerprint.clone(),
+                addr,
+                can_send: p.can_send,
+            });
+        }
+        roster
+    }
+    /// The grid in effect: the master's layout, the one the master sent, or what the
+    /// peers' 2.0 sides make of it.
+    fn my_cells(&self) -> Vec<Cell> {
+        let me = &self.identity.id;
+        match &self.group {
+            Some((cells, _)) if self.config.role == Role::Sub => cells.clone(),
+            _ if self.config.role == Role::Master && !self.config.layout.is_empty() => {
+                layout::with_master(&self.config.layout, me)
+            }
+            _ => layout::cells_from_sides(me, &self.config.peers),
+        }
+    }
+    /// On a master with a layout: the 2.0 side of each sub follows the grid.
+    fn sync_sides(&mut self) {
+        if self.config.role != Role::Master || self.config.layout.is_empty() {
+            return;
+        }
+        let cells = self.my_cells();
+        let me = self.identity.id.clone();
+        for p in &mut self.config.peers {
+            let side = layout::side_of(&cells, &me, &p.id);
+            if p.side != side {
+                p.side = side;
+                (self.hooks.on_peer_changed)(p.clone());
+            }
+        }
+    }
+    /// A peer a link may be open to: paired, or vouched for by the master's roster.
+    fn known_peer(&self, id: &str) -> Option<&PeerConfig> {
+        self.config.peers.iter().chain(&self.trusted).find(|p| p.id == id)
+    }
+    fn open(&self, id: &str) -> bool {
+        self.links.get(id).is_some_and(|l| l.paired)
+    }
+    /// Whether this computer may use its mouse and keyboard on the others.
+    fn me_can_send(&self) -> bool {
+        match &self.group {
+            Some((_, roster)) if self.config.role == Role::Sub => {
+                roster.iter().find(|m| m.id == self.identity.id).is_none_or(|m| m.can_send)
+            }
+            _ => true,
+        }
+    }
+    /// Whether `id` may take control of this computer: a master looks at its config,
+    /// a sub at the roster.
+    fn peer_can_send(&self, id: &str) -> bool {
+        if let Some((_, roster)) = &self.group {
+            if self.config.role == Role::Sub {
+                if let Some(m) = roster.iter().find(|m| m.id == id) {
+                    return m.can_send;
+                }
+            }
+        }
+        self.known_peer(id).is_none_or(|p| p.can_send)
+    }
+    /// The open link on the other side of the neighbouring cell on `side`.
+    fn neighbour_peer(&self, side: Side) -> Option<String> {
+        if !self.me_can_send() {
+            return None;
+        }
+        let cells = self.my_cells();
+        layout::neighbour(&cells, &self.identity.id, side)
+            .filter(|id| self.open(id))
+            .map(String::from)
+    }
+    /// On a sub: the master sent the grid and roster. Listed computers are trusted for
+    /// sub-to-sub links; computers no longer listed are dropped.
+    fn apply_group(&mut self, master: &str, cells: Vec<Cell>, roster: Vec<Member>) {
+        let me = self.identity.id.clone();
+        let trusted: Vec<PeerConfig> = roster
+            .iter()
+            .filter(|m| m.id != me && m.id != master && !self.config.peers.iter().any(|p| p.id == m.id))
+            .filter(|m| m.fingerprint.len() == 64 && m.fingerprint.starts_with(&m.id))
+            .map(|m| PeerConfig {
+                id: m.id.clone(),
+                name: m.name.clone(),
+                os: m.os,
+                fingerprint: m.fingerprint.clone(),
+                last_addr: m.addr.clone(),
+                role: Role::Sub,
+                can_send: m.can_send,
+                via_master: true,
+                ..PeerConfig::default()
+            })
+            .collect();
+        let dropped: Vec<String> = self
+            .links
+            .iter()
+            .filter(|(id, l)| {
+                l.paired
+                    && !self.config.peers.iter().any(|p| p.id == **id)
+                    && !trusted.iter().any(|t| t.id == **id && t.fingerprint == l.fp)
+            })
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in &dropped {
+            self.disconnect(id, "left the group");
+            self.retry.remove(id);
+        }
+        for (id, l) in self.links.iter_mut().filter(|(_, l)| !l.paired) {
+            if let Some(t) = trusted.iter().find(|t| t.id == *id && t.fingerprint == l.fp) {
+                l.paired = true;
+                if !l.outgoing {
+                    if let Ok(addr) = t.last_addr.parse() {
+                        l.addr = addr;
+                    }
+                }
+            }
+        }
+        self.trusted = trusted;
+        self.group = Some((layout::valid_cells(&cells), roster));
+    }
+    /// Key rules were edited (here, or by a sub): a master saves and hands them on, a sub
+    /// passes them to its master.
+    fn key_rules_edited(&mut self, keys: std::collections::BTreeMap<String, DirRules>) {
+        let keys: std::collections::BTreeMap<_, _> =
+            keys.into_iter().filter(|(k, _)| keymap::parse_pair(k).is_some()).collect();
+        if self.config.role == Role::Master {
+            if self.config.keys != keys {
+                self.config.keys = keys.clone();
+                self.local(true);
+                (self.hooks.on_key_rules)(keys);
+            }
+        } else if let Some(l) = self
+            .config
+            .peers
+            .iter()
+            .find(|p| p.role == Role::Master)
+            .and_then(|p| self.links.get(&p.id))
+            .filter(|l| l.paired && l.features.iter().any(|f| f == "keyrules"))
+        {
+            l.send(Msg::KeyRules(keys));
+        }
+    }
+    /// Closes links that are not fully up (and, after a wake-up, silent ones), resets the
+    /// dial backoff, redials everyone now and browses again.
+    fn reconnect(&mut self, stale: Option<Duration>) {
+        if !self.config.on {
+            return;
+        }
+        let close: Vec<String> = self
+            .links
+            .iter()
+            .filter(|(id, l)| {
+                let pairing = self.pairing.as_ref().is_some_and(|p| &p.peer == *id);
+                (!l.paired && !pairing) || stale.is_some_and(|s| l.last_rx.elapsed() >= s)
+            })
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in close {
+            self.disconnect(&id, "reconnect");
+        }
+        self.retry.clear();
+        self.reconnecting = Some(Instant::now());
+        if let Some(d) = &mut self.discovery {
+            d.rebrowse();
+        }
+        self.dial_peers();
     }
     fn maintenance(&mut self) {
         self.tell_subs();
@@ -909,7 +1199,23 @@ impl Control {
                 }
             }
         }
-        let peers = self.config.peers.clone();
+        self.dial_peers();
+    }
+    /// Dials every peer that has no link, is not waiting out a backoff and is ours to dial
+    /// (the one with the smaller id dials). Roster-vouched subs only if they are neighbours.
+    fn dial_peers(&mut self) {
+        let cells = self.my_cells();
+        let near: Vec<&str> = [Side::Left, Side::Right, Side::Top, Side::Bottom]
+            .into_iter()
+            .filter_map(|s| layout::neighbour(&cells, &self.identity.id, s))
+            .collect();
+        let peers: Vec<PeerConfig> = self
+            .config
+            .peers
+            .iter()
+            .chain(self.trusted.iter().filter(|t| near.contains(&t.id.as_str())))
+            .cloned()
+            .collect();
         for p in peers {
             if self.identity.id >= p.id
                 || self.links.contains_key(&p.id)
@@ -958,7 +1264,7 @@ impl Control {
         }
         self.release();
         self.captured_keys.clear();
-        self.mac_hangul = keymap::MacHangul::default();
+        self.mapper = KeyMapper::default();
         self.edge_wait = None;
         self.edge_hit = None;
         self.outward = false;
@@ -1033,11 +1339,13 @@ impl Control {
             }
         }
         if let Some(l) = self.links.get(&peer) {
-            for mut event in self.mac_hangul.map(event, self.platform.os(), l.os, &self.config, &self.captured_keys) {
-                if let InputEvent::Key { usage, .. } = &mut event {
-                    *usage = keymap::swap_cmd_ctrl(*usage, self.platform.os(), l.os, self.config.swap_cmd_ctrl);
+            match self.config.rules_for(self.platform.os(), l.os) {
+                Some(rules) => {
+                    for event in self.mapper.map(event, self.platform.os(), l.os, &rules, Instant::now()) {
+                        l.send(Msg::Input(event));
+                    }
                 }
-                l.send(Msg::Input(event));
+                None => l.send(Msg::Input(event)),
             }
         }
     }
@@ -1072,7 +1380,7 @@ impl Control {
             pos,
         };
         self.captured_keys.clear();
-        self.mac_hangul = keymap::MacHangul::default();
+        self.mapper = KeyMapper::default();
         self.switch_channel(&peer);
     }
     fn cross_on_request(&mut self, side: Side, pos: f64) {
@@ -1082,13 +1390,7 @@ impl Control {
         if self.platform.ready().is_err() {
             return;
         }
-        let Some(peer) = self
-            .config
-            .peers
-            .iter()
-            .find(|p| p.side == Some(side) && self.links.get(&p.id).is_some_and(|l| l.paired))
-            .map(|p| p.id.clone())
-        else {
+        let Some(peer) = self.neighbour_peer(side) else {
             return;
         };
         self.cross_to(peer, side, pos.clamp(0.0, 1.0));
@@ -1099,12 +1401,7 @@ impl Control {
         }
         let mut sides = Vec::new();
         for side in [Side::Left, Side::Right, Side::Top, Side::Bottom] {
-            if self
-                .config
-                .peers
-                .iter()
-                .any(|p| p.side == Some(side) && self.links.get(&p.id).is_some_and(|l| l.paired))
-            {
+            if self.neighbour_peer(side).is_some() {
                 sides.push(side);
             }
         }
@@ -1154,15 +1451,7 @@ impl Control {
                     self.edge_wait = None;
                     return;
                 };
-                let Some(peer) = self
-                    .config
-                    .peers
-                    .iter()
-                    .find(|p| {
-                        p.side == Some(side) && self.links.get(&p.id).is_some_and(|l| l.paired)
-                    })
-                    .map(|p| p.id.clone())
-                else {
+                let Some(peer) = self.neighbour_peer(side) else {
                     self.edge_wait = None;
                     return;
                 };
@@ -1203,12 +1492,8 @@ impl Control {
                         l.send(Msg::Leave { pos });
                     }
                     self.local(false);
-                    if self
-                        .config
-                        .peers
-                        .iter()
-                        .any(|p| p.id == peer && p.side == Some(entered))
-                    {
+                    let cells = self.my_cells();
+                    if layout::neighbour(&cells, &self.identity.id, entered) == Some(peer.as_str()) {
                         self.switch_channel(&peer);
                     }
                 }
@@ -1218,20 +1503,14 @@ impl Control {
         self.last_cursor = cursor;
     }
     /// While controlled: Control held on the controlling computer's keyboard (as injected
-    /// here) or on this computer's own. With Cmd/Ctrl swapped between a Mac and another
-    /// system, the controller's Control key arrives here as Cmd/Windows.
+    /// here) or on this computer's own. Its Control key arrives here as whatever the key
+    /// rules between the two systems turn it into (Command/Windows when swapped).
     fn control_held(&self, peer: &str) -> bool {
-        const CTRL: [u16; 2] = [0xE0, 0xE4];
-        const GUI: [u16; 2] = [0xE3, 0xE7];
-        let mine_mac = self.platform.os() == Os::Mac;
-        let swapped = self.config.swap_cmd_ctrl
-            && self
-                .config
-                .peers
-                .iter()
-                .find(|p| p.id == peer)
-                .is_some_and(|p| (p.os == Os::Mac) != mine_mac);
-        let control = if swapped { GUI } else { CTRL };
+        let mine = self.platform.os();
+        let control: Vec<u16> = match self.known_peer(peer).and_then(|p| self.config.rules_for(p.os, mine).map(|r| (p.os, r))) {
+            Some((os, rules)) => [0xE0, 0xE4].map(|u| keymap::map_modifier(os, mine, &rules, u)).to_vec(),
+            None => vec![0xE0, 0xE4],
+        };
         self.keys.iter().any(|k| control.contains(k)) || self.platform.control_down()
     }
     /// Sends what this computer's clipboard holds to `peer` (files, else an image, else
@@ -1247,10 +1526,10 @@ impl Control {
             let files = self.platform.clipboard_files();
             if !files.is_empty() {
                 let sig = files_sig(&files);
-                if self.clip_sig.as_ref() == Some(&sig) {
+                if !self.clip_wanted(peer, &sig) {
                     return;
                 }
-                self.clip_sig = Some(sig);
+                self.clip_sigs.insert(peer.into(), sig);
                 let id = self.take_transfer_id();
                 match Outgoing::files(id, &files, limit) {
                     Ok(out) => self.begin_send(peer, "files", out),
@@ -1264,10 +1543,10 @@ impl Control {
             }
             if let Some(png) = self.platform.clipboard_image_png() {
                 let sig = clip_sig(b"image", &[&png]);
-                if self.clip_sig.as_ref() == Some(&sig) {
+                if !self.clip_wanted(peer, &sig) {
                     return;
                 }
-                self.clip_sig = Some(sig);
+                self.clip_sigs.insert(peer.into(), sig);
                 if png.len() as u64 > limit {
                     self.transfer_note("send", "image", "too_large");
                     return;
@@ -1281,10 +1560,10 @@ impl Control {
             return;
         };
         let sig = clip_sig(b"text", &[text.as_bytes()]);
-        if self.clip_sig.as_ref() == Some(&sig) {
+        if !self.clip_wanted(peer, &sig) {
             return;
         }
-        self.clip_sig = Some(sig);
+        self.clip_sigs.insert(peer.into(), sig);
         if text.len() <= INLINE_TEXT {
             if let Some(l) = self.links.get(peer) {
                 l.send(Msg::Clipboard { text });
@@ -1295,6 +1574,27 @@ impl Control {
         } else {
             self.transfer_note("send", "text", "too_large");
         }
+    }
+    /// Content just arrived from `peer`: it has it, and this is where it came from.
+    fn clip_received(&mut self, peer: &str, sig: Vec<u8>) {
+        self.clip_sigs.insert(peer.into(), sig.clone());
+        self.clip_origin = Some((sig, peer.into()));
+    }
+    /// Whether clipboard content `sig` should go to `peer`: it does not have it yet, and
+    /// with relay off it did not come from another sub (when `peer` is a sub too).
+    fn clip_wanted(&self, peer: &str, sig: &[u8]) -> bool {
+        if self.clip_sigs.get(peer).map(Vec::as_slice) == Some(sig) {
+            return false;
+        }
+        if !self.config.clipboard_relay {
+            let is_sub = |id: &str| self.known_peer(id).is_some_and(|p| p.role == Role::Sub);
+            if let Some((origin, from)) = &self.clip_origin {
+                if origin.as_slice() == sig && from != peer && is_sub(from) && is_sub(peer) {
+                    return false;
+                }
+            }
+        }
+        true
     }
     fn take_transfer_id(&mut self) -> u32 {
         self.next_transfer = self.next_transfer.wrapping_add(1).max(1);
@@ -1434,17 +1734,17 @@ impl Control {
         match incoming.finish(&dest) {
             Ok(Received::Files(saved)) => {
                 self.platform.set_clipboard_files(&saved);
-                self.clip_sig = Some(files_sig(&saved));
+                self.clip_received(peer, files_sig(&saved));
                 self.transfer_finished(Some(dest.display().to_string()));
             }
             Ok(Received::Image(png)) => {
                 self.platform.set_clipboard_image_png(&png);
-                self.clip_sig = Some(clip_sig(b"image", &[&png]));
+                self.clip_received(peer, clip_sig(b"image", &[&png]));
                 self.transfer_finished(None);
             }
             Ok(Received::Text(text)) => {
                 self.platform.set_clipboard_text(&text);
-                self.clip_sig = Some(clip_sig(b"text", &[text.as_bytes()]));
+                self.clip_received(peer, clip_sig(b"text", &[text.as_bytes()]));
                 self.transfer_finished(None);
             }
             Err(e) => {
@@ -1491,12 +1791,24 @@ impl Control {
             .config
             .peers
             .iter()
+            .chain(&self.trusted)
             .map(|p| PeerStatus {
                 id: p.id.clone(),
                 connected: self.links.get(&p.id).is_some_and(|l| l.paired),
                 rtt_ms: self.links.get(&p.id).and_then(|l| l.rtt),
+                can_send: self.peer_can_send(&p.id),
+                via_master: p.via_master,
             })
             .collect();
+        status.layout = self.my_cells();
+        status.keys = self.config.all_rules();
+        if let Some(since) = self.reconnecting {
+            let down = self.config.peers.iter().any(|p| !self.open(&p.id));
+            if since.elapsed() >= RECONNECT_SHOWN || (!down && since.elapsed() >= Duration::from_millis(500)) {
+                self.reconnecting = None;
+            }
+        }
+        status.reconnecting = self.reconnecting.is_some();
         status.discovered = self
             .discovered
             .iter()
@@ -1609,6 +1921,7 @@ impl Worker {
                 os: self.os,
                 app_version: env!("CARGO_PKG_VERSION").into(),
                 role: self.role,
+                features: proto::FEATURES.iter().map(|f| f.to_string()).collect(),
             },
         )?;
         let (tx, rx) = mpsc::channel();
@@ -1672,6 +1985,7 @@ impl Worker {
                         name,
                         os,
                         role,
+                        features,
                         ..
                     } = msg
                     else {
@@ -1710,6 +2024,7 @@ impl Worker {
                             name,
                             os,
                             role,
+                            features,
                             fp: fp.clone(),
                             addr,
                             outgoing: self.outgoing,
@@ -1772,4 +2087,15 @@ fn files_sig(files: &[std::path::PathBuf]) -> Vec<u8> {
     }
     let refs: Vec<&[u8]> = parts.iter().map(Vec::as_slice).collect();
     clip_sig(b"files", &refs)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn dial_backoff_is_1_2_4_8_and_stays_at_8() {
+        let waits: Vec<u64> = (0..8).map(backoff_secs).collect();
+        assert_eq!(waits, [1, 2, 4, 8, 8, 8, 8, 8]);
+        assert_eq!(backoff_secs(usize::MAX), 8);
+    }
 }

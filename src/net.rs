@@ -191,6 +191,9 @@ fn publish_error(config: &NetConfig, error: String) {
             pairing: None,
             transfer: None,
             following: None,
+            layout: vec![],
+            reconnecting: false,
+            keys: Default::default(),
         },
     );
 }

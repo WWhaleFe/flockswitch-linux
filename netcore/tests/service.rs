@@ -41,6 +41,8 @@ struct FakePlatform {
     returned: Mutex<Option<(Side, f64)>>,
     control: AtomicBool,
     clipboard: Mutex<Option<String>>,
+    /// How often the service set the clipboard text.
+    sets: AtomicUsize,
     files: Mutex<Vec<std::path::PathBuf>>,
     image: Mutex<Option<Vec<u8>>>,
     recv_dir: Mutex<Option<std::path::PathBuf>>,
@@ -59,6 +61,7 @@ impl FakePlatform {
             returned: Mutex::new(None),
             control: AtomicBool::new(true),
             clipboard: Mutex::new(None),
+            sets: AtomicUsize::new(0),
             files: Mutex::new(vec![]),
             image: Mutex::new(None),
             recv_dir: Mutex::new(None),
@@ -127,6 +130,7 @@ impl Platform for FakePlatform {
         self.clipboard.lock().unwrap().clone()
     }
     fn set_clipboard_text(&self, text: &str) {
+        self.sets.fetch_add(1, Ordering::Relaxed);
         *self.clipboard.lock().unwrap() = Some(text.into());
     }
     fn clipboard_files(&self) -> Vec<std::path::PathBuf> {
@@ -492,6 +496,7 @@ fn silent_peer_triggers_two_second_safety_return() {
                 os: Os::Windows,
                 app_version: "test".into(),
                 role: Role::Sub,
+                features: vec![],
             },
         )
         .unwrap();
@@ -856,4 +861,403 @@ fn a_master_takes_three_subs_and_hands_them_its_layout_and_settings() {
         s.stop();
     }
     sm.stop();
+}
+
+// ---- 2.1: layout grid, can_send, clipboard relay, reconnect ----
+
+struct Node {
+    _dir: TempDir,
+    platform: Arc<FakePlatform>,
+    svc: Service,
+    id: String,
+}
+struct Group {
+    m: Node,
+    mcfg: NetConfig,
+    subs: Vec<Node>,
+}
+impl Group {
+    /// A master (Mac) paired with one sub per OS in `subs`.
+    fn new(subs: &[Os]) -> Self {
+        let dir = TempDir::new();
+        let mcfg = config(&dir, "A");
+        let (hm, mpairs, _, _) = hooks_full();
+        let platform = FakePlatform::new(Os::Mac);
+        let svc = Service::start(mcfg.clone(), platform.clone(), hm).unwrap();
+        let id = svc.status().me.id;
+        let mut group = Group { m: Node { _dir: dir, platform, svc, id }, mcfg, subs: vec![] };
+        for (i, os) in subs.iter().enumerate() {
+            let d = TempDir::new();
+            let c = config(&d, &format!("S{i}"));
+            let (h, pairs, _, _) = hooks_full();
+            let platform = FakePlatform::new(*os);
+            let s = Service::start(c.clone(), platform.clone(), h).unwrap();
+            group.m.svc.request(Request::PairAddr { pair_addr: s.local_addr().to_string() }).unwrap();
+            wait("pairing code", || {
+                group.m.svc.status().pairing.is_some_and(|p| p.stage == "waiting") && s.status().pairing.is_some()
+            });
+            group.m.svc.request(Request::Accept { accept: true }).unwrap();
+            s.request(Request::Accept { accept: true }).unwrap();
+            let mut to_sub = mpairs.recv_timeout(Duration::from_secs(5)).unwrap();
+            let mut to_master = pairs.recv_timeout(Duration::from_secs(5)).unwrap();
+            to_sub.last_addr = s.local_addr().to_string();
+            to_master.last_addr = group.m.svc.local_addr().to_string();
+            group.mcfg.peers.push(to_sub);
+            let mut csub = c;
+            csub.peers = vec![to_master];
+            s.update_config(csub).unwrap();
+            let id = s.status().me.id;
+            group.subs.push(Node { _dir: d, platform, svc: s, id });
+            group.m.svc.update_config(group.mcfg.clone()).unwrap();
+            wait("sub connected", || group.m.svc.status().peers.iter().filter(|p| p.connected).count() == i + 1);
+        }
+        group
+    }
+    /// Places the master and subs on the grid (cells in order: master, then each sub).
+    fn place(&mut self, cells: &[(u8, u8)]) {
+        let ids: Vec<&str> = std::iter::once(&self.m).chain(&self.subs).map(|n| n.id.as_str()).collect();
+        self.mcfg.layout = ids.iter().zip(cells).map(|(id, (col, row))| Cell { id: (*id).into(), col: *col, row: *row }).collect();
+        self.m.svc.update_config(self.mcfg.clone()).unwrap();
+    }
+    fn stop(&self) {
+        for s in &self.subs {
+            s.svc.stop();
+        }
+        self.m.svc.stop();
+    }
+}
+fn via_master_up(n: &Node) -> bool {
+    n.svc.status().peers.iter().any(|p| p.via_master && p.connected)
+}
+fn modes(g: &Group) -> Vec<String> {
+    std::iter::once(&g.m).chain(&g.subs).map(|n| n.svc.status().state.mode).collect()
+}
+
+#[test]
+fn sub_to_sub_crossing_through_the_masters_roster() {
+    // Master in the middle, A left of it, B above A: A and B touch, the master and B do not.
+    let mut g = Group::new(&[Os::Windows, Os::Linux]);
+    g.place(&[(2, 1), (1, 1), (1, 0)]);
+    let (a, b) = (&g.subs[0], &g.subs[1]);
+    wait("subs learn the grid", || a.svc.status().layout.len() == 3 && b.svc.status().layout.len() == 3);
+    wait("direct link between the subs", || via_master_up(a) && via_master_up(b));
+    // Subs are never shown as paired: only the master is in their config.
+    assert!(a.svc.status().peers.iter().any(|p| p.via_master && p.id == b.id));
+    wait("A arms its top edge", || a.platform.armed.lock().unwrap().contains(&Side::Top));
+    assert!(!b.platform.armed.lock().unwrap().contains(&Side::Top));
+    a.platform.warp(50.0, 0.0);
+    wait("A controls B", || a.svc.status().state.mode == "controlling" && b.svc.status().state.mode == "controlled");
+    assert_eq!(a.svc.status().state.peer.as_deref(), Some(b.id.as_str()));
+    // B entered on its bottom edge.
+    assert!(b.platform.cursor().unwrap().1 > 90.0);
+    let key = InputEvent::Key { usage: 4, down: true };
+    a.platform.send(key.clone());
+    wait("key delivered", || b.platform.records().contains(&key));
+    // The way back is the side it came in by.
+    a.platform.send(InputEvent::Motion { dx: 0.0, dy: 60.0 });
+    wait("back on A", || modes(&g)[1] == "local" && modes(&g)[2] == "local");
+    assert_eq!(a.platform.returned.lock().unwrap().unwrap().0, Side::Top);
+    // And the other way round.
+    b.platform.warp(50.0, 99.0);
+    wait("B controls A", || b.svc.status().state.mode == "controlling" && a.svc.status().state.mode == "controlled");
+    g.stop();
+}
+
+#[test]
+fn roster_trust_accepts_listed_rejects_unlisted_and_drops_after_a_change() {
+    let mut g = Group::new(&[Os::Windows, Os::Linux]);
+    g.place(&[(2, 1), (1, 1), (1, 0)]);
+    let (a, b) = (&g.subs[0], &g.subs[1]);
+    wait("listed subs link up", || via_master_up(a) && via_master_up(b));
+    // A computer the master does not list cannot join, however it dials.
+    // It dials A (the smaller id dials), so keep drawing identities until it is C.
+    let (dc, c_id) = loop {
+        let d = TempDir::new();
+        let ident = Identity::load_or_create(&d.0).unwrap();
+        if ident.id < a.id {
+            break (d, ident.id);
+        }
+    };
+    let mut cc = config(&dc, "S9");
+    cc.peers.push(PeerConfig {
+        id: a.id.clone(),
+        name: "S0".into(),
+        os: Os::Windows,
+        fingerprint: Identity::load_or_create(&a._dir.0).unwrap().fingerprint,
+        last_addr: a.svc.local_addr().to_string(),
+        role: Role::Sub,
+        ..PeerConfig::default()
+    });
+    let sc = Service::start(cc, FakePlatform::new(Os::Linux), Hooks::default()).unwrap();
+    assert_eq!(sc.status().me.id, c_id);
+    thread::sleep(Duration::from_millis(1500));
+    assert!(!a.svc.status().peers.iter().any(|p| p.id == c_id));
+    assert_eq!(a.svc.status().state.mode, "local");
+    sc.stop();
+    // The master drops B from the group: A drops the link and stops trusting B.
+    g.mcfg.peers.retain(|p| p.id != b.id);
+    g.mcfg.layout.retain(|c| c.id != b.id);
+    g.m.svc.update_config(g.mcfg.clone()).unwrap();
+    wait("A forgets B", || !a.svc.status().peers.iter().any(|p| p.id == b.id));
+    thread::sleep(Duration::from_millis(1500));
+    assert!(!a.svc.status().peers.iter().any(|p| p.id == b.id));
+    assert!(!a.platform.armed.lock().unwrap().contains(&Side::Top));
+    g.stop();
+}
+
+/// A hand-made peer for protocol checks: connects over TLS and says Hello.
+struct Raw {
+    stream: rustls::StreamOwned<rustls::ClientConnection, std::net::TcpStream>,
+    id: String,
+    _dir: TempDir,
+}
+impl Raw {
+    fn identity() -> (TempDir, Identity) {
+        let d = TempDir::new();
+        let i = Identity::load_or_create(&d.0).unwrap();
+        (d, i)
+    }
+    fn connect(dir: TempDir, addr: std::net::SocketAddr) -> Self {
+        use flock_net::proto::{write_frame, Msg, PROTO_VERSION};
+        let identity = Identity::load_or_create(&dir.0).unwrap();
+        let socket = std::net::TcpStream::connect(addr).unwrap();
+        socket.set_read_timeout(Some(Duration::from_millis(100))).unwrap();
+        let conn = rustls::ClientConnection::new(tls::client_config(&identity).unwrap(), "flockswitch.local".try_into().unwrap()).unwrap();
+        let mut stream = rustls::StreamOwned::new(conn, socket);
+        write_frame(&mut stream, &Msg::Hello {
+            proto: PROTO_VERSION,
+            id: identity.id.clone(),
+            name: "raw".into(),
+            os: Os::Windows,
+            app_version: "test".into(),
+            role: Role::Sub,
+            features: vec![],
+        })
+        .unwrap();
+        Self { stream, id: identity.id, _dir: dir }
+    }
+    fn send(&mut self, msg: &flock_net::proto::Msg) {
+        flock_net::proto::write_frame(&mut self.stream, msg).unwrap();
+    }
+    /// Whether a ReleaseAll arrives within `within`.
+    fn gets_release_all(&mut self, within: Duration) -> bool {
+        let deadline = Instant::now() + within;
+        while Instant::now() < deadline {
+            match flock_net::proto::read_frame(&mut self.stream) {
+                Ok(flock_net::proto::Msg::ReleaseAll) => return true,
+                Ok(_) => {}
+                Err(_) => {}
+            }
+        }
+        false
+    }
+}
+fn enter() -> flock_net::proto::Msg {
+    flock_net::proto::Msg::Enter { side: Side::Left, pos: 0.5 }
+}
+
+#[test]
+fn a_master_rejects_enter_from_a_sub_that_may_not_send() {
+    let dm = TempDir::new();
+    let (d1, i1) = Raw::identity();
+    let (d2, i2) = Raw::identity();
+    let mut cm = config(&dm, "A");
+    let platform = FakePlatform::new(Os::Mac);
+    let m = Service::start(cm.clone(), platform.clone(), Hooks::default()).unwrap();
+    let mk = |i: &Identity, can_send| PeerConfig { id: i.id.clone(), name: "raw".into(), os: Os::Windows, fingerprint: i.fingerprint.clone(), role: Role::Sub, can_send, ..PeerConfig::default() };
+    cm.peers = vec![mk(&i1, true), mk(&i2, false)];
+    m.update_config(cm).unwrap();
+    wait("status shows can_send", || {
+        let s = m.status();
+        s.peers.iter().any(|p| p.id == i2.id && !p.can_send) && s.peers.iter().any(|p| p.id == i1.id && p.can_send)
+    });
+    let mut blocked = Raw::connect(d2, m.local_addr());
+    blocked.send(&enter());
+    assert!(blocked.gets_release_all(Duration::from_secs(3)));
+    assert_eq!(m.status().state.mode, "local");
+    let mut allowed = Raw::connect(d1, m.local_addr());
+    allowed.send(&enter());
+    wait("allowed sub takes control", || m.status().state.mode == "controlled");
+    assert_eq!(m.status().state.peer.as_deref(), Some(allowed.id.as_str()));
+    m.stop();
+}
+
+#[test]
+fn a_sub_rejects_enter_from_a_roster_member_that_may_not_send() {
+    let mut g = Group::new(&[Os::Windows]);
+    let (d1, i1) = Raw::identity();
+    let (d2, i2) = Raw::identity();
+    let mk = |i: &Identity, can_send| PeerConfig { id: i.id.clone(), name: "raw".into(), os: Os::Windows, fingerprint: i.fingerprint.clone(), role: Role::Sub, can_send, ..PeerConfig::default() };
+    g.mcfg.peers.push(mk(&i1, true));
+    g.mcfg.peers.push(mk(&i2, false));
+    g.m.svc.update_config(g.mcfg.clone()).unwrap();
+    let a = &g.subs[0];
+    wait("roster reaches the sub", || a.svc.status().peers.iter().filter(|p| p.via_master).count() == 2);
+    assert!(a.svc.status().peers.iter().any(|p| p.id == i2.id && !p.can_send));
+    let mut blocked = Raw::connect(d2, a.svc.local_addr());
+    blocked.send(&enter());
+    assert!(blocked.gets_release_all(Duration::from_secs(3)));
+    assert_eq!(a.svc.status().state.mode, "local");
+    let mut allowed = Raw::connect(d1, a.svc.local_addr());
+    allowed.send(&enter());
+    wait("listed sub takes control", || a.svc.status().state.mode == "controlled");
+    g.stop();
+}
+
+#[test]
+fn a_computer_that_may_not_send_arms_no_edges_and_never_enters() {
+    let mut g = Group::new(&[Os::Windows]);
+    g.place(&[(2, 1), (3, 1)]);
+    let a = &g.subs[0];
+    wait("edge armed", || a.platform.armed.lock().unwrap().contains(&Side::Left));
+    g.mcfg.peers[0].can_send = false;
+    g.m.svc.update_config(g.mcfg.clone()).unwrap();
+    wait("edges disarmed", || a.platform.armed.lock().unwrap().is_empty());
+    a.svc.cross(Side::Left, 0.5).unwrap();
+    a.platform.warp(0.0, 50.0);
+    thread::sleep(Duration::from_millis(400));
+    assert_eq!(a.svc.status().state.mode, "local");
+    assert_eq!(g.m.svc.status().state.mode, "local");
+    // Allowed again: the edge is armed again and crossing works.
+    g.mcfg.peers[0].can_send = true;
+    g.m.svc.update_config(g.mcfg.clone()).unwrap();
+    wait("edge armed again", || a.platform.armed.lock().unwrap().contains(&Side::Left));
+    wait("crosses", || a.svc.status().state.mode == "controlling");
+    g.stop();
+}
+
+fn sets(n: &Node) -> usize {
+    n.platform.sets.load(Ordering::Relaxed)
+}
+fn settle() {
+    thread::sleep(Duration::from_millis(300));
+}
+
+#[test]
+fn clipboard_goes_from_a_through_the_master_to_b_once() {
+    let mut g = Group::new(&[Os::Windows, Os::Linux]);
+    g.place(&[(2, 1), (1, 1), (3, 1)]);
+    let (m, a, b) = (&g.m, &g.subs[0], &g.subs[1]);
+    *a.platform.clipboard.lock().unwrap() = Some("from A".into());
+    // A to the master.
+    a.platform.warp(99.0, 50.0);
+    wait("A controls the master", || a.svc.status().state.mode == "controlling" && m.svc.status().state.mode == "controlled");
+    wait("master has it", || m.platform.clipboard_text().as_deref() == Some("from A"));
+    a.platform.send(InputEvent::Motion { dx: -60.0, dy: 0.0 });
+    wait("A back", || a.svc.status().state.mode == "local" && m.svc.status().state.mode == "local");
+    settle();
+    assert_eq!((sets(a), sets(m), sets(b)), (0, 1, 0), "the master does not send it back");
+    // The master to B: forwarded.
+    m.platform.warp(99.0, 50.0);
+    wait("master controls B", || m.svc.status().state.mode == "controlling" && b.svc.status().state.mode == "controlled");
+    wait("B has it", || b.platform.clipboard_text().as_deref() == Some("from A"));
+    m.platform.send(InputEvent::Motion { dx: -60.0, dy: 0.0 });
+    wait("B back", || b.svc.status().state.mode == "local" && m.svc.status().state.mode == "local");
+    settle();
+    assert_eq!((sets(a), sets(m), sets(b)), (0, 1, 1), "B does not send it back");
+    // Again to B, and to A: unchanged content is not sent a second time.
+    m.platform.warp(99.0, 50.0);
+    wait("master controls B again", || b.svc.status().state.mode == "controlled");
+    settle();
+    m.platform.send(InputEvent::Motion { dx: -60.0, dy: 0.0 });
+    wait("B back again", || b.svc.status().state.mode == "local" && m.svc.status().state.mode == "local");
+    m.platform.warp(0.0, 50.0);
+    wait("master controls A", || a.svc.status().state.mode == "controlled");
+    settle();
+    assert_eq!((sets(a), sets(m), sets(b)), (0, 1, 1));
+    g.stop();
+}
+
+#[test]
+fn clipboard_relay_off_keeps_one_subs_content_from_another_but_not_the_masters_own() {
+    let mut g = Group::new(&[Os::Windows, Os::Linux]);
+    g.mcfg.clipboard_relay = false;
+    g.place(&[(2, 1), (1, 1), (3, 1)]);
+    let (m, a, b) = (&g.m, &g.subs[0], &g.subs[1]);
+    *a.platform.clipboard.lock().unwrap() = Some("from A".into());
+    a.platform.warp(99.0, 50.0);
+    wait("master has it", || m.platform.clipboard_text().as_deref() == Some("from A"));
+    a.platform.send(InputEvent::Motion { dx: -60.0, dy: 0.0 });
+    wait("A back", || a.svc.status().state.mode == "local" && m.svc.status().state.mode == "local");
+    // The relay setting reaches the subs through the master's settings.
+    m.platform.warp(99.0, 50.0);
+    wait("master controls B", || b.svc.status().state.mode == "controlled");
+    settle();
+    assert_eq!(sets(b), 0, "A's content is not passed on to B");
+    m.platform.send(InputEvent::Motion { dx: -60.0, dy: 0.0 });
+    wait("B back", || b.svc.status().state.mode == "local" && m.svc.status().state.mode == "local");
+    // The master's own copy still goes.
+    *m.platform.clipboard.lock().unwrap() = Some("from master".into());
+    m.platform.warp(99.0, 50.0);
+    wait("B gets the master's", || b.platform.clipboard_text().as_deref() == Some("from master"));
+    g.stop();
+}
+
+#[test]
+fn a_sub_forwards_nothing_between_subs_when_relay_is_off_even_without_the_master() {
+    // A -> B directly, then B -> C directly: C only gets B's own content, not A's.
+    let mut g = Group::new(&[Os::Windows, Os::Linux, Os::Windows]);
+    g.mcfg.clipboard_relay = false;
+    // A and B side by side, C right of B (B in the middle); the master elsewhere.
+    g.place(&[(2, 0), (0, 1), (1, 1), (2, 1)]);
+    let (a, b, c) = (&g.subs[0], &g.subs[1], &g.subs[2]);
+    wait("links", || {
+        a.svc.status().peers.iter().any(|p| p.id == b.id && p.connected) && c.svc.status().peers.iter().any(|p| p.id == b.id && p.connected)
+    });
+    *a.platform.clipboard.lock().unwrap() = Some("from A".into());
+    wait("settings reached the subs", || [a, b, c].iter().all(|n| n.svc.status().keys.len() == 9));
+    a.platform.warp(99.0, 50.0);
+    wait("B has A's", || b.platform.clipboard_text().as_deref() == Some("from A"));
+    a.platform.send(InputEvent::Motion { dx: -60.0, dy: 0.0 });
+    wait("A back", || a.svc.status().state.mode == "local");
+    b.platform.warp(99.0, 50.0);
+    wait("B controls C", || b.svc.status().state.mode == "controlling");
+    settle();
+    assert_eq!(sets(c), 0);
+    g.stop();
+}
+
+#[test]
+fn reconnect_after_a_simulated_pause_redials_at_once() {
+    let free = || std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+    let (da, db) = (TempDir::new(), TempDir::new());
+    let (ia, ib) = (Identity::load_or_create(&da.0).unwrap(), Identity::load_or_create(&db.0).unwrap());
+    // The smaller id dials; `dialer` is the one that has to find the other again.
+    let (dialer_dir, other_dir, other_id, other_fp, dialer_id, dialer_fp) =
+        if ia.id < ib.id { (&da, &db, ib.id, ib.fingerprint, ia.id, ia.fingerprint) } else { (&db, &da, ia.id, ia.fingerprint, ib.id, ib.fingerprint) };
+    let (dialer_port, other_port) = (free(), free());
+    let mut cd = config(dialer_dir, "A");
+    let mut co = config(other_dir, "S1");
+    cd.port = dialer_port;
+    co.port = other_port;
+    cd.peers.push(PeerConfig { id: other_id, name: "other".into(), os: Os::Mac, fingerprint: other_fp, side: Some(Side::Right),
+        last_addr: format!("127.0.0.1:{other_port}"), role: Role::Sub, ..PeerConfig::default() });
+    co.peers.push(PeerConfig { id: dialer_id, name: "dialer".into(), os: Os::Mac, fingerprint: dialer_fp,
+        last_addr: format!("127.0.0.1:{dialer_port}"), ..PeerConfig::default() });
+    let dialer = Service::start(cd, FakePlatform::new(Os::Mac), Hooks::default()).unwrap();
+    let other = Service::start(co.clone(), FakePlatform::new(Os::Mac), Hooks::default()).unwrap();
+    wait("linked", || dialer.status().peers.first().is_some_and(|p| p.connected));
+    // The other computer goes away; the dialer's backoff grows while it is gone.
+    other.update_config(NetConfig { on: false, ..co.clone() }).unwrap();
+    wait("link lost", || dialer.status().peers.first().is_some_and(|p| !p.connected));
+    thread::sleep(Duration::from_millis(3500));
+    other.update_config(co).unwrap();
+    wait("listening again", || other.status().running);
+    assert!(!dialer.status().peers[0].connected, "still waiting out its backoff");
+    // The dialer's computer wakes up: the clock jumped.
+    let woke = Instant::now();
+    dialer.simulate_clock_jump(Duration::from_secs(30)).unwrap();
+    wait("reconnecting flag", || dialer.status().reconnecting);
+    wait("linked again", || dialer.status().peers.first().is_some_and(|p| p.connected));
+    assert!(woke.elapsed() < Duration::from_secs(2), "{:?}", woke.elapsed());
+    wait("flag clears", || !dialer.status().reconnecting);
+    // The same through reconnect() and the request file.
+    other.update_config(NetConfig { on: false, ..config(other_dir, "S1") }).unwrap();
+    wait("link lost again", || dialer.status().peers.first().is_some_and(|p| !p.connected));
+    dialer.reconnect().unwrap();
+    wait("reconnecting after reconnect()", || dialer.status().reconnecting);
+    write_request(&dialer_dir.0, &Request::Action { action: "reconnect".into() }).unwrap();
+    wait("request consumed", || !request_path(&dialer_dir.0).exists());
+    dialer.stop();
+    other.stop();
 }

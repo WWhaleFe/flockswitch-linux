@@ -3,6 +3,7 @@ pub mod discovery;
 pub mod geometry;
 pub mod identity;
 pub mod keymap;
+pub mod layout;
 pub mod linux_input;
 pub mod pairing;
 pub mod proto;
@@ -11,10 +12,13 @@ pub mod tls;
 pub mod transfer;
 pub mod windows_input;
 pub use geometry::Rect;
+pub use keymap::{DirRules, HangulKey, ModMode};
+pub use layout::{Cell, Member};
 pub use proto::{InputEvent, MouseButton, Os, Side};
 use serde::{Deserialize, Serialize};
 pub use service::Service;
 use std::{
+    collections::BTreeMap,
     fs,
     path::{Path, PathBuf},
     sync::mpsc::Sender,
@@ -122,6 +126,8 @@ pub struct Hooks {
     pub on_peer_changed: Box<dyn Fn(PeerConfig) + Send + Sync>,
     /// On a sub: the master's settings arrived or changed. The app applies them.
     pub on_master_settings: Box<dyn Fn(MasterSettings) + Send + Sync>,
+    /// On a master: a sub sent edited key rules. The app saves them.
+    pub on_key_rules: Box<dyn Fn(BTreeMap<String, DirRules>) + Send + Sync>,
 }
 impl Default for Hooks {
     fn default() -> Self {
@@ -131,6 +137,7 @@ impl Default for Hooks {
             on_unpaired: Box::new(|_| {}),
             on_peer_changed: Box::new(|_| {}),
             on_master_settings: Box::new(|_| {}),
+            on_key_rules: Box::new(|_| {}),
         }
     }
 }
@@ -163,6 +170,10 @@ pub struct MasterSettings {
     pub clipboard_limit_mb: u32,
     pub corner_margin: f64,
     pub cross_delay_ms: u64,
+    /// Key rules per OS pair (2.1). Empty: the 2.0 fields above stand for them.
+    pub keys: BTreeMap<String, DirRules>,
+    /// Let clipboard content pass on from one sub to another.
+    pub clipboard_relay: bool,
     /// The app's own effect settings (countdown, haptics, cursor highlight), opaque here.
     pub app: serde_json::Value,
 }
@@ -173,13 +184,25 @@ impl Default for MasterSettings {
 }
 impl MasterSettings {
     pub fn of(config: &NetConfig, master_name: &str) -> Self {
+        // 2.0 subs only read the old fields, so they mirror the rules they stand for.
+        let mut old = config.clone();
+        if let Some(r) = config.keys.get("mac>windows") {
+            old.swap_cmd_ctrl = r.mod_mode != ModMode::Off;
+            old.mac_capslock_to_hangul = r.hangul_src.contains(&HangulKey::CapsLock);
+            old.mac_shift_space_to_hangul = r.hangul_src.contains(&HangulKey::ShiftSpace);
+        }
+        if let Some(r) = config.keys.get("windows>mac") {
+            old.lang1_on_mac = if r.hangul_src.contains(&HangulKey::Lang1) { "capslock" } else { "off" }.into();
+        }
         Self {
             master_name: master_name.into(),
             require_control: config.require_control,
-            swap_cmd_ctrl: config.swap_cmd_ctrl,
-            mac_capslock_to_hangul: config.mac_capslock_to_hangul,
-            mac_shift_space_to_hangul: config.mac_shift_space_to_hangul,
-            lang1_on_mac: config.lang1_on_mac.clone(),
+            swap_cmd_ctrl: old.swap_cmd_ctrl,
+            mac_capslock_to_hangul: old.mac_capslock_to_hangul,
+            mac_shift_space_to_hangul: old.mac_shift_space_to_hangul,
+            lang1_on_mac: old.lang1_on_mac,
+            keys: config.keys.clone(),
+            clipboard_relay: config.clipboard_relay,
             share_clipboard: config.share_clipboard,
             clipboard_limit_mb: config.clipboard_limit_mb,
             corner_margin: config.corner_margin,
@@ -194,6 +217,8 @@ impl MasterSettings {
         config.mac_capslock_to_hangul = self.mac_capslock_to_hangul;
         config.mac_shift_space_to_hangul = self.mac_shift_space_to_hangul;
         config.lang1_on_mac = self.lang1_on_mac.clone();
+        config.keys = self.keys.clone();
+        config.clipboard_relay = self.clipboard_relay;
         config.share_clipboard = self.share_clipboard;
         config.clipboard_limit_mb = self.clipboard_limit_mb;
         config.corner_margin = self.corner_margin;
@@ -214,6 +239,13 @@ pub struct NetConfig {
     pub lang1_on_mac: String,
     pub cross_delay_ms: u64,
     pub peers: Vec<PeerConfig>,
+    /// On the master: the layout grid, the master included under its own id. Empty: built
+    /// from the peers' 2.0 sides.
+    pub layout: Vec<Cell>,
+    /// Key rules per OS pair ("mac>windows"). A pair missing here follows the 2.0 fields.
+    pub keys: BTreeMap<String, DirRules>,
+    /// Let clipboard content pass on from one sub to another.
+    pub clipboard_relay: bool,
     pub discovery: bool,
     pub corner_margin: f64,
     /// Cross to another computer (and back) only while Control is held.
@@ -250,6 +282,9 @@ impl Default for NetConfig {
             lang1_on_mac: "capslock".into(),
             cross_delay_ms: 0,
             peers: Vec::new(),
+            layout: Vec::new(),
+            keys: BTreeMap::new(),
+            clipboard_relay: true,
             discovery: true,
             corner_margin: 80.0,
             require_control: false,
@@ -261,6 +296,27 @@ impl Default for NetConfig {
             app_settings: serde_json::Value::Null,
             config_dir: PathBuf::new(),
         }
+    }
+}
+impl NetConfig {
+    /// The key rules for events leaving a `src` computer for a `dst` one; None between
+    /// two computers of the same OS.
+    pub fn rules_for(&self, src: Os, dst: Os) -> Option<DirRules> {
+        if src == dst {
+            return None;
+        }
+        Some(self.keys.get(&keymap::pair_key(src, dst)).cloned().unwrap_or_else(|| DirRules::from_legacy(src, dst, self)))
+    }
+    /// The rules in effect for every direction.
+    pub fn all_rules(&self) -> BTreeMap<String, DirRules> {
+        keymap::all_pairs()
+            .into_iter()
+            .filter_map(|(s, d)| self.rules_for(s, d).map(|r| (keymap::pair_key(s, d), r)))
+            .collect()
+    }
+    /// Writes the rules the 2.0 fields stand for into `keys`, for every direction not set.
+    pub fn migrate_keys(&mut self) {
+        self.keys = self.all_rules();
     }
 }
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -278,6 +334,10 @@ pub struct PeerConfig {
     /// The peer's part (a master's peers are subs, a sub's peer is its master).
     #[serde(default)]
     pub role: Role,
+    /// Master only: this computer's mouse and keyboard may be used to drive the others.
+    pub can_send: bool,
+    /// A sub known only from its master's roster (runtime, never saved or shown as paired).
+    pub via_master: bool,
 }
 impl Default for PeerConfig {
     fn default() -> Self {
@@ -290,6 +350,8 @@ impl Default for PeerConfig {
             logitech_channel: 0,
             last_addr: String::new(),
             role: Role::Master,
+            can_send: true,
+            via_master: false,
         }
     }
 }
@@ -327,6 +389,15 @@ pub struct Status {
     /// On a sub: the master whose settings are in use.
     #[serde(default)]
     pub following: Option<String>,
+    /// The layout grid in effect.
+    #[serde(default)]
+    pub layout: Vec<Cell>,
+    /// A reconnect is under way (after `Service::reconnect` or a wake-up).
+    #[serde(default)]
+    pub reconnecting: bool,
+    /// The key rules in effect, every direction.
+    #[serde(default)]
+    pub keys: BTreeMap<String, DirRules>,
 }
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TransferStatus {
@@ -366,6 +437,11 @@ pub struct PeerStatus {
     pub id: String,
     pub connected: bool,
     pub rtt_ms: Option<f64>,
+    #[serde(default = "layout::yes")]
+    pub can_send: bool,
+    /// Known only through the master's roster (a sub-to-sub link).
+    #[serde(default)]
+    pub via_master: bool,
 }
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct StateStatus {
@@ -389,6 +465,8 @@ pub enum Request {
     PairAddr { pair_addr: String },
     Accept { accept: bool },
     Unpair { unpair: String },
+    /// `{"action":"reconnect"}`: same as `Service::reconnect`.
+    Action { action: String },
 }
 pub fn status_path(config_dir: impl AsRef<Path>) -> PathBuf {
     config_dir.as_ref().join("flockswitch/net-status.json")
@@ -518,5 +596,87 @@ mod hangul_settings_tests {
         assert!(!sub.mac_capslock_to_hangul && !sub.mac_shift_space_to_hangul);
         MasterSettings::of(&NetConfig::default(), "Mac").apply_to(&mut sub);
         assert!(sub.mac_capslock_to_hangul && sub.mac_shift_space_to_hangul);
+    }
+}
+
+#[cfg(test)]
+mod v2_1_tests {
+    use super::*;
+    #[test]
+    fn reconnect_action_request_and_old_requests_parse() {
+        let r: Request = serde_json::from_str(r#"{"action":"reconnect"}"#).unwrap();
+        assert_eq!(r, Request::Action { action: "reconnect".into() });
+        assert_eq!(serde_json::from_str::<Request>(r#"{"pair":"x"}"#).unwrap(), Request::Pair { pair: "x".into() });
+        assert_eq!(serde_json::from_str::<Request>(r#"{"accept":true}"#).unwrap(), Request::Accept { accept: true });
+    }
+    #[test]
+    fn a_2_0_network_section_loads_with_new_defaults() {
+        let old = r#"
+            on = true
+            name = "Desk"
+            swap_cmd_ctrl = false
+            lang1_on_mac = "off"
+            mac_shift_space_to_hangul = false
+            [[peers]]
+            id = "abc"
+            name = "PC"
+            os = "windows"
+            side = "right"
+            logitech_channel = 2
+            last_addr = "10.0.0.2:47160"
+            role = "sub"
+        "#;
+        let cfg: NetConfig = toml::from_str(old).unwrap();
+        assert!(cfg.layout.is_empty() && cfg.keys.is_empty() && cfg.clipboard_relay);
+        assert!(cfg.peers[0].can_send && !cfg.peers[0].via_master);
+        // The 2.0 fields stand for the rules.
+        let r = cfg.rules_for(Os::Mac, Os::Windows).unwrap();
+        assert_eq!(r.mod_mode, ModMode::Off);
+        assert_eq!(r.hangul_src, vec![HangulKey::CapsLock]);
+        assert!(cfg.rules_for(Os::Windows, Os::Mac).unwrap().hangul_src.is_empty());
+        assert!(cfg.rules_for(Os::Mac, Os::Mac).is_none());
+        assert_eq!(cfg.all_rules().len(), 9);
+        // Materialising them keeps the behaviour and survives a TOML round trip.
+        let mut migrated = cfg.clone();
+        migrated.migrate_keys();
+        assert_eq!(migrated.keys.len(), 9);
+        assert_eq!(migrated.rules_for(Os::Mac, Os::Windows), cfg.rules_for(Os::Mac, Os::Windows));
+        let again: NetConfig = toml::from_str(&toml::to_string(&migrated).unwrap()).unwrap();
+        assert_eq!(again, migrated);
+        // A rule set in `keys` wins over the 2.0 fields.
+        let mut set = cfg.clone();
+        set.keys.insert("mac>windows".into(), DirRules { mod_mode: ModMode::Position, ..DirRules::default() });
+        assert_eq!(set.rules_for(Os::Mac, Os::Windows).unwrap().mod_mode, ModMode::Position);
+        assert_eq!(set.rules_for(Os::Mac, Os::Linux).unwrap().mod_mode, ModMode::Off);
+    }
+    #[test]
+    fn master_settings_carry_keys_and_relay_and_mirror_the_2_0_fields() {
+        let old: MasterSettings = serde_json::from_str(r#"{"swap_cmd_ctrl":false}"#).unwrap();
+        assert!(old.keys.is_empty() && old.clipboard_relay);
+        let mut master = NetConfig { clipboard_relay: false, ..NetConfig::default() };
+        master.keys.insert("mac>windows".into(), DirRules { mod_mode: ModMode::Off, hangul_src: vec![HangulKey::ShiftSpace], ..DirRules::default() });
+        master.keys.insert("windows>mac".into(), DirRules { hangul_src: vec![], ..DirRules::default() });
+        let settings = MasterSettings::of(&master, "M");
+        assert!(!settings.swap_cmd_ctrl && !settings.mac_capslock_to_hangul && settings.mac_shift_space_to_hangul);
+        assert_eq!(settings.lang1_on_mac, "off");
+        let json = serde_json::to_string(&settings).unwrap();
+        let settings: MasterSettings = serde_json::from_str(&json).unwrap();
+        let mut sub = NetConfig::default();
+        settings.apply_to(&mut sub);
+        assert_eq!(sub.keys, master.keys);
+        assert!(!sub.clipboard_relay);
+        assert_eq!(sub.rules_for(Os::Mac, Os::Windows), master.rules_for(Os::Mac, Os::Windows));
+        // Untouched pairs fall back to the sub's mirrored 2.0 fields, which are the master's.
+        assert_eq!(sub.rules_for(Os::Mac, Os::Linux).unwrap().mod_mode, ModMode::Off);
+    }
+    #[test]
+    fn status_from_2_0_still_reads() {
+        let status: Status = serde_json::from_value(serde_json::json!({
+            "running": true, "me": {"id": "t", "name": "Mac", "port": 47160, "error": null},
+            "discovered": [], "peers": [{"id": "p", "connected": true, "rtt_ms": null}],
+            "state": {"mode": "local", "peer": null}, "pairing": null
+        })).unwrap();
+        assert!(status.peers[0].can_send && !status.peers[0].via_master);
+        assert!(status.layout.is_empty() && !status.reconnecting && status.keys.is_empty());
     }
 }

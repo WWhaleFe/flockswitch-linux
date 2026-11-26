@@ -2,6 +2,8 @@ use serde::{Deserialize, Serialize};
 use std::io::{self, Read, Write};
 
 pub const PROTO_VERSION: u32 = 1;
+/// Hello features of this version: Group and KeyRules messages.
+pub const FEATURES: [&str; 2] = ["group", "keyrules"];
 pub const MAX_FRAME: usize = 64 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -65,14 +67,25 @@ pub enum Msg {
         app_version: String,
         #[serde(default)]
         role: crate::Role,
+        /// Optional 2.1 features the sender understands (see `FEATURES`); 2.0 peers send none.
+        #[serde(default)]
+        features: Vec<String>,
     },
     PairRequest,
     /// Master to sub: where the sub sits around the master's screen (None: nowhere).
     Layout {
         side: Option<Side>,
     },
+    /// Master to sub (2.1): the layout grid and everyone in the group. Subs trust the
+    /// listed fingerprints for sub-to-sub links.
+    Group {
+        cells: Vec<crate::Cell>,
+        roster: Vec<crate::Member>,
+    },
     /// Master to sub: the settings the sub follows.
     MasterSettings(crate::MasterSettings),
+    /// Sub to master (2.1): edited key rules, which the master saves and hands on.
+    KeyRules(std::collections::BTreeMap<String, crate::DirRules>),
     PairAccept,
     PairReject,
     Ping {
@@ -161,6 +174,24 @@ pub(crate) fn take_frame(buffer: &mut Vec<u8>) -> io::Result<Option<Msg>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn hello_from_2_0_has_no_features_and_new_messages_round_trip() {
+        let old = r#"{"type":"Hello","data":{"proto":1,"id":"a","name":"n","os":"mac","app_version":"2.0.0","role":"sub"}}"#;
+        let Msg::Hello { features, .. } = serde_json::from_str(old).unwrap() else { panic!() };
+        assert!(features.is_empty());
+        let group = Msg::Group {
+            cells: vec![crate::Cell { id: "a".into(), col: 2, row: 1 }],
+            roster: vec![crate::Member { id: "a".into(), name: "A".into(), os: Os::Mac, fingerprint: "f".into(), addr: String::new(), can_send: false }],
+        };
+        let rules = Msg::KeyRules([("mac>windows".to_string(), crate::DirRules::default())].into());
+        for msg in [group, rules] {
+            let mut bytes = Vec::new();
+            write_frame(&mut bytes, &msg).unwrap();
+            assert_eq!(read_frame(bytes.as_slice()).unwrap(), msg);
+        }
+        let member: crate::Member = serde_json::from_str(r#"{"id":"a","name":"A","os":"mac","fingerprint":"f"}"#).unwrap();
+        assert!(member.can_send && member.addr.is_empty());
+    }
     #[test]
     fn framing() {
         let msg = Msg::Input(InputEvent::Key {
