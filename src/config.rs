@@ -2052,7 +2052,12 @@ mod test_build_migration_tests {
 
 impl Config {
     pub fn resolve_edge_owner(&mut self, previous: &Config) {
-        if self.network.on && !previous.network.on { self.edges.on = false; }
+        // Sharing starts when it is switched on, or when its cautions are agreed to
+        // while it is already on (e.g. settings carried over from a test build).
+        let sharing = |c: &Config| c.network.on && c.network.notice_accepted;
+        if (self.network.on && !previous.network.on) || (sharing(self) && !sharing(previous)) {
+            self.edges.on = false;
+        }
     }
     pub fn network_edges_allowed(&self) -> bool { self.network.on && !self.edges.on }
     pub fn logitech_edges_allowed(&self) -> bool {
@@ -2072,6 +2077,18 @@ mod owner_tests {
         let previous = c.clone(); c.edges.on = true; c.resolve_edge_owner(&previous);
         assert!(c.network.on && !c.network_edges_allowed() && c.logitech_edges_allowed());
         c.edges.on = false; assert!(c.network_edges_allowed());
+    }
+    #[test]
+    fn agreeing_to_cautions_with_sharing_already_on_takes_the_edges() {
+        // Settings carried over from a test build: sharing on, cautions not yet agreed,
+        // Logitech edges on.
+        let mut c = Config::default();
+        c.edges.on = true; c.edges.right = 2; c.network.on = true;
+        let previous = c.clone(); c.network.notice_accepted = true; c.resolve_edge_owner(&previous);
+        assert!(!c.edges.on && c.network_edges_allowed());
+        // Later turning the Logitech edges on stays possible.
+        let previous = c.clone(); c.edges.on = true; c.resolve_edge_owner(&previous);
+        assert!(c.edges.on && c.logitech_edges_allowed());
     }
     #[test]
     fn test2_config_gets_logitech_defaults() {

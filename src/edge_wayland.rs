@@ -309,7 +309,10 @@ impl Watch {
     }
 
     pub fn active(&self) -> bool {
-        self.cfg.logitech_edges_allowed() || self.network_wanted()
+        // Without a computer placed on a side there is nothing to arm: opening a
+        // capture session then would only report that no barrier could be made.
+        self.cfg.logitech_edges_allowed()
+            || (self.network_wanted() && !crate::net_wayland::capture().lock().unwrap().sides.is_empty())
     }
 
     pub fn network_wanted(&self) -> bool {

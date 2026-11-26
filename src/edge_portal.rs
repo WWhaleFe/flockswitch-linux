@@ -687,8 +687,14 @@ impl Portal {
             if let Some(c) = self.capture.as_mut() { c.network = true; }
             let mut bridge = crate::net_wayland::capture().lock().unwrap();
             bridge.active = true;
-            bridge.control = self.held_keys.contains(&29) || self.held_keys.contains(&97);
-            bridge.hit = Some((net_side, pos));
+            bridge.control = self.ctrl.held() || self.held_keys.contains(&29) || self.held_keys.contains(&97);
+            if self.watch.cfg.network.require_control && !bridge.control {
+                bridge.deferred = Some((net_side, pos));
+                bridge.hit = None;
+            } else {
+                bridge.deferred = None;
+                bridge.hit = Some((net_side, pos));
+            }
             bridge.release = None;
             bridge.position = None;
             bridge.pending.clear();
@@ -801,10 +807,24 @@ impl Portal {
     }
 
     async fn ei_event(&mut self, live: &mut Live, event: EiEvent) -> Option<End> {
-        if let EiEvent::KeyboardKey(k) = &event {
-            if k.state == ei::keyboard::KeyState::Press { self.held_keys.insert(k.key); }
-            else { self.held_keys.remove(&k.key); }
-            crate::net_wayland::capture().lock().unwrap().control = self.held_keys.contains(&29) || self.held_keys.contains(&97);
+        let keys_changed = match &event {
+            EiEvent::KeyboardKey(k) => {
+                let down = k.state == ei::keyboard::KeyState::Press;
+                if down { self.held_keys.insert(k.key); } else { self.held_keys.remove(&k.key); }
+                self.ctrl.key(k.key, down);
+                true
+            }
+            // A Control held before the capture began arrives only as modifiers.
+            EiEvent::KeyboardModifiers(m) => { self.ctrl.modifiers(m.depressed); true }
+            _ => false,
+        };
+        if keys_changed {
+            let control = self.ctrl.held() || self.held_keys.contains(&29) || self.held_keys.contains(&97);
+            let mut bridge = crate::net_wayland::capture().lock().unwrap();
+            bridge.control = control;
+            if control {
+                if let Some(hit) = bridge.deferred.take() { bridge.hit = Some(hit); }
+            }
         }
         if self.capture.as_ref().is_some_and(|c| c.network) {
             // Before crossing, inward motion cancels the pending dwell. Once the
@@ -822,6 +842,10 @@ impl Portal {
                         let p = c.cap.edge_position();
                         overlay::edge_cursor(p.0 * k, p.1 * k);
                     }
+                    // Waiting at the edge: this motion stays here. Queued, it would
+                    // reach the other computer after crossing and could push the
+                    // cursor straight back, or fill the queue and drop a key release.
+                    return None;
                 }
             }
             use flock_net::{linux_input as input, InputEvent};
@@ -934,7 +958,10 @@ fn network_capture_ended() {
     let mut bridge=crate::net_wayland::capture().lock().unwrap();
     bridge.active=false;
     bridge.sink=None;
-    bridge.hit=None;
+    // netcore may already hold the hit and keep timing it; a non-finite position
+    // makes it drop that hit (and with no cursor here, stop) instead of crossing late.
+    bridge.hit=Some((flock_net::Side::Left, f64::NAN));
+    bridge.deferred=None;
     bridge.release=None;
     bridge.pending.clear();
 }

@@ -22,6 +22,9 @@ use std::{
 pub struct Capture {
     pub sides: Vec<Side>,
     pub hit: Option<(Side, f64)>,
+    /// An edge hit held back until Control is down ("hold Control to cross"): libei
+    /// reports a Control held before the capture only a moment after it starts.
+    pub deferred: Option<(Side, f64)>,
     pub active: bool,
     pub sink: Option<Sender<InputEvent>>,
     pub pending: Vec<InputEvent>,
@@ -38,6 +41,7 @@ pub fn disable() {
     c.sides.clear();
     c.sink = None;
     c.hit = None;
+    c.deferred = None;
     c.pending.clear();
     if c.active {
         c.release = Some(Instant::now());
@@ -64,6 +68,8 @@ enum Command {
     Warp(f64, f64),
     Quit,
 }
+/// How long after the last remote input the pointer position this app set still counts.
+const REMOTE_FRESH: Duration = Duration::from_secs(3);
 pub struct Wayland {
     clipboard: crate::clipboard::Clipboard,
     commands: Sender<Command>,
@@ -72,6 +78,9 @@ pub struct Wayland {
     send: bool,
     capturing: AtomicBool,
     cancelled: Arc<AtomicBool>,
+    /// When another computer last moved this one's pointer. Wayland gives no global
+    /// cursor, so the position this app set is only known while that control lasts.
+    remote_at: Mutex<Option<Instant>>,
 }
 impl Wayland {
     pub fn new(shared: Arc<Shared>) -> anyhow::Result<Self> {
@@ -103,6 +112,7 @@ impl Wayland {
             send: support.send,
             capturing: AtomicBool::new(false),
             cancelled,
+            remote_at: Mutex::new(None),
         })
     }
 }
@@ -123,12 +133,15 @@ impl Platform for Wayland {
     fn cursor(&self) -> Option<(f64, f64)> {
         if !crate::net::network_edges_allowed() { return None; }
         if capture().lock().unwrap().active {
-            None
-        } else {
-            self.model.lock().unwrap().cursor
+            return None;
         }
+        // A position left from an earlier remote session is stale once the local mouse
+        // moves; reporting it would put a phantom cursor on an edge.
+        let fresh = self.remote_at.lock().unwrap().is_some_and(|t| t.elapsed() < REMOTE_FRESH);
+        if fresh { self.model.lock().unwrap().cursor } else { None }
     }
     fn warp(&self, x: f64, y: f64) {
+        *self.remote_at.lock().unwrap() = Some(Instant::now());
         self.model.lock().unwrap().cursor = Some((x, y));
         let _ = self.commands.send(Command::Warp(x, y));
     }
@@ -161,12 +174,14 @@ impl Platform for Wayland {
         let mut c = capture().lock().unwrap();
         c.sink = None;
         c.hit = None;
+        c.deferred = None;
         c.pending.clear();
         if c.active {
             c.release = Some(Instant::now() + Duration::from_millis(20));
         }
     }
     fn inject(&self, event: &InputEvent) {
+        *self.remote_at.lock().unwrap() = Some(Instant::now());
         let _ = self.commands.send(Command::Input(event.clone()));
     }
     fn ready(&self) -> Result<(), String> {

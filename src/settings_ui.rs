@@ -890,7 +890,9 @@ impl eframe::App for SettingsApp {
                         Tab::Switching => self.switching_section(ui, t, p),
                         Tab::Effects => {
                             let sub = self.follows_master();
-                            if sub { self.follow_banner(ui, p, t); }
+                            // A sub follows the master's effects: an open haptics window
+                            // would let it change them anyway.
+                            if sub { self.haptics_dialog = None; self.follow_banner(ui, p, t); }
                             ui.add_enabled_ui(!sub, |ui| self.effects_section(ui, t, p));
                         }
                         Tab::Devices => {
@@ -1131,10 +1133,8 @@ impl SettingsApp {
 
     fn edge_effects_card(&mut self, ui: &mut Ui, t: &Texts, p: Palette) {
         let sub = self.follows_master();
+        // The Effects tab already shows the banner once at its top.
         section(ui, p, t.section_edge_effects, |ui| {
-            if sub {
-                self.follow_banner(ui, p, t);
-            }
             ui.add_enabled_ui(!sub, |ui| self.edge_anim_rows(ui, t, p));
             ui.add_space(8.0);
         });

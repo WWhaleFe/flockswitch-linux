@@ -373,7 +373,13 @@ fn watch(shared: Arc<Shared>) {
                     end_countdown(&mut counting_down);
                     crate::net::cross(edge, x, y);
                 }
-            } else { end_countdown(&mut counting_down); }
+            } else {
+                // Not ready (no computer connected there yet): the wait starts over once
+                // it is, as on the Mac, instead of crossing at once.
+                resting = None;
+                last_tick = None;
+                end_countdown(&mut counting_down);
+            }
             continue;
         }
         let channel = cfg.edges.channel(edge);
