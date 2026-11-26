@@ -618,7 +618,7 @@ impl SettingsApp {
     }
 
     pub(super) fn this_page(&mut self, ui: &mut Ui, t: &Texts, p: Palette) {
-        if self.net_ips.0.elapsed() >= Duration::from_secs(10) {
+        if self.shots.is_none() && self.net_ips.0.elapsed() >= Duration::from_secs(10) {
             self.net_ips = (Instant::now(), local_ips());
         }
         let status = self.net_status.clone();

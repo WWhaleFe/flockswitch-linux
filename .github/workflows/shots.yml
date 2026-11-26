@@ -1,0 +1,35 @@
+name: Screenshots
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  shots:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build dependencies
+        run: bash .github/scripts/build-deps.sh
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --release --locked
+      - name: Screenshot dependencies (virtual display, software OpenGL, Korean font)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xvfb xauth libgl1-mesa-dri libglx-mesa0 libegl1 libxtst6 libxi6 libxrandr2 libxcursor1 libxfixes3 fonts-noto-cjk
+          fc-cache -f
+      - name: Take the screenshots
+        env:
+          LIBGL_ALWAYS_SOFTWARE: "1"
+        run: |
+          for lang in ko en; do
+            FLOCKSWITCH_SHOTS="$PWD/shots/$lang" FLOCKSWITCH_LANG=$lang \
+              xvfb-run -a -s "-screen 0 1280x1024x24" ./target/release/flockswitch settings
+          done
+          ls -l shots/*
+      - uses: actions/upload-artifact@v4
+        with:
+          name: shots-linux
+          path: shots
