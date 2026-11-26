@@ -20,7 +20,7 @@ jobs:
       - name: Screenshot dependencies (virtual display, software OpenGL, Korean font)
         run: |
           sudo apt-get update
-          sudo apt-get install -y xvfb xauth libgl1-mesa-dri libglx-mesa0 libegl1 libxtst6 libxi6 libxrandr2 libxcursor1 libxfixes3 fonts-noto-cjk
+          sudo apt-get install -y xvfb xauth libgl1-mesa-dri libglx-mesa0 libegl1 libxtst6 libxi6 libxrandr2 libxcursor1 libxfixes3 fonts-noto-cjk libxkbcommon-x11-0
           fc-cache -f
       - name: Take the screenshots
         env:
