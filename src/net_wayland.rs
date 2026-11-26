@@ -37,6 +37,7 @@ pub fn capture() -> &'static Mutex<Capture> {
     CAPTURE.get_or_init(|| Mutex::new(Capture::default()))
 }
 pub fn disable() {
+    REMOTE.store(false, Ordering::Release);
     let mut c = capture().lock().unwrap();
     c.sides.clear();
     c.sink = None;
@@ -68,8 +69,15 @@ enum Command {
     Warp(f64, f64),
     Quit,
 }
-/// How long after the last remote input the pointer position this app set still counts.
-const REMOTE_FRESH: Duration = Duration::from_secs(3);
+/// Whether another computer controls this one now. netcore warps the pointer when that
+/// control starts and when it ends, and in between injects the controller's input, so:
+/// a warp clears it and injected motion, scrolling or a press sets it (the key and button
+/// releases sent after control ends do not). Wayland has no global cursor; the position
+/// this app set is only true while that control lasts.
+static REMOTE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+pub fn remote_controlled() -> bool {
+    REMOTE.load(Ordering::Acquire)
+}
 pub struct Wayland {
     clipboard: crate::clipboard::Clipboard,
     commands: Sender<Command>,
@@ -78,9 +86,6 @@ pub struct Wayland {
     send: bool,
     capturing: AtomicBool,
     cancelled: Arc<AtomicBool>,
-    /// When another computer last moved this one's pointer. Wayland gives no global
-    /// cursor, so the position this app set is only known while that control lasts.
-    remote_at: Mutex<Option<Instant>>,
 }
 impl Wayland {
     pub fn new(shared: Arc<Shared>) -> anyhow::Result<Self> {
@@ -112,7 +117,6 @@ impl Wayland {
             send: support.send,
             capturing: AtomicBool::new(false),
             cancelled,
-            remote_at: Mutex::new(None),
         })
     }
 }
@@ -132,16 +136,14 @@ impl Platform for Wayland {
     }
     fn cursor(&self) -> Option<(f64, f64)> {
         if !crate::net::network_edges_allowed() { return None; }
-        if capture().lock().unwrap().active {
-            return None;
-        }
-        // A position left from an earlier remote session is stale once the local mouse
-        // moves; reporting it would put a phantom cursor on an edge.
-        let fresh = self.remote_at.lock().unwrap().is_some_and(|t| t.elapsed() < REMOTE_FRESH);
-        if fresh { self.model.lock().unwrap().cursor } else { None }
+        // Only while controlled from elsewhere is the position known (it is where this
+        // app moved the pointer); netcore needs it then to find the way back. Otherwise
+        // the edges come from the InputCapture barriers (take_edge_hit), and an old
+        // position left at the edge would look like a push against it.
+        if remote_controlled() { self.model.lock().unwrap().cursor } else { None }
     }
     fn warp(&self, x: f64, y: f64) {
-        *self.remote_at.lock().unwrap() = Some(Instant::now());
+        REMOTE.store(false, Ordering::Release);
         self.model.lock().unwrap().cursor = Some((x, y));
         let _ = self.commands.send(Command::Warp(x, y));
     }
@@ -181,7 +183,9 @@ impl Platform for Wayland {
         }
     }
     fn inject(&self, event: &InputEvent) {
-        *self.remote_at.lock().unwrap() = Some(Instant::now());
+        if matches!(event, InputEvent::Motion { .. } | InputEvent::Scroll { .. } | InputEvent::Key { down: true, .. } | InputEvent::Button { down: true, .. }) {
+            REMOTE.store(true, Ordering::Release);
+        }
         let _ = self.commands.send(Command::Input(event.clone()));
     }
     fn ready(&self) -> Result<(), String> {

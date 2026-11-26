@@ -671,12 +671,20 @@ impl Portal {
             return;
         }
         let net_side = crate::net::side(crate::edge_wayland::edge_of(seg.side));
-        let is_network = self.watch.network_wanted() && crate::net_wayland::capture().lock().unwrap().sides.contains(&net_side);
+        let is_network = self.watch.network_wanted() && self.watch.network_sides().contains(&net_side);
+        if is_network && crate::net_wayland::remote_controlled() {
+            // Another computer drives this pointer now: a barrier it touches is not a
+            // crossing from here, and holding the pointer would block its way back.
+            self.end_capture(live, Some(cap.position()), "controlled from another computer").await;
+            return;
+        }
         if is_network {
+            let control = self.ctrl.held() || self.held_keys.contains(&29) || self.held_keys.contains(&97);
+            let defer = self.watch.cfg.network.require_control && !control;
             let dwell = Duration::from_millis(self.watch.cfg.network.cross_delay_ms);
             // GNOME has no layer-shell. Draw through XWayland only when its screens
             // line up with portal zones; otherwise retain the delay without a drawing.
-            if let Some(k) = live.xwayland.filter(|_| !dwell.is_zero()) {
+            if let Some(k) = live.xwayland.filter(|_| !dwell.is_zero() && !defer) {
                 let p = cap.edge_position();
                 overlay::edge_begin_at(&self.watch.cfg.edges, crate::edge_wayland::edge_of(seg.side), None,
                     Some((p.0 * k, p.1 * k)), Duration::ZERO, dwell, false);
@@ -687,8 +695,8 @@ impl Portal {
             if let Some(c) = self.capture.as_mut() { c.network = true; }
             let mut bridge = crate::net_wayland::capture().lock().unwrap();
             bridge.active = true;
-            bridge.control = self.ctrl.held() || self.held_keys.contains(&29) || self.held_keys.contains(&97);
-            if self.watch.cfg.network.require_control && !bridge.control {
+            bridge.control = control;
+            if defer {
                 bridge.deferred = Some((net_side, pos));
                 bridge.hit = None;
             } else {
@@ -755,8 +763,11 @@ impl Portal {
             let release = {
                 let mut bridge = crate::net_wayland::capture().lock().unwrap();
                 let expired = bridge.sink.is_none() && c.since.elapsed() > Duration::from_millis(self.watch.cfg.network.cross_delay_ms.saturating_add(2000));
+                // "Hold Control to cross" without Control: libei reports a Control held
+                // beforehand within moments; after that the pointer is not kept here.
+                let no_control = bridge.deferred.is_some() && c.since.elapsed() > CONTROL_GRACE;
                 if bridge.sink.is_some() { overlay::edge_end(); }
-                if bridge.release.is_some_and(|t| Instant::now() >= t) || !self.watch.network_wanted() || expired {
+                if bridge.release.is_some_and(|t| Instant::now() >= t) || !self.watch.network_wanted() || expired || no_control {
                     Some(bridge.position.take().or(Some(c.cap.position())))
                 } else { None }
             };
@@ -953,6 +964,9 @@ fn distance(seg: &Segment, x: f64, y: f64) -> f64 {
     let (cx, cy) = (x.clamp(f64::from(x1.min(x2)), f64::from(x1.max(x2))), y.clamp(f64::from(y1.min(y2)), f64::from(y1.max(y2))));
     (x - cx).hypot(y - cy)
 }
+
+/// How long a network edge hit waits for libei to report a Control held beforehand.
+const CONTROL_GRACE: Duration = Duration::from_millis(250);
 
 fn network_capture_ended() {
     let mut bridge=crate::net_wayland::capture().lock().unwrap();

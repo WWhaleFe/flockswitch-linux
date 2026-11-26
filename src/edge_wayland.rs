@@ -312,7 +312,15 @@ impl Watch {
         // Without a computer placed on a side there is nothing to arm: opening a
         // capture session then would only report that no barrier could be made.
         self.cfg.logitech_edges_allowed()
-            || (self.network_wanted() && !crate::net_wayland::capture().lock().unwrap().sides.is_empty())
+            || (self.network_wanted() && !self.network_sides().is_empty())
+    }
+
+    /// The sides a paired computer is placed on, connected or not. Barriers follow the
+    /// placement, not the connection: a computer dropping and coming back must not
+    /// rebuild the capture session (GNOME before 49 would ask for permission again).
+    /// Pushing at a side whose computer is away is handed back by netcore at once.
+    pub fn network_sides(&self) -> Vec<flock_net::Side> {
+        self.cfg.network.peers.iter().filter_map(|p| p.side).collect()
     }
 
     pub fn network_wanted(&self) -> bool {
@@ -330,7 +338,7 @@ impl Watch {
         let mut sides = [false; 4];
         for edge in EDGES {
             sides[side_of(edge).index()] = on && self.cfg.logitech_edges_allowed() && self.cfg.edges.channel(edge) != 0;
-            if self.network_wanted() && crate::net_wayland::capture().lock().unwrap().sides.contains(&crate::net::side(edge)) {
+            if self.network_wanted() && self.network_sides().contains(&crate::net::side(edge)) {
                 sides[side_of(edge).index()] = true;
             }
         }
