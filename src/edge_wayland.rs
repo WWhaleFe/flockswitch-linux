@@ -309,12 +309,16 @@ impl Watch {
     }
 
     pub fn active(&self) -> bool {
-        self.cfg.enabled && self.edges_wanted()
+        (self.cfg.enabled && self.cfg.edges.on && self.cfg.edges.any()) || self.network_wanted()
+    }
+
+    pub fn network_wanted(&self) -> bool {
+        self.cfg.network.on && std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_default().to_ascii_lowercase().contains("gnome")
     }
 
     /// Edge switching is set up, whether or not flockswitch is paused from the menu.
     pub fn edges_wanted(&self) -> bool {
-        self.cfg.edges.on && self.cfg.edges.any()
+        (self.cfg.edges.on && self.cfg.edges.any()) || self.network_wanted()
     }
 
     /// Which sides have a channel (and so a barrier or a strip), paused or not.
@@ -322,7 +326,10 @@ impl Watch {
         let on = self.edges_wanted();
         let mut sides = [false; 4];
         for edge in EDGES {
-            sides[side_of(edge).index()] = on && self.cfg.edges.channel(edge) != 0;
+            sides[side_of(edge).index()] = on && self.cfg.enabled && self.cfg.edges.on && self.cfg.edges.channel(edge) != 0 && !crate::net::owns_edge(&self.cfg.network, edge);
+            if self.network_wanted() && crate::net_wayland::capture().lock().unwrap().sides.contains(&crate::net::side(edge)) {
+                sides[side_of(edge).index()] = true;
+            }
         }
         sides
     }
@@ -334,7 +341,7 @@ impl Watch {
     pub fn dwell_config(&self) -> DwellConfig {
         let mut channels = [0; 4];
         for edge in EDGES {
-            channels[side_of(edge).index()] = self.cfg.edges.channel(edge);
+            channels[side_of(edge).index()] = if !self.cfg.enabled || !self.cfg.edges.on || crate::net::owns_edge(&self.cfg.network, edge) {0} else {self.cfg.edges.channel(edge)};
         }
         DwellConfig {
             channels,

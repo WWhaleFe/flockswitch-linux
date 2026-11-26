@@ -49,6 +49,7 @@ pub fn run(shared: Arc<Shared>, open_settings: bool) -> Result<()> {
     let s = shared.clone();
     ctrlc::set_handler(move || s.stop.store(true, std::sync::atomic::Ordering::SeqCst))?;
     let mut engine = Some(spawn_engine(shared.clone()));
+    let network = crate::net::spawn(shared.clone());
     spawn_update_check(shared.clone());
     crate::overlay::set_ready();
     crate::edge_wayland::spawn(shared.clone());
@@ -133,6 +134,7 @@ pub fn run(shared: Arc<Shared>, open_settings: bool) -> Result<()> {
             if let Some(h) = engine.take() {
                 join_briefly(h); // lets the engine hand the button back first
             }
+            join_briefly(network);
             if ui.uninstall_requested {
                 crate::uninstall();
             }

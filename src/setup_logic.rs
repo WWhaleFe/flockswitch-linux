@@ -40,6 +40,7 @@ const HEREDOC_END: &str = "FLOCKSWITCH_EOF";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ItemId {
+    Network,
     UdevRule,
     Portal,
     KoreanFont,
@@ -52,6 +53,7 @@ impl ItemId {
     /// The name in the settings file (snoozed items) and the log.
     pub fn key(self) -> &'static str {
         match self {
+            ItemId::Network => "network",
             ItemId::UdevRule => "udev-rule",
             ItemId::Portal => "portal",
             ItemId::KoreanFont => "korean-font",
@@ -314,6 +316,9 @@ pub fn cellar_version(target: &Path) -> Option<String> {
 /// Everything the check looks at. setup.rs fills it in; tests make it up.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Facts {
+    pub network_send: bool,
+    pub network_receive: bool,
+    pub network_reason: String,
     /// A Wayland session (XDG_SESSION_TYPE or WAYLAND_DISPLAY).
     pub wayland: bool,
     /// GNOME Shell runs (org.gnome.Shell on the session bus, or XDG_CURRENT_DESKTOP).
@@ -386,6 +391,7 @@ pub enum State {
 /// Why an item is shown.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Why {
+    Network { send: bool, receive: bool, reason: String },
     UdevMissing,
     UdevOutdated,
     UdevDenied,
@@ -536,7 +542,16 @@ impl Item {
 
 /// Every item, in the order the settings window lists them.
 pub fn evaluate(f: &Facts) -> Vec<Item> {
-    vec![brew_update(f), udev(f), tray_icon(f), korean_font(f), portal(f), menu_entry(f)]
+    vec![network(f), brew_update(f), udev(f), tray_icon(f), korean_font(f), portal(f), menu_entry(f)]
+}
+
+fn network(f: &Facts) -> Item {
+    Item {
+        id: ItemId::Network,
+        state: if f.network_receive || f.network_send { State::Ok } else { State::NotApplicable },
+        why: Some(Why::Network {send:f.network_send, receive:f.network_receive, reason:f.network_reason.clone()}),
+        fix: None, manual: None,
+    }
 }
 
 /// The lines that install (or, where the manager tells the two apart, update) packages.
@@ -1041,7 +1056,7 @@ mod tests {
     fn nothing_to_do_on_a_set_up_computer() {
         let f = Facts { udev: Udev { etc: Some(UDEV_RULE.into()), ..Udev::default() }, ..Facts::default() };
         let items = evaluate(&f);
-        assert_eq!(items.len(), 6);
+        assert_eq!(items.len(), 7);
         assert!(shown(&items, &[]).is_empty(), "{items:?}");
         assert_eq!(find(&items, ItemId::UdevRule).state, State::Ok);
         assert_eq!(find(&items, ItemId::Portal).state, State::NotApplicable);
@@ -1508,5 +1523,19 @@ mod tests {
         assert_eq!(exit_after(&[Outcome::NoAdmin, Outcome::Done], false), exit::NO_ADMIN);
         assert_eq!(exit_after(&[Outcome::NoAdmin, failed], true), exit::FAILED);
         assert_eq!(exit_after(&[], false), exit::OK);
+    }
+}
+
+#[cfg(test)]
+mod network_tests {
+    use super::*;
+    #[test]
+    fn support_has_no_install_action() {
+        for (send, receive) in [(true,true),(false,true),(false,false)] {
+            let f=Facts{network_send:send,network_receive:receive,..Facts::default()};
+            let item=network(&f);
+            assert!(!item.actionable());
+            assert!(matches!(item.why,Some(Why::Network{send:s,receive:r,..}) if s==send && r==receive));
+        }
     }
 }

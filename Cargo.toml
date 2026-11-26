@@ -1,6 +1,6 @@
 [package]
 name = "flockswitch"
-version = "0.15.0"
+version = "2.0.0"
 edition = "2021"
 license = "MIT"
 description = "Turn a spare Logitech mouse button into an Easy-Switch key that moves your mouse and keyboard to another computer together"
@@ -8,6 +8,7 @@ repository = "https://github.com/WWhaleFe/flockswitch-linux"
 readme = "README.md"
 
 [dependencies]
+flock-net = { path = "netcore" }
 anyhow = "1"
 auto-launch = "0.6.0"
 ctrlc = { version = "3", features = ["termination"] }
@@ -32,14 +33,15 @@ x11-dl = "2.21"
 # Rust; no libei needed). KDE, sway, Hyprland: 1-pixel wlr-layer-shell strips along the
 # edges, also used to draw the countdown there. libwayland-client is loaded at run time
 # (winit's wayland-dlopen), so the program still starts where it is missing.
-ashpd = { version = "0.13.10", default-features = false, features = ["input_capture", "async-io"] }
+# RemoteDesktop in ashpd 0.13 also imports screencast::Stream.
+ashpd = { version = "0.13.10", default-features = false, features = ["input_capture", "remote_desktop", "screencast", "async-io"] }
 reis = { version = "0.7.1", features = ["async-io"] }
 async-io = "2.6"
 futures-util = "0.3"
 wayland-client = "0.31"
 wayland-protocols = { version = "0.32", features = ["client", "staging", "unstable"] }
 wayland-protocols-wlr = { version = "0.3", features = ["client"] }
-rustix = { version = "1", features = ["event", "fs"] }
+rustix = { version = "1", features = ["event", "fs", "time"] }
 # StatusNotifierItem over D-Bus: no GTK or libappindicator needed.
 tray-icon = { version = "0.26.1", default-features = false, features = ["ksni"] }
 # Load libwayland at run time (no -dev package to build) and draw a title bar where the

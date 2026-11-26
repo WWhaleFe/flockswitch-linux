@@ -203,3 +203,5 @@ Everything else (Wayland, X11, OpenGL, D-Bus, libei) is loaded at run time or ta
 ## License
 
 MIT
+
+For network sharing with ufw, run `sudo ufw allow 47160/tcp` and `sudo ufw allow 5353/udp` (mDNS).

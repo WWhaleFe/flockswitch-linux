@@ -357,6 +357,10 @@ fn watch(shared: Arc<Shared>) {
                 continue;
             }
         };
+        if crate::net::owns_edge(&cfg.network, edge) {
+            end_countdown(&mut counting_down);
+            continue;
+        }
         let channel = cfg.edges.channel(edge);
         let dwell = Duration::from_millis(cfg.edges.dwell_ms);
         let cooling = last_switch.is_some_and(|t| t.elapsed() < COOLDOWN);
@@ -417,7 +421,7 @@ fn watch(shared: Arc<Shared>) {
 /// The cursor and the displays, from the X server (root-window coordinates, y down),
 /// through Xlib and Xinerama loaded at run time. Wayland lets no app read the cursor
 /// position, so there this is not available (XWayland sees it only over X11 windows).
-mod platform {
+pub(crate) mod platform {
     use super::Rect;
     use crate::config::ShakeKey;
     use std::sync::OnceLock;
@@ -430,11 +434,11 @@ mod platform {
         display: *mut Display,
         root: u64,
     }
-    // Safety: only one thread per process makes X calls on this connection (the watcher
-    // in the background process, the window's thread for the preview in the settings one).
+    // ACCESS serializes this connection. XInitThreads runs before any worker starts.
     unsafe impl Send for X {}
     unsafe impl Sync for X {}
 
+    static ACCESS: std::sync::Mutex<()> = std::sync::Mutex::new(());
     static X11: OnceLock<Option<X>> = OnceLock::new();
 
     /// An X11 session: cursor and displays can be read.
@@ -461,6 +465,7 @@ mod platform {
 
     /// The cursor position and the modifier keys, as of now.
     pub fn pointer() -> Option<(f64, f64, u32)> {
+        let _access = ACCESS.lock().unwrap();
         let x = x()?;
         let (mut root, mut child) = (0u64, 0u64);
         let (mut rx, mut ry, mut wx, mut wy) = (0i32, 0i32, 0i32, 0i32);
@@ -493,6 +498,7 @@ mod platform {
     }
 
     pub fn displays() -> Vec<Rect> {
+        let _access = ACCESS.lock().unwrap();
         let Some(x) = x() else { return Vec::new() };
         if let Some(xin) = &x.xinerama {
             let mut count = 0i32;
@@ -517,6 +523,7 @@ mod platform {
 
     /// Moves the cursor there.
     pub fn place(px: f64, py: f64) {
+        let _access = ACCESS.lock().unwrap();
         let Some(x) = x() else { return };
         unsafe {
             (x.xlib.XWarpPointer)(x.display, 0, x.root, 0, 0, 0, 0, px as i32, py as i32);

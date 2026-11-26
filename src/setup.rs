@@ -103,6 +103,10 @@ fn gather(inputs: &Inputs) -> Facts {
                 .map(|(_, out)| logic::gsettings_list_contains(&out, logic::APPINDICATOR_UUID));
         }
     }
+    let network = crate::net::probe();
+    f.network_send = network.send;
+    f.network_receive = network.receive;
+    f.network_reason = network.reason;
     f.homebrew = homebrew(inputs.newer_version.clone());
     f
 }
@@ -365,6 +369,7 @@ fn stream(mut cmd: Command, label: &str, echo: bool) -> (Option<ExitStatus>, Vec
 
 pub fn title(t: &Texts, item: &Item) -> String {
     match item.id {
+        ItemId::Network => if crate::i18n::is_korean() { "네트워크 공유" } else { "Network sharing" }.into(),
         ItemId::UdevRule => t.setup_udev.into(),
         ItemId::Portal => t.setup_portal.into(),
         ItemId::KoreanFont => t.setup_font.into(),
@@ -383,6 +388,7 @@ pub fn title(t: &Texts, item: &Item) -> String {
 pub fn why(t: &Texts, item: &Item) -> String {
     let Some(why) = &item.why else { return String::new() };
     match why {
+        Why::Network { send, receive, reason } => crate::net::describe(&crate::net::Support {send:*send,receive:*receive,reason:reason.clone()}, crate::i18n::is_korean()),
         Why::UdevMissing => t.setup_udev_missing.into(),
         Why::UdevOutdated => t.setup_udev_outdated.into(),
         Why::UdevDenied => t.setup_udev_denied.into(),
@@ -455,6 +461,7 @@ pub fn cli(args: &[String]) -> i32 {
     let items = detect(&cli_inputs(korean, running));
     // Korean without a font to draw it in: English, as in the settings window.
     let t = readable_texts(&items);
+    if let Some(network) = items.iter().find(|i| i.id == ItemId::Network) { println!("{}", why(t, network)); }
     // A Homebrew update is not setup: it has its own way (the settings window, brew).
     let missing: Vec<&Item> = items.iter().filter(|i| i.state == logic::State::Missing && i.id != ItemId::BrewUpdate).collect();
     let todo = logic::installable(missing.iter().copied());

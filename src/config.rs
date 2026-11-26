@@ -764,6 +764,7 @@ fn button_by_name(name: &str) -> Option<u16> {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
+    pub network: flock_net::NetConfig,
     /// Master switch. When false the buttons are left alone.
     pub enabled: bool,
     /// Which device carries the trigger buttons: "auto" (first mouse that has them),
@@ -854,6 +855,7 @@ impl Hotkeys {
 impl Default for Config {
     fn default() -> Self {
         Config {
+            network: flock_net::NetConfig::default(),
             enabled: true,
             trigger_device: "auto".into(),
             follow: vec!["all".into()],
@@ -1060,6 +1062,12 @@ impl Config {
     }
 
     fn set_unchecked(&mut self, key: &str, value: &str) -> Result<()> {
+        match key {
+            "network.on" => { self.network.on = value.parse().context("network.on must be true or false")?; return Ok(()); }
+            "network.name" => { self.network.name = value.into(); return Ok(()); }
+            "network.port" => { self.network.port = value.parse().context("network.port must be between 1 and 65535")?; return Ok(()); }
+            _ => {}
+        }
         if key == "hotkeys" || key == "hotkeys.on" {
             self.hotkeys.on = value.parse().context("hotkeys must be true or false")?;
             return Ok(());
@@ -1250,6 +1258,9 @@ impl Config {
     }
 
     pub fn validate(&self) -> Result<()> {
+        anyhow::ensure!(["capslock", "off"].contains(&self.network.lang1_on_mac.as_str()), "network.lang1_on_mac must be capslock or off");
+        anyhow::ensure!(self.network.peers.iter().all(|p| p.logitech_channel <= 3), "network channel must be between 0 and 3");
+        anyhow::ensure!(self.network.port != 0, "network.port must be between 1 and 65535");
         for cid in BUTTONS {
             let b = self.button(cid);
             let name = button_name(cid);
@@ -1868,5 +1879,30 @@ mod tests {
         // Settings from before 0.7.0 install updates by themselves.
         let old = Config::parse("enabled = true\ncheck_updates = true\n").unwrap();
         assert!(old.check_updates && old.auto_update);
+    }
+}
+
+#[cfg(test)]
+mod network_tests {
+    use super::*;
+    #[test]
+    fn legacy_config_has_network_off() {
+        let config = Config::parse("enabled = true\n[edges]\non = true\nright = 2\n").unwrap();
+        assert!(!config.network.on);
+        assert_eq!(config.network.port, 47160);
+        assert_eq!(config.edges.right, 2);
+        config.validate().unwrap();
+        let loaded = Config::parse(&toml::to_string(&config).unwrap()).unwrap();
+        assert_eq!(loaded.network, config.network);
+    }
+    #[test]
+    fn network_port_validation() {
+        let mut config = Config::default();
+        for port in ["0", "65536", "-1"] { assert!(config.set("network.port", port).is_err()); }
+        config.set("network.port", "65535").unwrap();
+        config.set("network.on", "true").unwrap();
+        config.set("network.name", "My Linux").unwrap();
+        assert!(config.network.on);
+        assert_eq!(config.network.name, "My Linux");
     }
 }

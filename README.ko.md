@@ -215,3 +215,5 @@ Wayland, X11, OpenGL, D-Bus, libei는 실행할 때 불러오거나 순수 Rust�
 ## 라이선스
 
 MIT
+
+네트워크 공유에 ufw를 쓰면 `sudo ufw allow 47160/tcp`와 `sudo ufw allow 5353/udp`(mDNS)를 실행하세요.

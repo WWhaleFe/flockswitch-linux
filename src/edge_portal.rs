@@ -36,7 +36,7 @@ use futures_util::stream::{self, LocalBoxStream};
 use futures_util::StreamExt;
 use reis::ei;
 use reis::event::{DeviceCapability, EiEvent};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::os::unix::net::UnixStream;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -201,6 +201,8 @@ struct Live {
 }
 
 struct Capture {
+    network: bool,
+    scroll: HashMap<reis::event::Device, flock_net::linux_input::ScrollFrame>,
     id: Option<u32>,
     cap: Captured,
     since: Instant,
@@ -213,6 +215,7 @@ struct Portal {
     reconfigure: bool,
     dwell: Dwell,
     ctrl: CtrlKeys,
+    held_keys: HashSet<u32>,
     capture: Option<Capture>,
     /// Motion that came over libei before the portal's "activated".
     early_motion: (f64, f64),
@@ -232,6 +235,7 @@ pub fn run(shared: Arc<Shared>, version: u32, gnome: Option<u32>) {
         reconfigure,
         dwell: Dwell::new(),
         ctrl: CtrlKeys::default(),
+        held_keys: HashSet::new(),
         capture: None,
         early_motion: (0.0, 0.0),
         out: Vec::new(),
@@ -363,6 +367,11 @@ impl Portal {
             log::info!("input-capture: CreateSession (portal v1: the system asks every time a session is made)");
             ic.create_session(None, CreateSessionOptions::default().set_capabilities(wanted)).await?
         };
+        if self.watch.network_wanted() && (!caps.contains(Capabilities::Keyboard) || !caps.contains(Capabilities::Pointer)) {
+            let _ = session.close().await;
+            log::warn!("input-capture: network sending requires pointer and keyboard permission");
+            return Err(OpenError::Denied);
+        }
         let path = session_path(&session);
         log::info!("input-capture: session {path} allowed with {}", caps_text(caps));
         match self.connect(ic, session, path).await {
@@ -457,6 +466,7 @@ impl Portal {
         let zones = live.ic.zones(&live.session, GetZonesOptions::default()).await.map_err(err)?.response().map_err(err)?;
         live.zones = zones.regions().iter().map(|r| Zone { x: r.x_offset(), y: r.y_offset(), w: r.width() as i32, h: r.height() as i32 }).collect();
         log::info!("input-capture: zones {:?} (zone set {})", live.zones, zones.zone_set());
+        *crate::net_wayland::zones().lock().unwrap() = live.zones.iter().map(|z| flock_net::Rect::new(z.x.into(), z.y.into(), z.w.into(), z.h.into())).collect();
         let sides = self.watch.sides();
         let margin = self.watch.margin();
         live.made_for = (sides, margin);
@@ -530,7 +540,7 @@ impl Portal {
                         if !self.watch.edges_wanted() {
                             return End::Inactive;
                         }
-                        let paused = !self.watch.cfg.enabled;
+                        let paused = !self.watch.cfg.enabled && !self.watch.network_wanted();
                         if paused != live.paused {
                             live.paused = paused;
                             self.end_capture(live, None, "paused").await;
@@ -560,6 +570,11 @@ impl Portal {
                             }
                         }
                     }
+                    if !live.paused && live.made_for != (self.watch.sides(), self.watch.margin()) {
+                        self.end_capture(live, None, "network edges changed").await;
+                        if !self.reconfigure { return End::Changed("network edges changed".into()); }
+                        if let Err(e) = self.arm(live).await { return End::Again(e); }
+                    }
                     self.follow(live).await;
                 }
                 Ev::Activated(a) => self.activated(live, a).await,
@@ -567,12 +582,14 @@ impl Portal {
                     if self.capture.as_ref().is_some_and(|c| id.is_none() || c.id == id) {
                         log::info!("input-capture: deactivated by the compositor (activation {id:?})");
                         self.capture = None;
+                        network_capture_ended();
                         self.wait_step(live, None);
                     }
                 }
                 Ev::Disabled => {
                     log::info!("input-capture: disabled by the system");
                     self.capture = None;
+                    network_capture_ended();
                     self.wait_step(live, None);
                     live.enabled = false;
                     if !self.reconfigure {
@@ -640,7 +657,7 @@ impl Portal {
         if early != (0.0, 0.0) {
             cap.motion(early.0, early.1);
         }
-        self.capture = Some(Capture { id, cap, since: Instant::now(), last_drawn: cap.edge_position() });
+        self.capture = Some(Capture { network: false, scroll: HashMap::new(), id, cap, since: Instant::now(), last_drawn: cap.edge_position() });
         let now = Instant::now();
         if live.pointers == 0 {
             self.end_capture(live, Some(cap.position()), "no pointer device over libei, so the pointer cannot be followed").await;
@@ -648,6 +665,24 @@ impl Portal {
         }
         if !cap.at_edge() {
             self.end_capture(live, Some(cap.position()), "in a corner").await;
+            return;
+        }
+        let net_side = crate::net::side(crate::edge_wayland::edge_of(seg.side));
+        let is_network = crate::net_wayland::capture().lock().unwrap().sides.contains(&net_side);
+        if is_network {
+            let (x, y) = cap.edge_position();
+            let displays = crate::net_wayland::zones().lock().unwrap().clone();
+            let pos = flock_net::geometry::edge_ratio(&displays, net_side, x, y);
+            if let Some(c) = self.capture.as_mut() { c.network = true; }
+            let mut bridge = crate::net_wayland::capture().lock().unwrap();
+            bridge.active = true;
+            bridge.hit = Some((net_side, pos));
+            bridge.release = None;
+            bridge.position = None;
+            bridge.pending.clear();
+            let mut held: Vec<u16> = self.held_keys.iter().filter_map(|code| flock_net::linux_input::evdev_to_hid(*code)).collect();
+            held.sort_by_key(|usage| (!matches!(usage, 0xe0..=0xe7), *usage));
+            for usage in held { bridge.pending.push(flock_net::InputEvent::Key {usage, down: true}); }
             return;
         }
         if !self.dwell.would_switch(seg.side, &self.watch.dwell_config(), &self.watch.sit, now) {
@@ -698,6 +733,17 @@ impl Portal {
             self.wait_step(live, None);
             return;
         };
+        if c.network {
+            let release = {
+                let mut bridge = crate::net_wayland::capture().lock().unwrap();
+                let expired = bridge.sink.is_none() && c.since.elapsed() > Duration::from_millis(self.watch.cfg.network.cross_delay_ms.saturating_add(2000));
+                if bridge.release.is_some_and(|t| Instant::now() >= t) || !self.watch.cfg.network.on || expired {
+                    Some(bridge.position.take().or(Some(c.cap.position())))
+                } else { None }
+            };
+            if let Some(at) = release { self.end_capture(live, at, "network return").await; }
+            return;
+        }
         let cap = c.cap;
         let at = cap.at_edge().then_some(cap.seg.side);
         let switched = self.wait_step(live, at);
@@ -721,6 +767,7 @@ impl Portal {
     /// Gives the pointer back (at `at`, if given) and ends the wait.
     async fn end_capture(&mut self, live: &mut Live, at: Option<(f64, f64)>, why: &str) {
         let Some(c) = self.capture.take() else { return };
+        if c.network { network_capture_ended(); }
         self.release(live, c.id, c.since, at, why).await;
     }
 
@@ -735,10 +782,44 @@ impl Portal {
         }
         self.wait_step(live, None);
         self.ctrl.forget();
+        self.held_keys.clear();
         self.early_motion = (0.0, 0.0);
     }
 
     async fn ei_event(&mut self, live: &mut Live, event: EiEvent) -> Option<End> {
+        if let EiEvent::KeyboardKey(k) = &event {
+            if k.state == ei::keyboard::KeyState::Press { self.held_keys.insert(k.key); }
+            else { self.held_keys.remove(&k.key); }
+        }
+        if self.capture.as_ref().is_some_and(|c| c.network) {
+            use flock_net::{linux_input as input, InputEvent};
+            let captured = match &event {
+                EiEvent::PointerMotion(m) => Some(InputEvent::Motion { dx: m.dx.into(), dy: m.dy.into() }),
+                EiEvent::Button(b) => input::button(b.button).map(|button| InputEvent::Button {button, down: b.state == ei::button::ButtonState::Press}),
+                EiEvent::ScrollDiscrete(s) => {
+                    self.capture.as_mut().unwrap().scroll.entry(s.device.clone()).or_default().discrete(s.discrete_dx, s.discrete_dy);
+                    return None;
+                }
+                EiEvent::ScrollDelta(s) => {
+                    self.capture.as_mut().unwrap().scroll.entry(s.device.clone()).or_default().continuous(s.dx.into(), s.dy.into());
+                    return None;
+                }
+                EiEvent::Frame(f) => {
+                    if let Some(scroll) = self.capture.as_mut().unwrap().scroll.remove(&f.device) {
+                        crate::net_wayland::captured_event(scroll.event());
+                    }
+                    return None;
+                }
+                EiEvent::KeyboardKey(k) => input::evdev_to_hid(k.key).map(|usage| InputEvent::Key {usage, down: k.state == ei::keyboard::KeyState::Press}),
+                _ => None,
+            };
+            if let Some(event) = captured { crate::net_wayland::captured_event(event); return None; }
+            if matches!(event, EiEvent::KeyboardKey(_) | EiEvent::Button(_)) { return None; }
+            if matches!(event, EiEvent::DevicePaused(_) | EiEvent::DeviceStopEmulating(_)) {
+                self.end_capture(live, None, "captured device stopped").await;
+                return None;
+            }
+        }
         match event {
             EiEvent::SeatAdded(e) => {
                 e.seat.bind_capabilities(DeviceCapability::Pointer | DeviceCapability::Button | DeviceCapability::Scroll | DeviceCapability::Keyboard);
@@ -815,4 +896,13 @@ fn distance(seg: &Segment, x: f64, y: f64) -> f64 {
     let (x1, y1, x2, y2) = seg.barrier();
     let (cx, cy) = (x.clamp(f64::from(x1.min(x2)), f64::from(x1.max(x2))), y.clamp(f64::from(y1.min(y2)), f64::from(y1.max(y2))));
     (x - cx).hypot(y - cy)
+}
+
+fn network_capture_ended() {
+    let mut bridge=crate::net_wayland::capture().lock().unwrap();
+    bridge.active=false;
+    bridge.sink=None;
+    bridge.hit=None;
+    bridge.release=None;
+    bridge.pending.clear();
 }

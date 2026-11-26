@@ -288,6 +288,7 @@ fn bold(size: f32) -> FontId {
 /// The pages of the window, one tab each.
 #[derive(Clone, Copy, PartialEq)]
 enum Tab {
+    Network,
     Switching,
     Devices,
     General,
@@ -324,6 +325,9 @@ enum Uninstall {
 }
 
 struct SettingsApp {
+    net_status: Option<flock_net::Status>,
+    net_read: Instant,
+    net_address: String,
     tab: Tab,
     /// The button whose settings are shown, and for the gesture button which gesture.
     button_tab: u16,
@@ -526,6 +530,9 @@ impl SettingsApp {
             autostart,
             autostart_on,
             error: None,
+            net_status: None,
+            net_read: Instant::now() - Duration::from_secs(1),
+            net_address: String::new(),
             last_refresh: Instant::now() - REFRESH,
             // Started from the tray app: come to the front once at start.
             raise_frames: 2,
@@ -768,6 +775,7 @@ impl eframe::App for SettingsApp {
             ui.add_space(12.0);
             let tabs = [
                 (Tab::Switching, t.section_switching),
+                (Tab::Network, t.section_network),
                 (Tab::Devices, t.section_devices),
                 (Tab::General, t.section_general),
             ];
@@ -793,6 +801,7 @@ impl eframe::App for SettingsApp {
                             });
                     }
                     match self.tab {
+                        Tab::Network => self.network_section(ui, t, p),
                         Tab::Switching => self.switching_section(ui, t, p),
                         Tab::Devices => {
                             self.master_section(ui, t, p);
@@ -928,6 +937,143 @@ impl SettingsApp {
     }
 
     /// The master switch, then the settings of one button at a time.
+    fn net_request(&mut self, request: flock_net::Request) {
+        if let Err(e) = flock_net::write_request(crate::net::config_dir(), &request) {
+            self.error = Some(format!("{e:#}"));
+        }
+    }
+
+    fn network_section(&mut self, ui: &mut Ui, t: &Texts, p: Palette) {
+        let poll = Duration::from_millis(500);
+        if self.net_read.elapsed() >= poll {
+            self.net_status = flock_net::read_status(crate::net::config_dir()).ok();
+            self.net_read = Instant::now();
+        }
+        ui.ctx().request_repaint_after(poll);
+        let status = self.net_status.clone();
+        section_full(ui, p, t.section_network, None, None, |ui| {
+            let mut on = self.cfg.network.on;
+            if switch_row(ui, p, t.net_share, None, &mut on) { self.apply(|c| c.network.on = on); }
+            hint(ui, p, t.net_explain);
+            hint(ui, p, t.net_permission);
+            hint(ui, p, &crate::net::support_text(crate::i18n::is_korean()));
+            if on && self.status.edge_backend == "input-capture" {
+                let (text, problem) = edge_backend_text(t, &self.status.edge_backend, &self.status.edge_note, false);
+                ui.colored_label(if problem { p.red } else { p.muted }, text);
+            }
+            if on {
+                if let Some(error) = status.as_ref().and_then(|s| s.me.error.as_ref()) { ui.colored_label(p.red, error); }
+            }
+        });
+        if let Some(pairing) = status.as_ref().filter(|_| self.cfg.network.on).and_then(|s| s.pairing.as_ref()) {
+            section_full(ui, p, t.net_pairing, None, Some((&pairing.peer_name, p.accent)), |ui| {
+                let code = &pairing.code;
+                let shown = if code.len() == 6 && code.is_ascii() { format!("{} {}", &code[..3], &code[3..]) } else { code.clone() };
+                ui.label(RichText::new(shown).font(bold(32.0)).color(p.accent));
+                match pairing.stage.as_str() {
+                    "done" => { ui.colored_label(p.green, t.net_done); }
+                    "failed" => { ui.colored_label(p.red, t.net_failed); }
+                    stage => {
+                        hint(ui, p, t.net_compare);
+                        hint(ui, p, if stage == "peer_accepted" { t.net_peer_accepted } else { t.net_wait });
+                        ui.horizontal(|ui| {
+                            if button(ui, p, t.net_confirm, ButtonKind::Primary).clicked() { self.net_request(flock_net::Request::Accept { accept: true }); }
+                            if button(ui, p, t.cancel, ButtonKind::Plain).clicked() { self.net_request(flock_net::Request::Accept { accept: false }); }
+                        });
+                    }
+                }
+            });
+        }
+        section_full(ui, p, t.net_me, None, None, |ui| {
+            let width = (ui.available_width() * 0.62).min(300.0);
+            let mut name = self.cfg.network.name.clone();
+            if labeled_row(ui, p, t.net_name, width, ROW_SMALL, |ui| {
+                ui.add(egui::TextEdit::singleline(&mut name).hint_text(t.net_name_hint).desired_width(width)).changed()
+            }) { self.apply(|c| c.network.name = name); }
+            let mut port = self.cfg.network.port;
+            if labeled_row(ui, p, t.net_port, width, ROW_SMALL, |ui| ui.add(egui::DragValue::new(&mut port).range(1..=65535)).changed()) {
+                self.apply(|c| c.network.port = port);
+            }
+            if let Some(s) = &status { hint(ui, p, &format!("{}: {}", t.net_id, s.me.id.get(..8).unwrap_or(&s.me.id))); }
+        });
+        section_full(ui, p, t.net_nearby, None, None, |ui| {
+            let discovered: Vec<_> = status.as_ref().filter(|s| self.cfg.network.on && s.running).map(|s| s.discovered.iter().filter(|d| !d.paired && !self.cfg.network.peers.iter().any(|p| p.id == d.id)).cloned().collect()).unwrap_or_default();
+            if discovered.is_empty() { empty(ui, p, if self.cfg.network.on { t.net_empty } else { t.net_disabled }); }
+            for peer in discovered {
+                ui.horizontal(|ui| {
+                    ui.vertical(|ui| {
+                        ui.label(RichText::new(&peer.name).strong());
+                        hint(ui, p, &format!("{:?} · {}", peer.os, peer.addr));
+                    });
+                    if button(ui, p, t.net_pair, ButtonKind::Plain).clicked() { self.net_request(flock_net::Request::Pair { pair: peer.id }); }
+                });
+            }
+            divider(ui, p);
+            ui.horizontal(|ui| {
+                ui.add(egui::TextEdit::singleline(&mut self.net_address).hint_text(t.net_address_hint).desired_width((ui.available_width() - 110.0).max(100.0)));
+                ui.add_enabled_ui(self.cfg.network.on && !self.net_address.trim().is_empty(), |ui| {
+                    if button(ui, p, t.net_add_ip, ButtonKind::Plain).clicked() {
+                        let input = self.net_address.trim();
+                        let address = if let Ok(ip) = input.parse::<std::net::IpAddr>() {
+                            std::net::SocketAddr::new(ip, flock_net::NetConfig::default().port).to_string()
+                        } else { input.to_string() };
+                        if address.parse::<std::net::SocketAddr>().is_ok() { self.net_request(flock_net::Request::PairAddr { pair_addr: address }); }
+                        else { self.error = Some(t.net_address_hint.into()); }
+                    }
+                });
+            });
+        });
+        // Same heading as `section_with`, but each peer gets its own card below it.
+        ui.add_space(10.0);
+        ui.horizontal(|ui| {
+            ui.add_space(4.0);
+            ui.label(RichText::new(t.net_peers).font(bold(13.0)).color(p.muted));
+        });
+        ui.add_space(2.0);
+        if self.cfg.network.peers.is_empty() { card(ui, p, |ui| empty(ui, p, t.net_no_peers)); }
+        for peer in self.cfg.network.peers.clone() {
+            ui.push_id(&peer.id, |ui| card(ui, p, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(&peer.name).font(bold(15.0)));
+                    let online = status.as_ref().filter(|s| s.running && self.cfg.network.on).and_then(|s| s.peers.iter().find(|p| p.id == peer.id)).filter(|p| p.connected);
+                    if let Some(online) = online {
+                        let delay = online.rtt_ms.map(|ms| format!(" · {ms:.1} ms")).unwrap_or_default();
+                        ui.colored_label(p.green, format!("● {}{delay}", t.net_connected));
+                    } else { ui.colored_label(p.muted, format!("● {}", t.net_offline)); }
+                    if button(ui, p, t.net_unpair, ButtonKind::Danger).clicked() { self.net_request(flock_net::Request::Unpair { unpair: peer.id.clone() }); }
+                });
+                let sides = [None, Some(flock_net::Side::Left), Some(flock_net::Side::Right), Some(flock_net::Side::Top), Some(flock_net::Side::Bottom)];
+                let labels: Vec<String> = [t.off, t.edge_left, t.edge_right, t.edge_top, t.edge_bottom].iter().map(|s| s.to_string()).collect();
+                let width = (ui.available_width() * 0.66).min(300.0);
+                let mut selected = None;
+                labeled_row(ui, p, t.net_position, width, ROW_SMALL, |ui| {
+                    selected = segments(ui, p, &format!("net-side-{}", peer.id), &labels, Role::RadioButton, SEG_SMALL, None, Some(0), |i| sides[i] == peer.side);
+                    false
+                });
+                if let Some(i) = selected { self.apply(|c| { if let Some(p) = c.network.peers.iter_mut().find(|p| p.id == peer.id) { p.side = sides[i]; } }); }
+                let labels: Vec<String> = [t.off, "1", "2", "3"].iter().map(|s| s.to_string()).collect();
+                let mut channel = None;
+                labeled_row(ui, p, t.net_channel, width, ROW_SMALL, |ui| {
+                    channel = segments(ui, p, &format!("net-channel-{}", peer.id), &labels, Role::RadioButton, SEG_SMALL, None, Some(0), |i| i as u8 == peer.logitech_channel);
+                    false
+                });
+                let label_width = ui.painter().layout_no_wrap(t.net_channel.into(), FontId::proportional(14.5), p.text).size().x;
+                let center = Pos2::new(ui.min_rect().left() + label_width + 14.0, ui.cursor().top() - ROW_SMALL / 2.0);
+                info_icon(ui, p, &format!("net-channel-info-{}", peer.id), center, t.net_channel_info);
+                if let Some(i) = channel { self.apply(|c| { if let Some(p) = c.network.peers.iter_mut().find(|p| p.id == peer.id) { p.logitech_channel = i as u8; } }); }
+            }));
+            ui.add_space(8.0);
+        }
+        section_full(ui, p, t.net_options, None, None, |ui| {
+            let mut swap = self.cfg.network.swap_cmd_ctrl;
+            if switch_row(ui, p, t.net_swap, None, &mut swap) { self.apply(|c| c.network.swap_cmd_ctrl = swap); }
+            let mut lang1 = self.cfg.network.lang1_on_mac != "off";
+            if switch_row(ui, p, t.net_lang1, None, &mut lang1) { self.apply(|c| c.network.lang1_on_mac = if lang1 { "capslock" } else { "off" }.into()); }
+            hint(ui, p, t.net_return);
+            hint(ui, p, t.net_priority);
+        });
+    }
+
     fn switching_section(&mut self, ui: &mut Ui, t: &Texts, p: Palette) {
         ui.add_space(12.0);
         info_box(ui, p, t.switching_help);
@@ -2372,7 +2518,7 @@ impl SettingsApp {
         let runs = self.setup.runs.lock().unwrap().clone();
         let rows: Vec<&Item> = items
             .iter()
-            .filter(|i| runs.contains_key(&i.id) || (i.state == SetupState::Missing && !setup_logic::is_snoozed(i, &snoozed)))
+            .filter(|i| i.id == ItemId::Network || runs.contains_key(&i.id) || (i.state == SetupState::Missing && !setup_logic::is_snoozed(i, &snoozed)))
             .collect();
         // Set aside, and not run from here (a run keeps its row).
         let not_run: Vec<Item> = items.iter().filter(|i| !runs.contains_key(&i.id)).cloned().collect();
@@ -2632,6 +2778,7 @@ fn setup_row(ui: &mut Ui, p: Palette, t: &Texts, item: &Item, run: Option<&Setup
             labels.push((t.setup_retry, ButtonKind::Plain));
             actions.push(SetupAction::Install(item.clone()));
         }
+        None if item.id == ItemId::Network => {}
         None => {
             if item.fix.is_some() {
                 labels.push((setup_button(t, item), ButtonKind::Primary));
