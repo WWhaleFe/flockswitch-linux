@@ -662,6 +662,8 @@ impl SettingsApp {
             shots: shots::Shots::new(),
         };
         if app.shots.is_some() {
+            // The pictures are always dark, whatever the machine is set to.
+            ctx.set_theme(egui::Theme::Dark);
             app.cfg = shots::demo_config();
             app.net_status = Some(shots::demo_status(&app.cfg));
             app.status = shots::demo_device_status();
@@ -885,7 +887,18 @@ impl SettingsApp {
         if modal {
             side.disable();
         }
-        egui::ScrollArea::vertical().id_salt("sidebar").auto_shrink([false, false]).show(&mut side, |ui| self.sidebar(ui, t, p));
+        // The status card keeps the bottom (measured first, so its height is reserved); the
+        // pages above it scroll if they do not fit.
+        let inner = side.max_rect();
+        let mut probe = side.new_child(UiBuilder::new().max_rect(inner).invisible());
+        self.status_card(&mut probe, t, p);
+        let card_height = probe.min_rect().height();
+        let card_rect = Rect::from_min_max(Pos2::new(inner.left(), inner.bottom() - card_height), inner.max);
+        let nav_rect = Rect::from_min_max(inner.min, Pos2::new(inner.right(), card_rect.top() - 12.0));
+        let mut card = side.new_child(UiBuilder::new().max_rect(card_rect));
+        self.status_card(&mut card, t, p);
+        let mut nav = side.new_child(UiBuilder::new().max_rect(nav_rect));
+        egui::ScrollArea::vertical().id_salt("sidebar").auto_shrink([false, false]).show(&mut nav, |ui| self.sidebar(ui, t, p));
 
         let mut main = ui.new_child(UiBuilder::new().max_rect(main_rect.shrink2(Vec2::new(PAGE_PADDING.x, PAGE_PADDING.y))));
         if modal {
@@ -3493,7 +3506,7 @@ impl SettingsApp {
         self.my_id.clone()
     }
 
-    /// The left column: the app, the pages, and the status card.
+    /// The left column: the app and the pages (the status card is drawn under it).
     fn sidebar(&mut self, ui: &mut Ui, t: &Texts, p: Palette) {
         let width = ui.available_width();
         let pending = self.setup_pending_count();
@@ -3548,8 +3561,6 @@ impl SettingsApp {
                 self.page = page;
             }
         }
-        ui.add_space(24.0);
-        self.status_card(ui, t, p);
     }
 
     /// Where the mouse is, what the network is doing, and the device.

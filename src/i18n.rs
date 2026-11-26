@@ -1029,7 +1029,7 @@ const KO: Texts = Texts {
     keys_hsrc_help: "이 키를 누르면 {0}의 한/영 전환으로 바꿔 보냅니다. 여러 개 고를 수 있습니다",
     keys_hdst_help_linux: "Linux 입력기(ibus·fcitx)에 설정한 키를 고르세요",
     keys_hdst_help_android: "Gboard·삼성 키보드는 Shift+Space가 기본입니다",
-    keys_hdst_help_mac: "macOS 키보드 설정에서 Caps Lock으로 입력 소스를 바꾸도록 해 두었다면 Caps Lock",
+    keys_hdst_help_mac: "macOS 키보드 설정에서 Caps Lock으로 입력 소스를 바꾸도록 해 두었다면 Caps Lock을 고르세요",
     hk_lang1: "한/영 키",
     hk_right_alt: "오른쪽 Alt",
     hk_hanja: "한자 키",

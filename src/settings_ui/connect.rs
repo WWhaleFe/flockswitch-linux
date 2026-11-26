@@ -110,14 +110,15 @@ impl SettingsApp {
         // Linux session capabilities: warn when sending or receiving is unavailable.
         if net.on {
             let support = crate::net::cached_support();
-            if !support.send || !support.receive {
+            if !super::shots::active() && (!support.send || !support.receive) {
                 gap(ui);
                 note_box(ui, p, NoteKind::Error, &crate::net::support_text(crate::i18n::is_korean()), None);
             }
         }
 
         // The background app that does the sharing is not running.
-        let background = crate::main_instance_running();
+        // Screenshot mode shows everything healthy.
+        let background = super::shots::active() || crate::main_instance_running();
         if !background || status.as_ref().is_some_and(|s| net.on && !s.running) {
             gap(ui);
             if note_box(ui, p, NoteKind::Error, t.background_stopped, Some(t.background_restart)) {
