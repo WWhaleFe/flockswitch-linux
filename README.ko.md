@@ -9,7 +9,7 @@ flockswitch는 MX Master 마우스의 **휠 모드 전환 버튼, 제스처 버�
 이 저장소는 리눅스 버전입니다. 다른 버전은 [flockswitch-mac](https://github.com/WWhaleFe/flockswitch-mac), [flockswitch-windows](https://github.com/WWhaleFe/flockswitch-windows), [flockswitch-android](https://github.com/WWhaleFe/flockswitch-android)에 있으며, 모두 같은 방식으로 전환되어 섞어 쓸 수 있습니다.
 
 > [!CAUTION]
-> **베타 버전이며, 아직 재확인이 필요합니다.** Linux에서 실제로 동작을 확인한 것은 0.12.0까지(Ubuntu 26.04, GNOME 50, Wayland)입니다. 지금 버전을 포함한 그 뒤 버전은 실제 Linux PC에서 다시 확인하지 않았고, X11(Xorg) 세션과 KDE Plasma·sway·Hyprland에서는 한 번도 시험하지 않았습니다. 예상대로 동작하지 않을 수 있으니, 써 보신 결과를 알려 주시면 큰 도움이 됩니다.
+> **베타 버전입니다.** 2.0.0은 실제 Linux PC(Ubuntu 26.04, GNOME 50, Wayland)에서 Mac과 함께 네트워크 공유까지 확인했습니다. X11(Xorg) 세션과 KDE Plasma·sway·Hyprland에서는 아직 시험하지 않았습니다. 써 보신 결과를 알려 주시면 큰 도움이 됩니다.
 
 > Logitech과 관계없는 개인 오픈소스입니다. "Logitech", "MX Master", "Easy-Switch", "Bolt", "Unifying"은 Logitech의 상표입니다.
 
@@ -38,7 +38,7 @@ Cmd/Ctrl 매핑과 Mac에서 한/영 키 쓰기는 설정할 수 있습니다.
 | 세션 | 네트워크 보내기 | 네트워크 받기 | 클립보드 | 카운트다운 | 실기기 확인 |
 |---|---|---|---|---|---|
 | X11(Xorg) | X11 캡처 | XTest | 실행 중 유지하는 X11 선택 영역 | 네트워크 넘김 지연 포함 지원 | 2.0 미확인, X11 실기기 시험 이력 없음 |
-| GNOME Wayland | 포인터·키보드 InputCapture | RemoteDesktop ConnectToEIS | data-control이 없어 XWayland 경유 | 포털 구역과 X11 화면 좌표가 맞으면 표시, 아니면 지연만 적용 | 2.0 미확인, Ubuntu 26.04 / GNOME 50에서 0.12.0 로지텍 기능만 확인 |
+| GNOME Wayland | 포인터·키보드 InputCapture | RemoteDesktop ConnectToEIS | data-control이 없어 XWayland 경유 | 포털 구역과 X11 화면 좌표가 맞으면 표시, 아니면 지연만 적용 | 2.0.0을 Ubuntu 26.04 / GNOME 50에서 Mac과 함께 확인 |
 | KDE / 기타 Wayland | 불가, 받기 전용 | 컴포지터가 RemoteDesktop ConnectToEIS를 제공할 때 지원 | 제공 시 네이티브 data-control, 아니면 XWayland | 로지텍 모서리는 layer-shell 표시, 네트워크 송신·카운트다운 없음 | 실기기 시험 이력 없음 |
 
 GNOME Wayland는 공유를 시작할 때 **입력 캡처와 원격 데스크톱 두 권한**을 요청합니다.

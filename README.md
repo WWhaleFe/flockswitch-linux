@@ -9,7 +9,7 @@ flockswitch turns buttons of an MX Master mouse - the wheel mode-shift button, t
 This repository is the Linux version. The others live in [flockswitch-mac](https://github.com/WWhaleFe/flockswitch-mac), [flockswitch-windows](https://github.com/WWhaleFe/flockswitch-windows) and [flockswitch-android](https://github.com/WWhaleFe/flockswitch-android); all of them switch the same way and can be mixed.
 
 > [!CAUTION]
-> **Beta, and still needs re-checking.** The Linux version was last checked on a real PC at 0.12.0 (Ubuntu 26.04, GNOME 50, Wayland). Later versions, including the current one, have not been re-checked on real Linux hardware, and X11 (Xorg) sessions and KDE Plasma, sway or Hyprland have never been tried. It may not work as expected; reports are very welcome.
+> **Beta.** 2.0.0 was checked on a real Linux PC (Ubuntu 26.04, GNOME 50, Wayland), network sharing with a Mac included. X11 (Xorg) sessions and KDE Plasma, sway or Hyprland have not been tried yet; reports are very welcome.
 
 > Not affiliated with Logitech. "Logitech", "MX Master", "Easy-Switch", "Bolt" and "Unifying" are trademarks of Logitech.
 
@@ -38,7 +38,7 @@ into a file manager. Linux shows the two Mac Hangul remapping rows read-only wit
 | Session | Network send | Network receive | Clipboard | Countdown | Real hardware validation |
 |---|---|---|---|---|---|
 | X11 (Xorg) | X11 capture | XTest | X11 selection, held while the app runs | Yes, including network crossing delay | 2.0 has not been tested; X11 has never been tested on real hardware |
-| GNOME Wayland | InputCapture with pointer + keyboard | RemoteDesktop ConnectToEIS | Through XWayland; GNOME has no data-control | XWayland when portal zones and X11 screens align; otherwise delay without drawing | 2.0 has not been tested; only 0.12.0 Logitech features were checked on Ubuntu 26.04 / GNOME 50 |
+| GNOME Wayland | InputCapture with pointer + keyboard | RemoteDesktop ConnectToEIS | Through XWayland; GNOME has no data-control | XWayland when portal zones and X11 screens align; otherwise delay without drawing | 2.0.0 checked on Ubuntu 26.04 / GNOME 50 with a Mac |
 | KDE / other Wayland | Unavailable, receive only | RemoteDesktop ConnectToEIS when the compositor supports it | Native data-control when offered, otherwise XWayland | Layer-shell countdown for Logitech edges; no network sender/countdown | Never tested on real hardware |
 
 GNOME Wayland asks for **two permissions** when sharing starts: input capture and

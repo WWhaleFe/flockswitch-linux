@@ -1,20 +1,13 @@
 # Changelog
 
-## 2.0.0 - 2026-11-26
+## 2.0.0 - 2026-11-27
 
 - Share any mouse, keyboard and clipboard between your own paired computers on a trusted local network. One master manages up to three subs, with TLS encryption, discovery, six-digit pairing and an emergency return shortcut.
 - Text, PNG images and files follow the cursor, with a fixed 100 MB limit and received files in Downloads/flockswitch. Network crossing keeps Logitech channels unchanged.
 - Five settings tabs, four Network pages, consent, master/sub settings, network state in the header and tray, and the lime/ink 2.0 cards. Mac Hangul rows are read-only on Linux.
 - One edge owner, X11 network countdown, GNOME's shared InputCapture session and RemoteDesktop permissions; other Wayland compositors remain receive only when ConnectToEIS is available.
 - Replaces 0.15.0 in place, preserving settings, devices, button state, wheel mode, backups, setup checks, udev, shortcuts and Homebrew updates. Imports test-build network settings once without deleting the source or replacing identity.
-- Linux remains a beta. 2.0 network, clipboard, UI and portal transitions still need real hardware validation; see the README support table.
-
-## 2.0.0 - 2026-11-24
-
-- Add network mouse and keyboard sharing with TLS pairing, discovery, and the Network settings tab.
-- X11 sends and receives; GNOME Wayland uses InputCapture and RemoteDesktop EIS. Other Wayland desktops receive only when RemoteDesktop ConnectToEIS is available.
-- Setup reports sending and receiving capabilities. Existing 1.x settings remain compatible; network sharing defaults to off.
-
+- Linux remains a beta. 2.0.0 was checked on Ubuntu 26.04 / GNOME 50 Wayland together with a Mac; X11 and other desktops are untried, see the README support table.
 
 ## 0.15.0 - 2026-11-19
 
