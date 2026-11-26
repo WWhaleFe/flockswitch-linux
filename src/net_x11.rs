@@ -454,10 +454,19 @@ mod smoke_tests {
     #[ignore = "requires X11 text/uri-list, run under xvfb-run"]
     fn x11_clipboard_files_round_trip() {
         let p = platform();
-        let files = vec![PathBuf::from("/tmp/a b.txt"), PathBuf::from("/tmp/한글.png")];
+        // arboard puts only existing files on the clipboard (it canonicalizes each path),
+        // as the files received over the network are.
+        let dir = std::env::temp_dir().join(format!("flock-x11-files-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let files: Vec<PathBuf> = ["a b.txt", "한글.png"].iter().map(|n| {
+            let f = dir.join(n);
+            std::fs::write(&f, b"x").unwrap();
+            f.canonicalize().unwrap()
+        }).collect();
         p.set_clipboard_files(&files);
         let mut reader = arboard::Clipboard::new().unwrap();
         assert_eq!(reader.get().file_list().unwrap(), files);
         assert_eq!(p.clipboard_files(), files);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
