@@ -392,6 +392,13 @@ fn watch(shared: Arc<Shared>) {
             continue;
         }
         shared.wait_screen(screen_generation, wait);
+        if shared.stopped() {
+            break;
+        }
+        // Settings notifications can end the wait before this snapshot is current.
+        if shared.version() != version {
+            continue;
+        }
         if displays_read.is_none_or(|t| t.elapsed() >= DISPLAYS_POLL) {
             displays_read = Some(Instant::now());
             displays = platform::displays();

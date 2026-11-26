@@ -53,7 +53,18 @@ with (scratch / 'facades.rs').open('a') as out:
 # Run the real two-axis shake detector tests (edge.rs) and wake-flag tests (wake.rs).
 edge = (root / 'src/edge.rs').read_text()
 wake = (root / 'src/wake.rs').read_text()
+# Exercise the actual X11 watcher and Linux hook wiring with deterministic desktop
+# and storage facades. Keep production control flow verbatim in the generated files.
+net = (root / 'src/net.rs').read_text()
+(scratch / 'runtime-edge.rs').write_text(
+    edge[edge.index('use crate::config::'):edge.index('/// The cursor and the displays, from the X server')])
+hook_start = net.index('                            let paired = shared.clone();')
+hook_end = net.index('                            match Service::start', hook_start)
+(scratch / 'runtime-net.rs').write_text(
+    'fn hooks(shared: Arc<Shared>) -> flock_net::Hooks {\n'
+    + net[hook_start:hook_end] + '\nhooks\n}\n')
 with (scratch / 'facades.rs').open('a') as out:
+    out.write(f'include!("{root / "scripts/host-runtime.rs"}");\n')
     out.write('mod shake_checks {\nuse std::time::{Duration, Instant};\n')
     out.write(item(edge, r'^pub\(crate\) const POLL:', ';') + '\n')
     out.write(item(edge, r'^const SHAKE_POLL:', 'const SHAKE_REST: Duration = Duration::from_secs(2);') + '\n')

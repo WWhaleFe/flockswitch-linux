@@ -300,10 +300,8 @@ pub fn spawn(shared: Arc<Shared>) -> JoinHandle<()> {
                                         log::error!("save master settings: {e:#}");
                                     }
                                 }),
-                                on_key_rules: Box::new(move |keys| {
-                                    if let Err(e) = key_rules.update_config(|c| c.network.keys = keys) {
-                                        log::error!("save key rules from sub: {e:#}");
-                                    }
+                                persist_key_rules: Box::new(move |keys| {
+                                    key_rules.update_config(|c| c.network.keys = keys.clone())
                                 }),
                                 ..flock_net::Hooks::default()
                             };
