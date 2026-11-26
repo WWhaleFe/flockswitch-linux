@@ -217,6 +217,9 @@ struct Portal {
     dwell: Dwell,
     ctrl: CtrlKeys,
     held_keys: HashSet<u32>,
+    /// A Control held from before the capture (known only from libei's modifiers) was
+    /// sent to the other computer as a key press.
+    ctrl_sent: bool,
     capture: Option<Capture>,
     /// Motion that came over libei before the portal's "activated".
     early_motion: (f64, f64),
@@ -237,6 +240,7 @@ pub fn run(shared: Arc<Shared>, version: u32, gnome: Option<u32>) {
         dwell: Dwell::new(),
         ctrl: CtrlKeys::default(),
         held_keys: HashSet::new(),
+        ctrl_sent: false,
         capture: None,
         early_motion: (0.0, 0.0),
         out: Vec::new(),
@@ -586,6 +590,8 @@ impl Portal {
                         log::info!("input-capture: deactivated by the compositor (activation {id:?})");
                         self.capture = None;
                         network_capture_ended();
+                        overlay::edge_end();
+                        self.forget_keys();
                         self.wait_step(live, None);
                     }
                 }
@@ -593,6 +599,8 @@ impl Portal {
                     log::info!("input-capture: disabled by the system");
                     self.capture = None;
                     network_capture_ended();
+                    overlay::edge_end();
+                    self.forget_keys();
                     self.wait_step(live, None);
                     live.enabled = false;
                     if !self.reconfigure {
@@ -819,10 +827,17 @@ impl Portal {
             Err(e) => log::info!("input-capture: release (activation {id:?}): {e}"),
         }
         self.wait_step(live, None);
+        self.forget_keys();
+        self.early_motion = (0.0, 0.0);
+    }
+
+    /// The keys seen during a capture: their releases never come once it has ended,
+    /// however it ended (given back here, or by the compositor).
+    fn forget_keys(&mut self) {
         self.ctrl.forget();
         self.held_keys.clear();
+        self.ctrl_sent = false;
         crate::net_wayland::capture().lock().unwrap().control = false;
-        self.early_motion = (0.0, 0.0);
     }
 
     async fn ei_event(&mut self, live: &mut Live, event: EiEvent) -> Option<End> {
@@ -843,6 +858,14 @@ impl Portal {
             bridge.control = control;
             let promoted = control && bridge.deferred.take().map(|hit| bridge.hit = Some(hit)).is_some();
             drop(bridge);
+            // A Control held since before the edge shows only in the modifiers; the other
+            // computer needs it as a key (shortcuts there, and "hold Control" on the way
+            // back). Its release follows the same way; netcore releases all on return.
+            let key_ctrl = self.held_keys.contains(&29) || self.held_keys.contains(&97);
+            if self.capture.as_ref().is_some_and(|c| c.network) && !key_ctrl && control != self.ctrl_sent {
+                self.ctrl_sent = control;
+                crate::net_wayland::captured_event(flock_net::InputEvent::Key { usage: 0xE0, down: control });
+            }
             // Control came after the edge was reached: start the countdown drawing now.
             let dwell = Duration::from_millis(self.watch.cfg.network.cross_delay_ms);
             if let (true, Some(k), Some(c)) = (promoted && !dwell.is_zero(), live.xwayland, self.capture.as_ref()) {
@@ -854,7 +877,8 @@ impl Portal {
         if self.capture.as_ref().is_some_and(|c| c.network) {
             // Before crossing, inward motion cancels the pending dwell. Once the
             // network sink owns input, all relative motion goes to the peer instead.
-            if crate::net_wayland::capture().lock().unwrap().sink.is_none() {
+            let waiting = { let b = crate::net_wayland::capture().lock().unwrap(); b.sink.is_none() && b.release.is_none() };
+            if waiting {
                 if let EiEvent::PointerMotion(m) = &event {
                     let c = self.capture.as_mut().unwrap();
                     c.cap.motion(m.dx.into(), m.dy.into());
