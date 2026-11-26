@@ -3583,9 +3583,16 @@ impl SettingsApp {
             }
         };
         let (line, here) = match &at {
-            MouseAt::Here => (t.status_here.to_string(), true),
-            MouseAt::There(name) => (crate::i18n::fill(t.status_there, &[name]), false),
-            MouseAt::Controlled(name) => (crate::i18n::fill(t.status_controlled, &[name]), true),
+            MouseAt::Here => (t.status_this.to_string(), true),
+            MouseAt::There(name) => (name.clone(), false),
+            MouseAt::Controlled(name) => (name.clone(), true),
+        };
+        // Line 2 leads with "mouse here"; without that prefix when it would not fit.
+        let net_line = {
+            let full = format!("{} · {net_line}", t.status_mouse_here);
+            let avail = ui.available_width() - 20.0;
+            let width = ui.painter().layout_no_wrap(full.clone(), FontId::proportional(12.0), p.muted).size().x;
+            if width <= avail { full } else { net_line }
         };
         let device = match &self.status.trigger {
             Some(name) => match self.status.channel {
@@ -3612,7 +3619,7 @@ impl SettingsApp {
                     } else {
                         ui.painter().circle_filled(dot.center(), 4.0, p.off);
                     }
-                    ui.add(egui::Label::new(RichText::new(line).size(13.0).color(p.text)).truncate());
+                    ui.add(egui::Label::new(RichText::new(line).size(13.0).strong().color(p.text)).truncate());
                 });
                 ui.add(egui::Label::new(RichText::new(net_line).size(12.0).color(p.muted)).truncate());
             })

@@ -409,9 +409,8 @@ pub struct Texts {
     pub nav_buttons: &'static str,
     pub nav_hotkeys: &'static str,
     pub nav_edges: &'static str,
-    pub status_here: &'static str,
-    pub status_there: &'static str,
-    pub status_controlled: &'static str,
+    pub status_this: &'static str,
+    pub status_mouse_here: &'static str,
     pub status_net_off: &'static str,
     pub status_master: &'static str,
     pub status_sub: &'static str,
@@ -962,9 +961,8 @@ const KO: Texts = Texts {
     nav_buttons: "버튼 전환",
     nav_hotkeys: "단축키 전환",
     nav_edges: "모서리 전환",
-    status_here: "마우스가 이 컴퓨터에 있어요",
-    status_there: "마우스가 {0}에 있어요",
-    status_controlled: "{0}의 마우스가 와 있어요",
+    status_this: "이 컴퓨터",
+    status_mouse_here: "마우스 위치",
     status_net_off: "네트워크 공유 꺼짐",
     status_master: "마스터 · 서브 {1}대 중 {0}대 연결",
     status_sub: "서브 · 마스터 {0}",
@@ -1524,9 +1522,8 @@ const EN: Texts = Texts {
     nav_buttons: "Button switching",
     nav_hotkeys: "Shortcut switching",
     nav_edges: "Edge switching",
-    status_here: "The mouse is on this computer",
-    status_there: "The mouse is on {0}",
-    status_controlled: "{0}'s mouse is here",
+    status_this: "This computer",
+    status_mouse_here: "Mouse here",
     status_net_off: "Network sharing is off",
     status_master: "Master · {0} of {1} subs connected",
     status_sub: "Sub · master {0}",
@@ -1716,7 +1713,7 @@ mod tests {
     fn no_text_has_an_em_dash_or_a_stray_placeholder() {
         for t in [&KO, &EN] {
             for text in [
-                t.status_there,
+                t.status_this,
                 t.status_master,
                 t.keys_hsrc,
                 t.keys_table_help,
@@ -1742,8 +1739,6 @@ mod tests {
     #[test]
     fn every_placeholder_of_a_text_exists_in_both_languages() {
         let pairs = [
-            (KO.status_there, EN.status_there),
-            (KO.status_controlled, EN.status_controlled),
             (KO.status_master, EN.status_master),
             (KO.status_sub, EN.status_sub),
             (KO.layout_subs, EN.layout_subs),
