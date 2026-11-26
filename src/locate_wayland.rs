@@ -6,7 +6,7 @@
 //! highlight the way `path` finds for this session. Shaking the mouse needs the cursor
 //! all the time and stays X11 only (edge.rs). An X11 session does all of this in edge.rs.
 
-use crate::edge::{POLL, STATUS_POLL};
+use crate::edge::STATUS_POLL;
 use crate::edge_logic::{self, Zone};
 use crate::edge_wayland::session_is_wayland;
 use crate::locate_logic::{self as logic, LocatePath};
@@ -58,7 +58,7 @@ fn watch(shared: Arc<Shared>) {
     let mut mouse_here = false;
     let mut told_shake = false;
     while !shared.stopped() {
-        std::thread::sleep(POLL);
+        let screen_generation = shared.screen_generation();
         if shared.version() != version {
             version = shared.version();
             cfg = shared.config();
@@ -84,5 +84,7 @@ fn watch(shared: Arc<Shared>) {
                 log::info!("locate: asked by {}, but finding the cursor is off in the settings", source.name());
             }
         }
+        let wait = status_read.map_or(STATUS_POLL, |t| STATUS_POLL.saturating_sub(t.elapsed()));
+        shared.wait_screen(screen_generation, wait);
     }
 }

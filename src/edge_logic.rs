@@ -9,6 +9,24 @@
 
 use std::time::{Duration, Instant};
 
+/// Wayland dispatch still wakes immediately on input. Only the periodic housekeeping
+/// deadline backs off when the pointer is away from every strip.
+pub fn dispatch_interval(pointer_on_edge: bool) -> Duration {
+    Duration::from_millis(if pointer_on_edge { 25 } else { 300 })
+}
+
+#[cfg(test)]
+mod idle_tests {
+    use super::*;
+
+    #[test]
+    fn edge_input_restores_the_dwell_deadline() {
+        assert_eq!(dispatch_interval(false), Duration::from_millis(300));
+        assert_eq!(dispatch_interval(true), Duration::from_millis(25));
+        assert_eq!(dispatch_interval(false), Duration::from_millis(300));
+    }
+}
+
 /// After one switch, the next needs the cursor to leave the edge and this much time
 /// (the same as edge.rs).
 pub const COOLDOWN: Duration = Duration::from_secs(2);

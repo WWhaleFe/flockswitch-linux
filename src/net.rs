@@ -173,8 +173,8 @@ pub fn live_status() -> Option<flock_net::Status> {
 
 /// The network config the service runs with: sharing only after consent, the master's
 /// effect settings attached, and the app driving the edges when there is a wait.
-fn runtime_config(shared: &Shared) -> NetConfig {
-    crate::net_logic::runtime_config(&shared.config(), crate::edge_wayland::session_is_wayland(), config_dir())
+fn runtime_config(full: &Config) -> NetConfig {
+    crate::net_logic::runtime_config(full, crate::edge_wayland::session_is_wayland(), config_dir())
 }
 
 fn publish_error(config: &NetConfig, error: String) {
@@ -212,22 +212,37 @@ pub fn spawn(shared: Arc<Shared>) -> JoinHandle<()> {
             let mut mode = String::from("local");
             let mut platform: Option<Arc<dyn Platform>> = None;
             let mut previous = None;
+            let mut version = None;
+            let mut cached = None;
+            let mut edges_allowed = false;
             let mut attempted = false;
             let mut retry = Instant::now() - Duration::from_secs(5);
             let mut key_retry = Instant::now() - Duration::from_secs(2);
             while !shared.stopped() {
                 shared.reload_if_edited();
-                let config = runtime_config(&shared);
-                EDGES_ALLOWED.store(shared.config().network_edges_allowed() && config.on, Ordering::Release);
+                if version != Some(shared.version()) {
+                    // Serializing the master's effect settings and copying peers is
+                    // needed only when settings change, not every supervisor tick.
+                    shared.read_config(|full| {
+                        version = Some(shared.version());
+                        let config = runtime_config(full);
+                        edges_allowed = full.network_edges_allowed() && config.on;
+                        cached = Some(config);
+                    });
+                }
+                let config = cached.as_ref().expect("initial network settings");
+                EDGES_ALLOWED.store(edges_allowed, Ordering::Release);
                 if !config.on {
-                    LIVE.lock().unwrap().take();
-                    mode = "local".into();
-                    if let Some(s) = service.take() {
-                        s.stop();
+                    if previous.as_ref().is_none_or(|c: &NetConfig| c.on) {
+                        LIVE.lock().unwrap().take();
+                        mode = "local".into();
+                        if let Some(s) = service.take() {
+                            s.stop();
+                        }
+                        platform = None;
+                        attempted = false;
+                        crate::net_wayland::disable();
                     }
-                    platform = None;
-                    attempted = false;
-                    crate::net_wayland::disable();
                 } else {
                     if !attempted {
                         attempted = true;
@@ -240,7 +255,7 @@ pub fn spawn(shared: Arc<Shared>) -> JoinHandle<()> {
                             };
                         match result {
                             Ok(p) => platform = Some(p),
-                            Err(e) => publish_error(&config, format!("{e:#}")),
+                            Err(e) => publish_error(config, format!("{e:#}")),
                         }
                     }
                     if service.is_none() && retry.elapsed() >= Duration::from_secs(5) {
@@ -298,10 +313,10 @@ pub fn spawn(shared: Arc<Shared>) -> JoinHandle<()> {
                                     *LIVE.lock().unwrap() = Some(Live { service: s.clone(), config: config.clone() });
                                     service = Some(s);
                                 },
-                                Err(e) => publish_error(&config, format!("{e:#}")),
+                                Err(e) => publish_error(config, format!("{e:#}")),
                             }
                         }
-                    } else if previous.as_ref() != Some(&config) {
+                    } else if previous.as_ref() != Some(config) {
                         if let Some(s) = &service {
                             let _ = s.update_config(config.clone());
                             if let Some(live) = LIVE.lock().unwrap().as_mut() { live.config = config.clone(); }
@@ -311,7 +326,7 @@ pub fn spawn(shared: Arc<Shared>) -> JoinHandle<()> {
                 // Keep the outbox on disk across disabled sharing, failed sends and restarts.
                 // Enqueueing is not an acknowledgement: only echoed master settings clear it.
                 if config.on && config.role == flock_net::Role::Sub && key_retry.elapsed() >= Duration::from_secs(2) {
-                    if let (Some(s), Some(keys)) = (&service, shared.config().pending_key_rules) {
+                    if let (Some(s), Some(keys)) = (&service, shared.read_config(|c| c.pending_key_rules.clone())) {
                         key_retry = Instant::now();
                         if let Err(e) = s.send_key_rules(keys) {
                             log::warn!("send key rules to the master (will retry): {e:#}");
@@ -328,12 +343,14 @@ pub fn spawn(shared: Arc<Shared>) -> JoinHandle<()> {
                 if let Some(service) = &service {
                     let now = service.status().state.mode;
                     if (mode == "local" && now == "controlled") || (mode == "controlling" && now == "local") {
-                        let locate = shared.config().locate;
+                        let locate = shared.read_config(|c| c.locate.clone());
                         if locate.on && locate.on_arrival { crate::overlay::locate(&locate); }
                     }
                     mode = now;
                 }
-                previous = Some(config);
+                if previous.as_ref() != Some(config) {
+                    previous = Some(config.clone());
+                }
                 thread::sleep(Duration::from_millis(100));
             }
             LIVE.lock().unwrap().take();

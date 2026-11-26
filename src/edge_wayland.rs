@@ -378,7 +378,13 @@ impl Watch {
         move |progress| if progressive { rising_pulse(progress).0 } else { HAPTIC_TICK }
     }
 
-    /// Once per poll: picks up changed settings and, every 300 ms, the engine's status.
+    /// The idle dispatch deadline, capped by the next engine status check.
+    pub fn dispatch_interval(&self, pointer_on_edge: bool) -> Duration {
+        let wait = crate::edge_logic::dispatch_interval(pointer_on_edge);
+        wait.min(self.status_read.map_or(Duration::ZERO, |t| STATUS_POLL.saturating_sub(t.elapsed())))
+    }
+
+    /// Once per poll: picks up changed settings and, every 300 ms, engine status.
     /// True when the settings changed.
     pub fn poll(&mut self) -> bool {
         let mut changed = false;

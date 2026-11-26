@@ -131,9 +131,11 @@ struct Axis {
     extreme: f64,
     start: f64,
     stroke_began: Option<Instant>,
-    /// When the first stroke of the shake going on began, and its turns, oldest first.
+    /// When this shake began, its turn count (capped at the required minimum),
+    /// and the most recent turn. Older turn timestamps are never used.
     began: Option<Instant>,
-    turns: Vec<Instant>,
+    turns: usize,
+    last_turn: Option<Instant>,
     /// The last time the cursor really moved (not just jitter).
     last_move: Option<Instant>,
 }
@@ -155,7 +157,7 @@ impl Axis {
         }
         let stale = |t: Instant| now.duration_since(t) > SHAKE_GAP;
         let mut turned = false;
-        if self.last_move.is_some_and(stale) || self.turns.last().is_some_and(|t| stale(*t)) {
+        if self.last_move.is_some_and(stale) || self.last_turn.is_some_and(stale) {
             self.reset(v);
         }
         if self.heading == 0.0 {
@@ -174,13 +176,15 @@ impl Axis {
             // short wobble ends the shake, and the time starts again from here.
             let quick = self.stroke_began.is_some_and(|t| !stale(t));
             if quick && (self.extreme - self.start).abs() >= SHAKE_MIN_STROKE {
-                if self.turns.is_empty() {
+                if self.turns == 0 {
                     self.began = self.stroke_began;
                 }
-                self.turns.push(now);
+                self.turns = (self.turns + 1).min(SHAKE_MIN_TURNS);
+                self.last_turn = Some(now);
                 turned = true;
             } else {
-                self.turns.clear();
+                self.turns = 0;
+                self.last_turn = None;
                 self.began = None;
             }
             self.start = self.extreme;
@@ -192,7 +196,7 @@ impl Axis {
         // under way before it is seen, and people stop as soon as the cursor reacts.
         let needed = time.saturating_sub(SHAKE_SLACK);
         // Judged at each new turn: a shake that has stopped is over.
-        turned && self.turns.len() >= SHAKE_MIN_TURNS && self.began.is_some_and(|b| now.duration_since(b) >= needed)
+        turned && self.turns >= SHAKE_MIN_TURNS && self.began.is_some_and(|b| now.duration_since(b) >= needed)
     }
 }
 
@@ -207,6 +211,16 @@ struct Shake {
 }
 
 impl Shake {
+    /// At rest, read as often as the edge watcher. Any real movement restores
+    /// 10 ms sampling until a full shake gap has passed without movement.
+    fn poll_interval(&self, now: Instant) -> Duration {
+        if self.axes.iter().any(|axis| axis.last_move.is_some_and(|t| now.duration_since(t) <= SHAKE_GAP)) {
+            SHAKE_POLL
+        } else {
+            POLL
+        }
+    }
+
     /// Takes the cursor's position and whether the key asked for is held (true when
     /// none is); true at the moment a shake that has lasted `time` is noticed.
     fn update(&mut self, (x, y): (f64, f64), held: bool, time: Duration, now: Instant) -> bool {
@@ -277,6 +291,7 @@ pub fn available() -> bool {
 pub fn spawn(shared: Arc<Shared>) {
     std::thread::Builder::new()
         .name("edges".into())
+        .stack_size(256 * 1024)
         .spawn(move || watch(shared))
         .expect("spawning the edge watcher");
 }
@@ -309,7 +324,7 @@ fn watch(shared: Arc<Shared>) {
     let mut shake = Shake::default();
 
     while !shared.stopped() {
-        std::thread::sleep(if cfg.locate.on && cfg.locate.on_shake { SHAKE_POLL } else { POLL });
+        let screen_generation = shared.screen_generation();
         if shared.version() != version {
             version = shared.version();
             cfg = shared.config();
@@ -361,12 +376,22 @@ fn watch(shared: Arc<Shared>) {
             if noticed {
                 overlay::locate(&cfg.locate);
             }
+        } else {
+            shake = Shake::default();
         }
+        // Keep active edge timing unchanged. Disabled edges need only arrival checks;
+        // settings, locate requests and engine status wake them immediately.
+        let wait = if cfg.locate.on && cfg.locate.on_shake { shake.poll_interval(Instant::now()) }
+            else if active { POLL } else { STATUS_POLL };
+        // An early notification must not restart the arrival-check deadline.
+        let wait = wait.min(status_read.map_or(STATUS_POLL, |t| STATUS_POLL.saturating_sub(t.elapsed())));
         if !active {
             resting = None;
             end_countdown(&mut counting_down);
+            shared.wait_screen(screen_generation, wait);
             continue;
         }
+        shared.wait_screen(screen_generation, wait);
         if displays_read.is_none_or(|t| t.elapsed() >= DISPLAYS_POLL) {
             displays_read = Some(Instant::now());
             displays = platform::displays();
@@ -801,6 +826,46 @@ mod tests {
                         assert!(!got.is_empty(), "{hz} Hz +-{amp} dir {dir:?} step {step:?} seed {seed}: not noticed in 1 s");
                         assert!(got[0] >= Duration::from_millis(800) && got[0] <= Duration::from_millis(1150), "{got:?}");
                     }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn shake_poll_backs_off_only_after_motion_stops() {
+        let mut shake = Shake::default();
+        let now = Instant::now();
+        let time = Duration::from_secs(1);
+        assert_eq!(shake.poll_interval(now), POLL);
+        shake.update((100.0, 100.0), true, time, now);
+        shake.update((110.0, 100.0), true, time, now + POLL);
+        assert_eq!(shake.poll_interval(now + POLL), SHAKE_POLL);
+        assert_eq!(shake.poll_interval(now + POLL + SHAKE_GAP), SHAKE_POLL);
+        assert_eq!(shake.poll_interval(now + POLL + SHAKE_GAP + SHAKE_POLL), POLL);
+        shake.update((110.0, 120.0), true, time, now + Duration::from_secs(1));
+        assert_eq!(shake.poll_interval(now + Duration::from_secs(1)), SHAKE_POLL);
+        shake.update((110.0, 120.0), false, time, now + Duration::from_secs(1));
+        assert_eq!(shake.poll_interval(now + Duration::from_secs(1)), POLL);
+    }
+
+    #[test]
+    fn adaptive_poll_preserves_recorded_shakes_after_idle() {
+        for (hz, amp) in [(6.0, 60.0), (7.5, 40.0), (9.0, 30.0), (5.0, 110.0)] {
+            for dir in [(1.0, 0.0), (0.0, 1.0), (0.8, 0.6)] {
+                for seed in 1..=4 {
+                    let mut shake = Shake::default();
+                    let start = Instant::now();
+                    shake.update((0.0, 0.0), true, Duration::from_secs(1), start);
+                    let mut next = Duration::ZERO;
+                    let rec = recorded_shake(hz, amp, 1.15, (1, 1), dir, seed);
+                    let mut noticed = false;
+                    for (at, position) in rec {
+                        if at < next { continue; }
+                        let now = start + at;
+                        noticed |= shake.update(position, true, Duration::from_secs(1), now);
+                        next = at + shake.poll_interval(now);
+                    }
+                    assert!(noticed, "{hz} Hz +-{amp} dir {dir:?} seed {seed}");
                 }
             }
         }

@@ -4,6 +4,7 @@
 mod backup;
 mod config;
 mod clipboard;
+mod idle;
 mod device;
 mod net;
 mod net_logic;

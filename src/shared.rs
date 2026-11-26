@@ -376,6 +376,7 @@ pub fn save_wheel_modes(modes: &std::collections::HashMap<String, u8>) {
 }
 
 pub struct Shared {
+    screen_signal: crate::idle::Signal,
     config: Mutex<Config>,
     /// Modification time of config.toml as last read or written by us.
     config_mtime: Mutex<Option<std::time::SystemTime>>,
@@ -417,6 +418,7 @@ impl Shared {
     pub fn new(cfg: Config) -> Shared {
         crate::i18n::set_language(&cfg.language);
         Shared {
+            screen_signal: crate::idle::Signal::default(),
             config: Mutex::new(cfg),
             config_mtime: Mutex::new(config_mtime()),
             version: AtomicU64::new(0),
@@ -434,6 +436,22 @@ impl Shared {
         self.config.lock().unwrap().clone()
     }
 
+    pub fn read_config<T>(&self, read: impl FnOnce(&Config) -> T) -> T {
+        read(&self.config.lock().unwrap())
+    }
+
+    pub fn screen_generation(&self) -> u64 {
+        self.screen_signal.generation()
+    }
+
+    pub fn wait_screen(&self, seen: u64, timeout: std::time::Duration) {
+        self.screen_signal.wait(seen, timeout);
+    }
+
+    pub fn screen_readiness(&self) -> std::io::Result<std::sync::Arc<std::os::fd::OwnedFd>> {
+        self.screen_signal.readiness()
+    }
+
     pub fn version(&self) -> u64 {
         self.version.load(Ordering::SeqCst)
     }
@@ -449,6 +467,7 @@ impl Shared {
         // Recheck the file rather than marking that unseen write as already loaded.
         *self.config_mtime.lock().unwrap() = None;
         self.version.fetch_add(1, Ordering::SeqCst);
+        self.screen_signal.notify();
         Ok(())
     }
 
@@ -477,6 +496,7 @@ impl Shared {
                 crate::i18n::set_language(&cfg.language);
                 *current = cfg;
                 self.version.fetch_add(1, Ordering::SeqCst);
+                self.screen_signal.notify();
                 log::info!("settings file changed, reloaded");
             }
             Err(e) => log::warn!("settings file has an error, keeping current settings: {e:#}"),
@@ -504,6 +524,7 @@ impl Shared {
         change(&mut st);
         if *st != before {
             self.status_generation.fetch_add(1, Ordering::SeqCst);
+            self.screen_signal.notify();
         }
         let file = StatusFile {
             trigger: st.trigger.clone(),
@@ -561,6 +582,7 @@ impl Shared {
             LocateSource::Command => 2,
         };
         self.locate_request.store(code, Ordering::SeqCst);
+        self.screen_signal.notify();
     }
 
     pub fn take_locate_request(&self) -> Option<LocateSource> {
