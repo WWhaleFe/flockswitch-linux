@@ -38,14 +38,26 @@ with (scratch / 'facades.rs').open('a') as out:
     for name in ['versions', 'assets', 'homebrew_paths']:
         out.write('#[test]\n' + item(update, r'^    fn ' + name + r'\(', '\n    }') + '\n')
     out.write('#[test]\n' + item(tray, r'^    fn homebrew_path_without_the_version\(', '\n    }') + '\n}\n')
-modules = ['config', 'clipboard', 'i18n', 'net_logic', 'edge_logic', 'setup_logic', 'locate_logic', 'window_size']
+# Run the real two-axis shake detector tests (edge.rs) and wake-flag tests (wake.rs).
+edge = (root / 'src/edge.rs').read_text()
+wake = (root / 'src/wake.rs').read_text()
+with (scratch / 'facades.rs').open('a') as out:
+    out.write('mod shake_checks {\nuse std::time::{Duration, Instant};\n')
+    out.write(item(edge, r'^pub\(crate\) const POLL:', ';') + '\n')
+    out.write(item(edge, r'^const SHAKE_POLL:', 'const SHAKE_REST: Duration = Duration::from_secs(2);') + '\n')
+    out.write(item(edge, r'^#\[derive\(Default\)\]\nstruct Axis', '\n}\n\n/// The edge')[:-len('\n\n/// The edge')] + '\n')
+    out.write(item(edge, r'^    fn shake_on\(', '        assert!(noticed_at(&rec, second).is_empty());\n    }') + '\n}\n')
+    out.write('mod wake_checks {\nuse std::sync::atomic::{AtomicBool, Ordering};\n')
+    out.write(item(wake, r'^static PENDING:', 'fn should_reconnect(active: bool) -> bool {\n    !active\n}') + '\n')
+    out.write(item(wake, r'^#\[cfg\(test\)\]\nmod tests', '\n}') + '\n}\n')
+modules = ['config', 'clipboard', 'i18n', 'net_logic', 'edge_logic', 'setup_logic', 'locate_logic', 'window_size', 'settings_logic']
 (scratch / 'lib.rs').write_text(
     '// These modules expose runtime entry points unused by this logic-only harness.\n'
     '#![allow(dead_code)]\ninclude!("facades.rs");\n' + ''.join(
         f'#[path = "{root / "src" / (name + ".rs")}"] mod {name};\n' for name in modules))
 (scratch / 'Cargo.toml').write_text(f'''[package]
 name = "flockswitch-host-tests"
-version = "2.0.0"
+version = "2.1.0"
 edition = "2021"
 [lib]
 path = "lib.rs"

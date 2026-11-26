@@ -60,6 +60,7 @@ impl SizeGuard {
 
     /// The app itself resized the window (to fit its content): `size` is the size to
     /// keep from now on, as if the user had made it so.
+    #[cfg(test)]
     pub fn remember(&mut self, size: [f32; 2]) {
         self.size = Some(size);
         self.asked_at = None;

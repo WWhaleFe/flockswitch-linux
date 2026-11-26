@@ -52,6 +52,7 @@ pub fn run(shared: Arc<Shared>, open_settings: bool) -> Result<()> {
     ctrlc::set_handler(move || s.stop.store(true, std::sync::atomic::Ordering::SeqCst))?;
     let mut engine = Some(spawn_engine(shared.clone()));
     let network = crate::net::spawn(shared.clone());
+    crate::wake::spawn(shared.clone());
     spawn_update_check(shared.clone());
     crate::overlay::set_ready();
     crate::edge_wayland::spawn(shared.clone());

@@ -24,6 +24,7 @@ mod locate_wayland;
 mod overlay;
 mod overlay_render;
 mod overlay_wayland;
+mod settings_logic;
 mod settings_ui;
 mod setup;
 mod setup_logic;
@@ -31,8 +32,11 @@ mod shared;
 mod shortcuts_portal;
 mod tray;
 mod update;
+mod wake;
 mod window_size;
 mod wl;
+
+pub const APP_NAME: &str = "flockswitch";
 
 use anyhow::{bail, Result};
 use config::Config;
@@ -247,7 +251,7 @@ fn real_main(args: &[String]) -> Result<()> {
                 bail!("flockswitch is not running; start it first (the running flockswitch shows the cursor)");
             }
             if Config::load_or_create().is_ok_and(|c| !c.locate.on) {
-                eprintln!("note: finding the cursor is off (Settings → General, or `flockswitch set locate true`), so nothing will show");
+                eprintln!("note: finding the cursor is off (Settings → Effects, or `flockswitch set locate true`), so nothing will show");
             }
             leave_request(&shared::locate_request_path(), "")
         }
@@ -299,6 +303,7 @@ fn run_headless() -> Result<()> {
     let s = shared.clone();
     ctrlc::set_handler(move || s.stop.store(true, Ordering::SeqCst))?;
     edge_wayland::spawn(shared.clone());
+    wake::spawn(shared.clone());
     let mut engine = Engine::new(shared.clone())?;
     let network = net::spawn(shared.clone());
     let result = engine.run();

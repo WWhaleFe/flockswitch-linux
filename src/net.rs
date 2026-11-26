@@ -13,6 +13,11 @@ use std::{
     time::{Duration, Instant},
 };
 
+/// Where files received from another computer are saved.
+pub fn received_dir() -> Option<PathBuf> {
+    Some(dirs::download_dir()?.join("flockswitch"))
+}
+
 pub fn config_dir() -> PathBuf {
     Config::path()
         .parent()
@@ -20,6 +25,28 @@ pub fn config_dir() -> PathBuf {
         .parent()
         .unwrap()
         .to_path_buf()
+}
+
+/// Where the settings window leaves key rules edited on a sub. The window is another
+/// process and cannot call the service; the network thread sends them to the master.
+fn key_rules_request_path() -> PathBuf {
+    Config::path().with_file_name("key-rules.request")
+}
+
+/// Asks the running app to send `keys` to the master (a sub's edit of "OS 전환 시").
+pub fn request_key_rules(keys: &std::collections::BTreeMap<String, flock_net::DirRules>) -> anyhow::Result<()> {
+    let path = key_rules_request_path();
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, serde_json::to_vec(keys)?)?;
+    std::fs::rename(tmp, path)?;
+    Ok(())
+}
+
+fn take_key_rules_request() -> Option<std::collections::BTreeMap<String, flock_net::DirRules>> {
+    let path = key_rules_request_path();
+    let bytes = std::fs::read(&path).ok()?;
+    let _ = std::fs::remove_file(&path);
+    serde_json::from_slice(&bytes).ok()
 }
 /// The running service and the config it runs with, for the edge watcher.
 struct Live {
@@ -142,11 +169,12 @@ pub fn network_side_ready(edge: Edge) -> bool {
     let Some(live) = live.as_ref() else { return false };
     let side = side(edge);
     let status = live.service.status();
+    // The computer in the neighbouring cell of the layout (a master's sub or, on a sub,
+    // another sub), as long as its link is up.
+    let next = flock_net::layout::neighbour(&status.layout, &status.me.id, side);
     status.running
         && status.state.mode == "local"
-        && live.config.peers.iter().any(|p| {
-            p.side == Some(side) && status.peers.iter().any(|s| s.id == p.id && s.connected)
-        })
+        && next.is_some_and(|id| status.peers.iter().any(|s| s.id == id && s.connected))
 }
 
 /// Moves control to the computer on `edge`, entering at the spot matching (x, y).
@@ -293,6 +321,24 @@ pub fn spawn(shared: Arc<Shared>) -> JoinHandle<()> {
                             let _ = s.update_config(config.clone());
                             if let Some(live) = LIVE.lock().unwrap().as_mut() { live.config = config.clone(); }
                         }
+                    }
+                }
+                // Key rules edited on a sub go to its master (see `request_key_rules`).
+                if let Some(keys) = take_key_rules_request() {
+                    match &service {
+                        Some(s) => {
+                            if let Err(e) = s.send_key_rules(keys) {
+                                log::warn!("send key rules to the master: {e:#}");
+                            }
+                        }
+                        None => log::info!("key rules edited while sharing is off: kept on this computer only"),
+                    }
+                }
+                // Woke from sleep or unlocked: look for the other computers again now.
+                if crate::wake::take() {
+                    if let Some(s) = &service {
+                        log::info!("wake or unlock: reconnecting");
+                        let _ = s.reconnect();
                     }
                 }
                 if let Some(service) = &service {

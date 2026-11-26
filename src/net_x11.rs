@@ -337,7 +337,7 @@ impl Platform for X11 {
     fn set_clipboard_files(&self, files: &[std::path::PathBuf]) { self.clipboard.set_files(files); }
     fn clipboard_image_png(&self) -> Option<Vec<u8>> { self.clipboard.image() }
     fn set_clipboard_image_png(&self, png: &[u8]) { self.clipboard.set_image(png); }
-    fn received_dir(&self) -> Option<std::path::PathBuf> { Some(dirs::download_dir()?.join("flockswitch")) }
+    fn received_dir(&self) -> Option<std::path::PathBuf> { crate::net::received_dir() }
     fn os(&self) -> Os {
         Os::Linux
     }

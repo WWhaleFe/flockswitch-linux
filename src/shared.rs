@@ -104,6 +104,10 @@ pub struct StatusFile {
     pub shortcuts_portal: String,
     #[serde(default)]
     pub shortcuts_bound: Vec<BoundShortcut>,
+    /// A newer version the tray app has found (its number), so that the settings
+    /// window offers "Update now" at once.
+    #[serde(default)]
+    pub update_available: Option<String>,
 }
 
 fn status_path() -> std::path::PathBuf {
@@ -517,6 +521,12 @@ impl Shared {
             shortcuts_portal: st.shortcuts_portal.clone(),
             shortcuts_bound: st.shortcuts_bound.clone(),
             version: env!("CARGO_PKG_VERSION").into(),
+            update_available: match &st.update {
+                crate::update::UpdateState::Available(r)
+                | crate::update::UpdateState::DownloadFailed(r)
+                | crate::update::UpdateState::InstallFailed(r) => Some(r.version.clone()),
+                _ => None,
+            },
         };
         drop(st);
         // Only touch the disk when something the settings window shows has changed.
