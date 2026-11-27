@@ -172,7 +172,7 @@ mod net {
         shared.update_config(|c| {
             c.network.role = flock_net::Role::Sub;
             c.network.peers.push(flock_net::PeerConfig { id: "master".into(), role: flock_net::Role::Master, ..Default::default() });
-            c.network.layout.push(flock_net::Cell { id: "master".into(), col: 0, row: 0 });
+            c.network.layout.push(flock_net::Cell::new("master", 0, 0));
             c.pending_key_rules = Some(c.network.all_rules());
         }).unwrap();
         let hooks = hooks(shared.clone());

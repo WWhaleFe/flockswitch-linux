@@ -974,13 +974,18 @@ impl Config {
             log::warn!("migrating test-build network settings: {e:#}");
         }
         if !path.exists() {
-            let cfg = Config::default();
+            let mut cfg = Config::default();
+            cfg.network.apply_hangul_defaults();
             cfg.write_at(&path)?;
             return Ok(cfg);
         }
         let text = std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
-        let cfg = Config::parse(&text).with_context(|| format!("parsing {}", path.display()))?;
+        let mut cfg = Config::parse(&text).with_context(|| format!("parsing {}", path.display()))?;
         cfg.validate()?;
+        // One-time default key rule changes (Shift+Space as a Korean/English key, 2.2).
+        if cfg.network.apply_hangul_defaults() {
+            cfg.write_at(&path)?;
+        }
         Ok(cfg)
     }
 

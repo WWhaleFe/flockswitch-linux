@@ -633,6 +633,8 @@ mod tests {
         assert_eq!(inject_call(&InputEvent::Button { button: MouseButton::Left, down: true }), Some(Inject::Button(0x110, true)));
         assert_eq!(inject_call(&InputEvent::Button { button: MouseButton::Forward, down: false }), Some(Inject::Button(0x114, false)));
         assert_eq!(inject_call(&InputEvent::Key { usage: 0x04, down: false }), Some(Inject::Key(30, false)));
+        // The Korean/English toggle (Lang1) reaches ibus-hangul / fcitx5-hangul as KEY_HANGEUL.
+        assert_eq!(inject_call(&InputEvent::Key { usage: 0x90, down: true }), Some(Inject::Key(122, true)));
         assert_eq!(inject_call(&InputEvent::Key { usage: 0xffff, down: true }), None);
         // netcore: positive dy is wheel up; the extension: positive is down.
         assert_eq!(inject_call(&InputEvent::Scroll { dx: 1.0, dy: 2.0 }), Some(Inject::Scroll(-1.0, -2.0)));

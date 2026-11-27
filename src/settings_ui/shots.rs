@@ -88,7 +88,7 @@ fn other(i: usize) -> PeerConfig {
 }
 
 fn cell(id: &str, col: u8, row: u8) -> Cell {
-    Cell { id: id.into(), col, row }
+    Cell::new(id, col, row)
 }
 
 /// The demo settings: this computer as master with two computers side by side to its
@@ -121,11 +121,13 @@ pub(super) fn demo_status(cfg: &Config) -> flock_net::Status {
         can_send: true,
         via_master: false,
         keyrules: true,
+        displays: Vec::new(),
+        paused: false,
     };
     let rtts = [2.4, 3.1, 9.6];
     flock_net::Status {
         running: true,
-        me: MeStatus { id: ME.into(), name: cfg.network.name.clone(), port: flock_net::DEFAULT_PORT, error: None, can_send: true },
+        me: MeStatus { id: ME.into(), name: cfg.network.name.clone(), port: flock_net::DEFAULT_PORT, error: None, can_send: true, displays: Vec::new() },
         discovered: Vec::new(),
         peers: cfg.network.peers.iter().zip(rtts).map(|(p, r)| peer(p, r)).collect(),
         state: StateStatus { mode: "controlling".into(), peer: Some(OTHERS[1].0.into()) },

@@ -2,8 +2,10 @@ use serde::{Deserialize, Serialize};
 use std::io::{self, Read, Write};
 
 pub const PROTO_VERSION: u32 = 1;
-/// Hello features of this version: Group and KeyRules messages.
-pub const FEATURES: [&str; 2] = ["group", "keyrules"];
+/// Hello features of this version: Group and KeyRules messages, and Displays (2.2: the
+/// computer's monitors, so layout cells and crossings are per monitor). A message that a
+/// feature stands for is only ever sent to a peer that advertised it.
+pub const FEATURES: [&str; 4] = ["group", "keyrules", "displays", "lang1-toggle"];
 pub const MAX_FRAME: usize = 64 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -97,12 +99,25 @@ pub enum Msg {
     Pong {
         t: u64,
     },
+    /// Control moves to the receiver. `side` is the sender's exit side. With `display` (2.2)
+    /// it is the receiver's monitor to land on and `pos` runs along that monitor's edge;
+    /// without it `pos` runs along the receiver's whole exposed edge.
     Enter {
         side: Side,
         pos: f64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        display: Option<u8>,
     },
+    /// Control goes back to the receiver. `display` as in `Enter`: the receiver's monitor.
     Leave {
         pos: f64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        display: Option<u8>,
+    },
+    /// The sender's monitors (2.2), sorted as `geometry::sorted_displays`. Sent after
+    /// the link is paired and whenever they change, only to peers with the "displays" feature.
+    Displays {
+        rects: Vec<crate::Rect>,
     },
     Input(InputEvent),
     /// Text on the sender's clipboard, sent just before control moves.
@@ -184,17 +199,31 @@ mod tests {
         assert_eq!(listen_port, None);
         assert!(features.is_empty());
         let group = Msg::Group {
-            cells: vec![crate::Cell { id: "a".into(), col: 2, row: 1 }],
+            cells: vec![crate::Cell::new("a", 2, 1)],
             roster: vec![crate::Member { id: "a".into(), name: "A".into(), os: Os::Mac, fingerprint: "f".into(), addr: String::new(), can_send: false, features: vec![] }],
         };
         let rules = Msg::KeyRules([("mac>windows".to_string(), crate::DirRules::default())].into());
-        for msg in [group, rules] {
+        let displays = Msg::Displays { rects: vec![crate::Rect::new(0.0, 0.0, 1920.0, 1080.0), crate::Rect::new(1920.0, 0.0, 1280.0, 720.0)] };
+        let enter = Msg::Enter { side: Side::Left, pos: 0.25, display: Some(1) };
+        let leave = Msg::Leave { pos: 0.75, display: Some(0) };
+        for msg in [group, rules, displays, enter, leave] {
             let mut bytes = Vec::new();
             write_frame(&mut bytes, &msg).unwrap();
             assert_eq!(read_frame(bytes.as_slice()).unwrap(), msg);
         }
         let member: crate::Member = serde_json::from_str(r#"{"id":"a","name":"A","os":"mac","fingerprint":"f"}"#).unwrap();
         assert!(member.can_send && member.addr.is_empty());
+    }
+    #[test]
+    fn enter_and_leave_from_2_1_have_no_display_and_are_written_without_one() {
+        let old: Msg = serde_json::from_str(r#"{"type":"Enter","data":{"side":"left","pos":0.5}}"#).unwrap();
+        assert_eq!(old, Msg::Enter { side: Side::Left, pos: 0.5, display: None });
+        let old: Msg = serde_json::from_str(r#"{"type":"Leave","data":{"pos":0.5}}"#).unwrap();
+        assert_eq!(old, Msg::Leave { pos: 0.5, display: None });
+        // A 2.1 peer parses what a 2.2 one sends without a display.
+        let json = serde_json::to_string(&Msg::Enter { side: Side::Right, pos: 0.5, display: None }).unwrap();
+        assert!(!json.contains("display"), "{json}");
+        assert!(FEATURES.contains(&"displays"));
     }
     #[test]
     fn framing() {

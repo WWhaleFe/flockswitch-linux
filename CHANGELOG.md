@@ -1,5 +1,16 @@
 # Changelog
 
+## 2.3.0 - 2026-11-27
+
+- Layout map is now 6 x 4 (was 5 x 3); saved 5 x 3 layouts keep working as they are.
+- One tile per monitor: a computer with two monitors has two tiles on the map, labelled "<name> · 1" and "<name> · 2", and another computer can be placed next to a specific monitor. The cursor crosses only at that monitor's edge and arrives on the matching monitor of the other computer. Click a monitor tile, then an empty cell, to move that one tile; a computer's missing monitors are placed automatically next to it as the monitors are arranged, and the cells of an unplugged monitor are kept for when it returns.
+- **Pause connection** switch for each paired computer (next to Unpair): no connecting, an open link is closed, links from it are refused, and the cursor never crosses to it, while the pairing and its place on the map stay. Paused computers read "Paused" and are dimmed in the list and on the map.
+- Keyboard page: a short note on what works between which systems and a **Details** guide (modifier keys, Korean/English, Caps Lock, Hanja, line/word/document moves, screen capture, what does not cross).
+- Korean/English from the other computer: Shift+Space is also a Korean/English key on every sender (added once to saved key rules, and not added back if you turn it off). A Linux receiver gets one press of the Hangul key (KEY_HANGEUL, X11 keycode 130) on X11, Wayland (EIS) and through the GNOME helper, so the Hangul key must be a toggle key in the input method: ibus-hangul has it by default, and fcitx5-hangul needs Hangul in its trigger keys.
+- Reconnecting to a Mac and other computers on the same network is more reliable (IPv6 link-local addresses keep their scope, IPv4 is tried first, shorter retry waits for computers that are found, dialing at once when a computer appears again, and the listener is recreated).
+- Updated network core (shared with macOS, Windows and Android 2.2): the new monitor and pause messages are only sent to computers that support them, so older versions keep working.
+- Keyboard page: one switch, "Switch Korean/English with Shift+Space", turns Shift+Space on or off as a Korean/English key for every direction leaving this computer. Off, Space with Shift held types a space.
+
 ## 2.2.0 - 2026-11-27
 
 - New GNOME helper extension (`flockswitch@wwhalefe.github.io`): on GNOME Wayland it reads the pointer, notices the screen edges and takes and injects this computer's mouse and keyboard from inside the compositor, so after one install and one log out and in the system no longer asks for input capture or remote control at all. Edge switching and network sharing use it automatically when it is on; without it (not installed, off, another desktop) everything works through the portals exactly as before. The extension answers only the installed flockswitch program (`~/.local/bin` or Homebrew). While this computer's input is on another computer, Ctrl+Alt+Shift+Escape here makes the extension give it back at once (emergency exit).

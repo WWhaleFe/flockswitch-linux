@@ -86,6 +86,15 @@ pub trait Platform: Send + Sync + 'static {
             self.warp(x, y);
         }
     }
+    /// Like `place_on_return`, for a computer with several monitors: `pos` runs along the
+    /// `side` edge of monitor `display` (see `geometry::sorted_displays`). The service only
+    /// calls this when there are two or more monitors; with one it calls `place_on_return`.
+    fn place_on_return_display(&self, side: Side, display: u8, pos: f64) {
+        match geometry::display_edge_position(&self.displays(), display, side, pos) {
+            Some((x, y)) => self.warp(x, y),
+            None => self.place_on_return(side, pos),
+        }
+    }
     fn start_capture(&self, sink: Sender<InputEvent>) -> anyhow::Result<()>;
     /// Optional monotonic capture time for the event being consumed, in sink order.
     /// None uses the service's current time. Queue timestamps alongside the existing
@@ -259,6 +268,9 @@ pub struct NetConfig {
     pub layout: Vec<Cell>,
     /// Key rules per OS pair ("mac>windows"). A pair missing here follows the 2.0 fields.
     pub keys: BTreeMap<String, DirRules>,
+    /// Which one-time changes to the default key rules were applied to the saved ones
+    /// (see `apply_hangul_defaults`). Apps save it with the rest.
+    pub hangul_defaults: u32,
     /// Let clipboard content pass on from one sub to another.
     pub clipboard_relay: bool,
     pub discovery: bool,
@@ -303,6 +315,7 @@ impl Default for NetConfig {
             peers: Vec::new(),
             layout: Vec::new(),
             keys: BTreeMap::new(),
+            hangul_defaults: 0,
             clipboard_relay: true,
             discovery: true,
             corner_margin: 80.0,
@@ -343,7 +356,73 @@ impl NetConfig {
     pub fn migrate_keys(&mut self) {
         self.keys = self.all_rules();
     }
+    /// One-time migration (2.2): Shift+Space becomes a Korean/English key for the saved
+    /// rules of Windows and Linux senders, which the defaults now include. Pairs the user
+    /// emptied (Korean/English switching off) and pairs that already list it are left
+    /// alone; Mac senders had it by default, so a Mac pair without it was edited by the
+    /// user. `hangul_defaults` records that it ran, so a user who turns Shift+Space off
+    /// afterwards keeps it off. Returns whether anything changed: then save the config.
+    pub fn apply_hangul_defaults(&mut self) -> bool {
+        if self.hangul_defaults >= HANGUL_DEFAULTS {
+            return false;
+        }
+        for (src, dst) in keymap::all_pairs() {
+            if src == Os::Mac {
+                continue;
+            }
+            let key = keymap::pair_key(src, dst);
+            if let Some(rules) = self.keys.get_mut(&key) {
+                if !rules.hangul_src.is_empty() && !rules.hangul_src.contains(&HangulKey::ShiftSpace) {
+                    rules.hangul_src.push(HangulKey::ShiftSpace);
+                }
+            }
+        }
+        self.hangul_defaults = HANGUL_DEFAULTS;
+        true
+    }
 }
+impl NetConfig {
+    /// Whether Shift+Space is a Korean/English key for every direction the Keyboard page
+    /// shows for a `src` computer (every other OS it can send to), saved rule or default.
+    pub fn shift_space_on(&self, src: Os) -> bool {
+        let mut any = false;
+        for (s, d) in keymap::all_pairs() {
+            if s != src {
+                continue;
+            }
+            any = true;
+            if !self.rules_for(s, d).is_some_and(|r| r.hangul_src.contains(&HangulKey::ShiftSpace)) {
+                return false;
+            }
+        }
+        any
+    }
+    /// Adds (`on`) or removes Shift+Space from the Korean/English keys of every direction
+    /// leaving `src`, writing each effective rule into `keys` and changing nothing else.
+    /// Removing the only key of a pair leaves its list empty, which means no toggle key
+    /// for that pair, the same as the user clearing it in the table. The choice is the
+    /// user's, so the one-time default migration is marked as done and never re-adds it.
+    pub fn set_shift_space(&mut self, src: Os, on: bool) {
+        if self.keys.is_empty() {
+            // The 2.0 fields stand for the untouched pairs; write them all down first.
+            self.migrate_keys();
+        }
+        for (s, d) in keymap::all_pairs() {
+            if s != src {
+                continue;
+            }
+            let Some(mut rules) = self.rules_for(s, d) else { continue };
+            rules.hangul_src.retain(|k| *k != HangulKey::ShiftSpace);
+            if on {
+                rules.hangul_src.push(HangulKey::ShiftSpace);
+            }
+            self.keys.insert(keymap::pair_key(s, d), rules);
+        }
+        self.hangul_defaults = self.hangul_defaults.max(HANGUL_DEFAULTS);
+    }
+}
+/// The version of the one-time default-key migration `apply_hangul_defaults` stands for.
+pub const HANGUL_DEFAULTS: u32 = 1;
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct PeerConfig {
@@ -363,6 +442,10 @@ pub struct PeerConfig {
     pub can_send: bool,
     /// A sub known only from its master's roster (runtime, never saved or shown as paired).
     pub via_master: bool,
+    /// This computer pauses the connection to the peer: no dialing, links closed or
+    /// refused (Bye "paused"), never a crossing target. It stays paired and keeps its cells.
+    #[serde(default)]
+    pub paused: bool,
 }
 impl Default for PeerConfig {
     fn default() -> Self {
@@ -377,6 +460,7 @@ impl Default for PeerConfig {
             role: Role::Master,
             can_send: true,
             via_master: false,
+            paused: false,
         }
     }
 }
@@ -451,6 +535,10 @@ pub struct MeStatus {
     /// Whether the master lets this computer drive the others (true without group info).
     #[serde(default = "enabled_by_default")]
     pub can_send: bool,
+    /// This computer's monitors, sorted as `geometry::sorted_displays` (a layout cell's
+    /// `display` is a position in this list).
+    #[serde(default)]
+    pub displays: Vec<Rect>,
 }
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DiscoveredStatus {
@@ -478,6 +566,12 @@ pub struct PeerStatus {
     /// The connected peer understands key rule edits (a 2.0 master silently ignores them).
     #[serde(default)]
     pub keyrules: bool,
+    /// The peer's monitors as it told us (empty: not known, treat as one).
+    #[serde(default)]
+    pub displays: Vec<Rect>,
+    /// This computer pauses the connection to the peer (`PeerConfig::paused`).
+    #[serde(default)]
+    pub paused: bool,
 }
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct StateStatus {
@@ -501,6 +595,9 @@ pub enum Request {
     PairAddr { pair_addr: String },
     Accept { accept: bool },
     Unpair { unpair: String },
+    /// `{"pause":"<id>","paused":true}`: pause or resume the connection to a paired
+    /// computer (`PeerConfig::paused`). The service saves it through `Hooks::on_peer_changed`.
+    Pause { pause: String, paused: bool },
     /// `{"action":"reconnect"}`: same as `Service::reconnect`.
     Action { action: String },
 }
@@ -715,6 +812,92 @@ mod v2_1_tests {
         assert_eq!(settings.keys.len(), 9);
         assert_eq!(sub.rules_for(Os::Mac, Os::Linux), master.rules_for(Os::Mac, Os::Linux));
         assert_eq!(sub.all_rules(), master.all_rules());
+    }
+    #[test]
+    fn pause_request_parses_and_2_1_configs_load_unpaused() {
+        let r: Request = serde_json::from_str(r#"{"pause":"x","paused":true}"#).unwrap();
+        assert_eq!(r, Request::Pause { pause: "x".into(), paused: true });
+        assert_eq!(serde_json::from_str::<Request>(r#"{"unpair":"x"}"#).unwrap(), Request::Unpair { unpair: "x".into() });
+        assert_eq!(serde_json::from_str::<Request>(r#"{"action":"reconnect"}"#).unwrap(), Request::Action { action: "reconnect".into() });
+        let p: PeerConfig = serde_json::from_str(r#"{"id":"a","side":"off"}"#).unwrap();
+        assert!(!p.paused);
+        let cfg: NetConfig = toml::from_str("[[peers]]\nid = \"a\"\nside = \"left\"\n[[layout]]\nid = \"a\"\ncol = 1\nrow = 1\n").unwrap();
+        assert!(!cfg.peers[0].paused && cfg.layout[0].display == 0 && cfg.hangul_defaults == 0);
+        let again: NetConfig = toml::from_str(&toml::to_string(&cfg).unwrap()).unwrap();
+        assert_eq!(again, cfg);
+    }
+    #[test]
+    fn status_without_displays_or_paused_still_reads() {
+        let status: Status = serde_json::from_value(serde_json::json!({
+            "running": true, "me": {"id": "t", "name": "Mac", "port": 47160, "error": null},
+            "discovered": [], "peers": [{"id": "p", "connected": true, "rtt_ms": null}],
+            "state": {"mode": "local", "peer": null}, "pairing": null
+        })).unwrap();
+        assert!(status.me.displays.is_empty() && status.peers[0].displays.is_empty() && !status.peers[0].paused);
+    }
+    #[test]
+    fn shift_space_migration_adds_it_once_and_respects_the_user() {
+        let mut cfg = NetConfig::default();
+        cfg.migrate_keys();
+        // Saved before 2.2: Windows and Linux senders list only the Hangul key.
+        for r in cfg.keys.values_mut() {
+            if r.hangul_src.contains(&HangulKey::ShiftSpace) && !r.hangul_src.contains(&HangulKey::CapsLock) {
+                r.hangul_src.retain(|k| *k != HangulKey::ShiftSpace);
+            }
+        }
+        cfg.keys.get_mut("windows>linux").unwrap().hangul_src.clear();
+        cfg.keys.get_mut("mac>linux").unwrap().hangul_src.retain(|k| *k != HangulKey::ShiftSpace);
+        assert_eq!(cfg.keys["windows>mac"].hangul_src, vec![HangulKey::Lang1]);
+        assert!(cfg.apply_hangul_defaults());
+        assert_eq!(cfg.hangul_defaults, HANGUL_DEFAULTS);
+        for key in ["windows>mac", "windows>android", "linux>mac", "linux>windows", "linux>android"] {
+            assert_eq!(cfg.keys[key].hangul_src, vec![HangulKey::Lang1, HangulKey::ShiftSpace], "{key}");
+        }
+        assert!(cfg.keys["windows>linux"].hangul_src.is_empty(), "switching turned off stays off");
+        assert!(!cfg.keys["mac>linux"].hangul_src.contains(&HangulKey::ShiftSpace), "a Mac pair the user edited is not touched");
+        // The user turns it off again: it is not added back.
+        cfg.keys.get_mut("windows>mac").unwrap().hangul_src.retain(|k| *k != HangulKey::ShiftSpace);
+        assert!(!cfg.apply_hangul_defaults());
+        assert_eq!(cfg.keys["windows>mac"].hangul_src, vec![HangulKey::Lang1]);
+        // Pairs never saved follow the new defaults without any migration.
+        let fresh = NetConfig::default();
+        assert!(fresh.rules_for(Os::Linux, Os::Windows).unwrap().hangul_src.contains(&HangulKey::ShiftSpace));
+        // ... except where the 2.0 setting switched Hangul off for a Mac receiver.
+        let off = NetConfig { lang1_on_mac: "off".into(), ..NetConfig::default() };
+        assert!(off.rules_for(Os::Windows, Os::Mac).unwrap().hangul_src.is_empty());
+    }
+    #[test]
+    fn shift_space_switch_sets_every_pair_of_a_sender() {
+        let mut cfg = NetConfig::default();
+        assert!(cfg.shift_space_on(Os::Mac) && cfg.shift_space_on(Os::Windows) && cfg.shift_space_on(Os::Linux));
+        let before = cfg.all_rules();
+        cfg.set_shift_space(Os::Windows, false);
+        assert!(!cfg.shift_space_on(Os::Windows) && cfg.shift_space_on(Os::Mac) && cfg.shift_space_on(Os::Linux));
+        for (pair, rules) in cfg.all_rules() {
+            if pair.starts_with("windows>") {
+                assert_eq!(rules.hangul_src, vec![HangulKey::Lang1], "{pair}");
+                assert_eq!(DirRules { hangul_src: before[&pair].hangul_src.clone(), ..rules.clone() }, before[&pair], "{pair}");
+            } else {
+                assert_eq!(rules, before[&pair], "{pair}");
+            }
+        }
+        // One pair turned it back on by hand: the switch reads off until all have it.
+        cfg.keys.get_mut("windows>mac").unwrap().hangul_src.push(HangulKey::ShiftSpace);
+        assert!(!cfg.shift_space_on(Os::Windows));
+        cfg.set_shift_space(Os::Windows, true);
+        assert!(cfg.shift_space_on(Os::Windows));
+        assert_eq!(cfg.all_rules(), before);
+        // A pair listing only Shift+Space ends empty (no toggle key), as if the user cleared it.
+        cfg.keys.get_mut("linux>mac").unwrap().hangul_src = vec![HangulKey::ShiftSpace];
+        cfg.set_shift_space(Os::Linux, false);
+        assert!(cfg.keys["linux>mac"].hangul_src.is_empty());
+        // The one-time migration never puts it back after the switch turned it off,
+        // even when the switch ran before the migration did.
+        let mut cfg = NetConfig::default();
+        cfg.set_shift_space(Os::Linux, false);
+        cfg.set_shift_space(Os::Windows, false);
+        assert!(!cfg.apply_hangul_defaults());
+        assert!(!cfg.shift_space_on(Os::Linux) && !cfg.shift_space_on(Os::Windows));
     }
     #[test]
     fn status_from_2_0_still_reads() {
