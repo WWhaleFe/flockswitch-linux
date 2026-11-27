@@ -7,7 +7,7 @@
 - Fixed: a computer never forgot a peer that had forgotten it (unpaired while this one was off). The "release all keys" message sent with every closing link was taken for a working session and restarted the check each time. Now two refusals ten seconds apart make it forget the peer, and the two can pair again.
 - Fixed: asking to pair again while the other side still held the pairing closed the link at once (its session messages arrived first), so no code appeared. A paired peer that receives a pair request now starts a new pairing.
 - After switching networking on, resuming a paused computer or **Find connections again**, the computer dials at once whichever side normally dials first, and drops a backoff that grew while it was off (before, this could take up to 6 to 10 seconds).
-- Fixed: a pairing asked for while an earlier link to the same address was still closing was silently dropped.
+- Fixed: a pairing asked for while an earlier link to the same address was still closing was silently dropped, and a pairing was silently cancelled when its link was replaced by the other side's automatic redial. The pairing now carries on over the new link, and is dialled again when there is none.
 
 ## 2.3.0 - 2026-11-27
 
