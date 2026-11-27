@@ -29,6 +29,8 @@ const LINK_QUEUE: usize = 256;
 const MAX_ACCEPTS_PER_IP: usize = 8;
 
 const POLL: Duration = Duration::from_millis(8);
+const CAPTURE_RETRY_MIN: Duration = Duration::from_secs(2);
+const CAPTURE_RETRY_MAX: Duration = Duration::from_secs(30);
 const HEARTBEAT: Duration = Duration::from_millis(500);
 const DEAD: Duration = Duration::from_secs(2);
 /// How long a peer paired by the service is kept against an older config snapshot from the app.
@@ -165,6 +167,8 @@ impl Service {
             last_cursor: None,
             armed: Vec::new(),
             edge_hit: None,
+            capture_block: None,
+            capture_backoff: Duration::ZERO,
             outward: false,
             started: Instant::now(),
             last_write: Instant::now() - Duration::from_secs(1),
@@ -552,6 +556,10 @@ struct Control {
     last_cursor: Option<(f64, f64)>,
     armed: Vec<Side>,
     edge_hit: Option<(Side, f64, Instant)>,
+    /// No crossing is attempted before this instant after a failed `start_capture`.
+    capture_block: Option<Instant>,
+    /// Last cooldown length: 2 s, doubling to 30 s while captures keep failing.
+    capture_backoff: Duration,
     outward: bool,
     started: Instant,
     last_write: Instant,
@@ -1809,15 +1817,33 @@ impl Control {
     }
     /// Takes control of `peer` across `side`.
     fn cross_to(&mut self, peer: String, side: Side, pos: f64) {
+        if self.capture_block.is_some_and(|t| Instant::now() < t) {
+            self.edge_hit = None;
+            self.edge_wait = None;
+            return;
+        }
         // Discard events from an earlier capture before installing the next sink.
         while self.captured.try_recv().is_ok() {}
         if let Err(e) = self.platform.start_capture(self.capture.clone()) {
             self.edge_hit = None;
             self.edge_wait = None;
             self.platform.stop_capture();
-            self.status.lock().unwrap().me.error = Some(e.to_string());
+            self.capture_backoff = if self.capture_backoff.is_zero() {
+                CAPTURE_RETRY_MIN
+            } else {
+                (self.capture_backoff * 2).min(CAPTURE_RETRY_MAX)
+            };
+            self.capture_block = Some(Instant::now() + self.capture_backoff);
+            self.status.lock().unwrap().me.error = Some(format!(
+                "Cannot capture input to cross to the next screen ({e}). Retrying in {} s.",
+                self.capture_backoff.as_secs()
+            ));
             return;
         }
+        if self.capture_block.take().is_some() {
+            self.status.lock().unwrap().me.error = None;
+        }
+        self.capture_backoff = Duration::ZERO;
         self.edge_hit = None;
         self.edge_wait = None;
         self.send_clipboard(&peer);
@@ -1911,6 +1937,9 @@ impl Control {
             State::Local => {
                 let Some(side) = edge else {
                     self.edge_wait = None;
+                    if self.capture_block.is_some_and(|t| Instant::now() >= t) {
+                        self.capture_backoff = Duration::ZERO;
+                    }
                     return;
                 };
                 let Some(peer) = self.neighbour_peer(side) else {
@@ -2752,6 +2781,8 @@ mod tests {
         files: Mutex<Vec<std::path::PathBuf>>,
         image: Mutex<Option<Vec<u8>>>,
         stopped: AtomicUsize,
+        capture_fail: AtomicUsize,
+        capture_calls: AtomicUsize,
         mac: AtomicBool,
         android: AtomicBool,
         on_files: Mutex<Option<Box<dyn Fn() + Send>>>,
@@ -2764,7 +2795,17 @@ mod tests {
         fn displays(&self) -> Vec<Rect> { vec![Rect::new(0.0, 0.0, 100.0, 100.0)] }
         fn cursor(&self) -> Option<(f64, f64)> { Some((50.0, 50.0)) }
         fn warp(&self, _: f64, _: f64) {}
-        fn start_capture(&self, _: Sender<InputEvent>) -> Result<()> { Ok(()) }
+        fn start_capture(&self, _: Sender<InputEvent>) -> Result<()> {
+            self.capture_calls.fetch_add(1, Ordering::Relaxed);
+            let mut n = self.capture_fail.load(Ordering::Relaxed);
+            while n > 0 {
+                match self.capture_fail.compare_exchange(n, n - 1, Ordering::Relaxed, Ordering::Relaxed) {
+                    Ok(_) => { anyhow::bail!("tap denied"); }
+                    Err(now) => n = now,
+                }
+            }
+            Ok(())
+        }
         fn stop_capture(&self) { self.stopped.fetch_add(1, Ordering::Relaxed); }
         fn inject(&self, event: &InputEvent) { self.injected.lock().unwrap().push(event.clone()); }
         fn ready(&self) -> Result<(), String> { Ok(()) }
@@ -2878,6 +2919,8 @@ mod tests {
             last_cursor: None,
             armed: Vec::new(),
             edge_hit: None,
+            capture_block: None,
+            capture_backoff: Duration::ZERO,
             outward: false,
             started: Instant::now(),
             last_write: Instant::now() - Duration::from_secs(1),
@@ -2937,6 +2980,63 @@ mod tests {
         }
         assert_eq!(pace.0.len(), 1024);
         assert!(pace.allow(b, now + DEAD * 2));
+    }
+
+    #[test]
+    fn failed_capture_backs_off_and_recovers_for_every_neighbour() {
+        let mut r = rig(Role::Master);
+        r.c.config.peers.push(peer(SUB, Role::Sub));
+        r.c.config.peers.push(peer(OTHER, Role::Sub));
+        let _rx = link(&mut r.c, SUB, Role::Sub);
+        r.p.capture_fail.store(3, Ordering::Relaxed);
+        let calls = || r.p.capture_calls.load(Ordering::Relaxed);
+        let error = |c: &Control| c.status.lock().unwrap().me.error.clone();
+        // A storm of attempts inside the cooldown reaches the platform once.
+        for _ in 0..100 { r.c.cross_to(SUB.into(), Side::Right, 0.5); }
+        assert_eq!(calls(), 1);
+        assert!(error(&r.c).unwrap().contains("tap denied"));
+        assert!(matches!(r.c.state, State::Local));
+        // A different neighbour obeys the same cooldown.
+        r.c.cross_to(OTHER.into(), Side::Left, 0.5);
+        assert_eq!(calls(), 1);
+        // The cooldown doubles while it keeps failing, capped at 30 s.
+        let mut expect = [4, 8, 16, 30, 30].into_iter();
+        r.c.capture_block = Some(Instant::now());
+        r.c.cross_to(SUB.into(), Side::Right, 0.5);
+        assert_eq!(calls(), 2);
+        assert_eq!(r.c.capture_backoff, Duration::from_secs(expect.next().unwrap()));
+        r.c.capture_block = Some(Instant::now());
+        r.c.cross_to(OTHER.into(), Side::Left, 0.5);
+        assert_eq!(calls(), 3);
+        assert_eq!(r.c.capture_backoff, Duration::from_secs(expect.next().unwrap()));
+        assert!(error(&r.c).is_some());
+        // The next attempt succeeds: the error clears and the backoff resets.
+        r.c.capture_block = Some(Instant::now());
+        r.c.cross_to(SUB.into(), Side::Right, 0.5);
+        assert_eq!(calls(), 4);
+        assert!(matches!(r.c.state, State::Controlling { .. }));
+        assert_eq!(error(&r.c), None);
+        assert_eq!(r.c.capture_backoff, Duration::ZERO);
+        assert!(r.c.capture_block.is_none());
+    }
+
+    #[test]
+    fn capture_backoff_is_capped_and_resets_when_the_cursor_leaves_the_edge() {
+        let mut r = rig(Role::Master);
+        r.c.config.peers.push(peer(SUB, Role::Sub));
+        r.p.capture_fail.store(usize::MAX, Ordering::Relaxed);
+        for _ in 0..8 {
+            r.c.capture_block = Some(Instant::now());
+            r.c.cross_to(SUB.into(), Side::Right, 0.5);
+        }
+        assert_eq!(r.c.capture_backoff, Duration::from_secs(30));
+        // Cursor away from any edge after the cooldown: the next failure starts at 2 s again.
+        r.c.capture_block = Some(Instant::now());
+        r.c.poll_cursor();
+        assert_eq!(r.c.capture_backoff, Duration::ZERO);
+        r.c.cross_to(SUB.into(), Side::Right, 0.5);
+        assert_eq!(r.c.capture_backoff, Duration::from_secs(2));
+        assert!(r.c.status.lock().unwrap().me.error.is_some());
     }
 
     #[test]
