@@ -4,6 +4,69 @@ use flock_net::{NetConfig, Role};
 use serde_json::{json, Value};
 use std::path::PathBuf;
 
+/// Apply the settings received from the master.
+pub fn apply_master_settings(config: &mut Config, settings: &flock_net::MasterSettings) {
+    settings.apply_to(&mut config.network);
+    if let Some(pending) = &config.pending_key_rules {
+        // The master echoes its whole table: only the pairs we sent must match.
+        if pending.iter().all(|(pair, rule)| settings.keys.get(pair) == Some(rule)) {
+            config.pending_key_rules = None;
+        } else {
+            // An older response must not consume a newer edit, or replace it locally.
+            config.network.keys.extend(pending.clone());
+        }
+    }
+    apply_app_settings(config, &settings.app);
+}
+
+/// The name to show for the computer `id`: the live status (also for a sub known only
+/// through the master), else the configured peer name. None when neither has one.
+pub fn peer_name(net: &NetConfig, status: Option<&flock_net::Status>, id: &str) -> Option<String> {
+    status
+        .and_then(|s| s.peers.iter().find(|p| p.id == id))
+        .map(|p| p.name.clone())
+        .filter(|n| !n.is_empty())
+        .or_else(|| net.peers.iter().find(|p| p.id == id).map(|p| p.name.clone()).filter(|n| !n.is_empty()))
+}
+
+/// Whether the cursor can cross over `side` now: this computer may send, is in control,
+/// and a connected, paired computer sits on that side of the layout (a master's sub or,
+/// on a sub, another sub).
+pub fn side_ready(status: &flock_net::Status, side: flock_net::Side) -> bool {
+    let next = flock_net::layout::neighbour(&status.layout, &status.me.id, side);
+    status.running
+        && status.me.can_send
+        && status.state.mode == "local"
+        && next.is_some_and(|id| status.peers.iter().any(|s| s.id == id && s.connected))
+}
+
+/// The master unpaired or was unpaired: forget the computer `id` and, when no master is
+/// left to receive them, the key rule edits waiting for it.
+pub fn forget_peer(config: &mut Config, id: &str) {
+    config.network.peers.retain(|p| p.id != id);
+    config.network.layout.retain(|cell| cell.id != id);
+    if keys_undeliverable(config, None) {
+        config.pending_key_rules = None;
+    }
+}
+
+/// Whether pending key rule edits can never be delivered and must go: this is not a sub
+/// with a master any more, or the connected master is a 2.0 one that ignores them.
+pub fn keys_undeliverable(config: &Config, status: Option<&flock_net::Status>) -> bool {
+    let Some(master) = config.network.peers.iter().find(|p| p.role == Role::Master) else { return true };
+    config.network.role != Role::Sub
+        || status.is_some_and(|s| s.peers.iter().any(|p| p.id == master.id && p.connected && !p.keyrules))
+}
+
+/// The whole pixels to move for `delta`, with the fraction kept in `rest` for the next
+/// event: an X11 pointer sits on whole pixels, so slow motion would otherwise be lost.
+pub fn whole_pixels(rest: &mut f64, delta: f64) -> f64 {
+    let total = *rest + delta;
+    let whole = total.trunc();
+    *rest = total - whole;
+    whole
+}
+
 pub fn runtime_config(full: &Config, wayland: bool, config_dir: PathBuf) -> NetConfig {
     let mut config = full.network.clone();
     config.config_dir = config_dir;
@@ -14,6 +77,54 @@ pub fn runtime_config(full: &Config, wayland: bool, config_dir: PathBuf) -> NetC
         config.app_settings = app_settings(full);
     }
     config
+}
+
+#[cfg(test)]
+mod delivery_tests {
+    use super::*;
+
+    #[test]
+    fn offline_edit_survives_old_master_settings_and_restart() {
+        let mut sub = Config::default();
+        sub.network.role = Role::Sub;
+        let old = flock_net::MasterSettings::of(&sub.network, "master");
+        sub.network.keys = sub.network.all_rules();
+        sub.network.keys.get_mut("linux>mac").unwrap().capture = false;
+        sub.pending_key_rules = Some([("linux>mac".to_string(), sub.network.keys["linux>mac"].clone())].into());
+        let mut sub = Config::parse(&sub.to_text().unwrap()).unwrap();
+        apply_master_settings(&mut sub, &old);
+        assert!(!sub.network.keys["linux>mac"].capture);
+        assert!(sub.pending_key_rules.is_some());
+        let ack = flock_net::MasterSettings::of(&sub.network, "master");
+        apply_master_settings(&mut sub, &ack);
+        assert!(sub.pending_key_rules.is_none());
+    }
+
+    #[test]
+    fn old_ack_does_not_delete_a_newer_edit() {
+        let mut sub = Config::default();
+        sub.network.keys = sub.network.all_rules();
+        sub.network.keys.get_mut("linux>mac").unwrap().capture = false;
+        let old_ack = flock_net::MasterSettings::of(&sub.network, "master");
+        sub.network.keys.get_mut("mac>linux").unwrap().capture = false;
+        sub.pending_key_rules = Some([("mac>linux".to_string(), sub.network.keys["mac>linux"].clone())].into());
+        apply_master_settings(&mut sub, &old_ack);
+        assert!(sub.pending_key_rules.is_some());
+        assert!(!sub.network.keys["mac>linux"].capture);
+    }
+
+    #[test]
+    fn only_the_pending_pairs_are_checked_against_the_echo() {
+        let mut sub = Config::default();
+        sub.network.keys = sub.network.all_rules();
+        sub.network.keys.get_mut("linux>mac").unwrap().capture = false;
+        sub.pending_key_rules = Some([("linux>mac".to_string(), sub.network.keys["linux>mac"].clone())].into());
+        let mut echo = flock_net::MasterSettings::of(&sub.network, "master");
+        let other = echo.keys.get_mut("mac>windows").unwrap();
+        other.capture = !other.capture;
+        apply_master_settings(&mut sub, &echo);
+        assert!(sub.pending_key_rules.is_none());
+    }
 }
 
 /// The effect settings a master hands to its subs: the countdown look and the cursor
@@ -77,7 +188,7 @@ impl NetState {
         };
         let name = || {
             let id = status.state.peer.as_deref().unwrap_or_default();
-            config.network.peers.iter().find(|p| p.id == id).map_or_else(|| id.to_string(), |p| p.name.clone())
+            peer_name(&config.network, Some(status), id).unwrap_or_else(|| id.to_string())
         };
         match status.state.mode.as_str() {
             "controlling" => NetState::Controlling(name()),
@@ -103,6 +214,18 @@ impl NetState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn slow_motion_adds_up_to_whole_pixels() {
+        let mut rest = 0.0;
+        let moved: f64 = (0..12).map(|_| whole_pixels(&mut rest, 0.25)).sum();
+        assert_eq!(moved, 3.0);
+        let mut rest = 0.0;
+        let moved: f64 = (0..12).map(|_| whole_pixels(&mut rest, -0.25)).sum();
+        assert_eq!(moved, -3.0);
+        let mut rest = 0.5;
+        assert_eq!(whole_pixels(&mut rest, 1.75), 2.0);
+        assert_eq!(rest, 0.25);
+    }
     #[test]
     fn effect_settings_follow_the_master() {
         let mut master = Config::default();
@@ -144,13 +267,16 @@ mod tests {
         config.network.peers.push(flock_net::PeerConfig { id: "p1".into(), name: "Laptop".into(), ..Default::default() });
         let status = |mode: &str, peer: Option<&str>| flock_net::Status {
             running: true,
-            me: flock_net::MeStatus { id: String::new(), name: String::new(), port: 0, error: None },
+            me: flock_net::MeStatus { id: String::new(), name: String::new(), port: 0, error: None, can_send: true },
             discovered: vec![],
             peers: vec![],
             state: flock_net::StateStatus { mode: mode.into(), peer: peer.map(Into::into) },
             pairing: None,
             transfer: None,
             following: None,
+            layout: vec![],
+            reconnecting: false,
+            keys: Default::default(),
         };
         assert_eq!(NetState::of(&config, None), NetState::Off);
         assert_eq!(NetState::of(&config, Some(&status("local", None))), NetState::Idle);
@@ -158,6 +284,84 @@ mod tests {
         assert_eq!(NetState::of(&config, Some(&status("controlled", Some("p1")))), NetState::Controlled("Laptop".into()));
         config.network.on = false;
         assert_eq!(NetState::of(&config, Some(&status("local", None))), NetState::Off);
+    }
+
+    fn peer_status(id: &str, name: &str, connected: bool, keyrules: bool) -> flock_net::PeerStatus {
+        flock_net::PeerStatus { id: id.into(), name: name.into(), os: None, connected, rtt_ms: None, can_send: true, via_master: true, keyrules }
+    }
+    fn live(peers: Vec<flock_net::PeerStatus>, mode: &str, peer: Option<&str>) -> flock_net::Status {
+        flock_net::Status {
+            running: true,
+            me: flock_net::MeStatus { id: "me".into(), name: String::new(), port: 0, error: None, can_send: true },
+            discovered: vec![],
+            peers,
+            state: flock_net::StateStatus { mode: mode.into(), peer: peer.map(Into::into) },
+            pairing: None,
+            transfer: None,
+            following: None,
+            layout: vec![
+                flock_net::Cell { id: "me".into(), col: 1, row: 1 },
+                flock_net::Cell { id: "p2".into(), col: 2, row: 1 },
+            ],
+            reconnecting: false,
+            keys: Default::default(),
+        }
+    }
+
+    #[test]
+    fn names_come_from_the_roster_before_the_config_before_the_id() {
+        let mut config = Config::default();
+        config.network.on = true;
+        config.network.notice_accepted = true;
+        config.network.peers.push(flock_net::PeerConfig { id: "p1".into(), name: "Laptop".into(), ..Default::default() });
+        let status = live(vec![peer_status("p1", "Renamed", true, true), peer_status("p2", "Desk", true, true), peer_status("p3", "", true, true)], "controlling", Some("p2"));
+        assert_eq!(NetState::of(&config, Some(&status)), NetState::Controlling("Desk".into()));
+        assert_eq!(peer_name(&config.network, Some(&status), "p1").as_deref(), Some("Renamed"));
+        assert_eq!(peer_name(&config.network, Some(&status), "p3"), None);
+        assert_eq!(peer_name(&config.network, None, "p1").as_deref(), Some("Laptop"));
+        let unknown = live(vec![], "controlled", Some("zz"));
+        assert_eq!(NetState::of(&config, Some(&unknown)), NetState::Controlled("zz".into()));
+    }
+
+    #[test]
+    fn crossing_needs_the_right_to_send_and_a_live_neighbour() {
+        let mut status = live(vec![peer_status("p2", "Desk", true, true)], "local", None);
+        assert!(side_ready(&status, flock_net::Side::Right));
+        assert!(!side_ready(&status, flock_net::Side::Left));
+        status.me.can_send = false;
+        assert!(!side_ready(&status, flock_net::Side::Right));
+        status.me.can_send = true;
+        status.peers[0].connected = false;
+        assert!(!side_ready(&status, flock_net::Side::Right));
+    }
+
+    #[test]
+    fn unpairing_drops_the_peer_its_cell_and_the_edits_waiting_for_the_master() {
+        let mut sub = Config::default();
+        sub.network.role = Role::Sub;
+        sub.network.peers.push(flock_net::PeerConfig { id: "master".into(), role: Role::Master, ..Default::default() });
+        sub.network.peers.push(flock_net::PeerConfig { id: "other".into(), role: Role::Sub, ..Default::default() });
+        sub.network.layout.push(flock_net::Cell { id: "master".into(), col: 0, row: 0 });
+        sub.network.layout.push(flock_net::Cell { id: "other".into(), col: 1, row: 0 });
+        sub.pending_key_rules = Some(sub.network.all_rules());
+        forget_peer(&mut sub, "other");
+        assert!(sub.pending_key_rules.is_some() && sub.network.layout.len() == 1);
+        forget_peer(&mut sub, "master");
+        assert!(sub.pending_key_rules.is_none() && sub.network.peers.is_empty() && sub.network.layout.is_empty());
+    }
+
+    #[test]
+    fn edits_are_undeliverable_for_a_non_sub_or_a_keyrules_less_master() {
+        let mut sub = Config::default();
+        sub.network.role = Role::Sub;
+        assert!(keys_undeliverable(&sub, None));
+        sub.network.peers.push(flock_net::PeerConfig { id: "m".into(), role: Role::Master, ..Default::default() });
+        assert!(!keys_undeliverable(&sub, None));
+        assert!(!keys_undeliverable(&sub, Some(&live(vec![peer_status("m", "M", true, true)], "local", None))));
+        assert!(!keys_undeliverable(&sub, Some(&live(vec![peer_status("m", "M", false, false)], "local", None))));
+        assert!(keys_undeliverable(&sub, Some(&live(vec![peer_status("m", "M", true, false)], "local", None))));
+        sub.network.role = Role::Master;
+        assert!(keys_undeliverable(&sub, None));
     }
 }
 

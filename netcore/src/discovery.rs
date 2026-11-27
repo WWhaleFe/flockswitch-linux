@@ -73,14 +73,18 @@ impl Discovery {
             }
         }
     }
+    /// Starts the browse again now, to hear from every live peer again.
+    pub fn rebrowse(&mut self) {
+        self.browsed = Instant::now();
+        let _ = self.daemon.stop_browse(SERVICE_TYPE);
+        match self.daemon.browse(SERVICE_TYPE) {
+            Ok(events) => self.events = events,
+            Err(e) => log::warn!("mDNS browse: {e}"),
+        }
+    }
     pub fn poll(&mut self) -> Vec<DiscoveredPeer> {
         if self.browsed.elapsed() >= REBROWSE {
-            self.browsed = Instant::now();
-            let _ = self.daemon.stop_browse(SERVICE_TYPE);
-            match self.daemon.browse(SERVICE_TYPE) {
-                Ok(events) => self.events = events,
-                Err(e) => log::warn!("mDNS browse: {e}"),
-            }
+            self.rebrowse();
         }
         while let Ok(event) = self.monitor.try_recv() {
             if let DaemonEvent::Error(error) = event {

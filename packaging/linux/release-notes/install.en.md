@@ -23,10 +23,26 @@ Downloads the file for this computer (x86_64 or arm64), checks it against SHA256
 ### Homebrew
 
 ```sh
+# Install
 brew install --formula wwhalefe/tap/flockswitch && flockswitch setup
+
+# Upgrade
+brew update && brew upgrade --formula wwhalefe/tap/flockswitch
+
+# Uninstall (removes settings and pairings, then the Homebrew package)
+flockswitch uninstall && brew uninstall --formula wwhalefe/tap/flockswitch
 ```
 
-`flockswitch setup` also adds the app menu entry; then start flockswitch from the app menu. Upgrade (or Settings → General → **Update now**, which runs it after you approve): `brew update && brew upgrade --formula wwhalefe/tap/flockswitch`. Uninstall: `flockswitch uninstall && brew uninstall --formula wwhalefe/tap/flockswitch`. No Homebrew yet? The one line above needs none (Homebrew itself: [brew.sh](https://brew.sh)).
+`flockswitch setup` also adds the app menu entry; then start flockswitch from the app menu. Upgrade (or Settings → General → **Update now**, which runs it after you approve): `brew update && brew upgrade --formula wwhalefe/tap/flockswitch`. No Homebrew yet? The one line above needs none (Homebrew itself: [brew.sh](https://brew.sh)).
+
+### Uninstall (installed without Homebrew)
+
+```sh
+flockswitch quit; flockswitch uninstall     # settings, pairings, start at login
+rm -f ~/.local/bin/flockswitch ~/.local/share/applications/flockswitch.desktop
+rm -rf ~/.local/share/flockswitch
+sudo rm -f /etc/udev/rules.d/70-flockswitch.rules   # device permission rule (optional)
+```
 
 ### Install by hand
 

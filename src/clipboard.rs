@@ -66,20 +66,35 @@ pub fn decode_png(data: &[u8]) -> Option<(usize, usize, Vec<u8>)> {
     decoder.set_transformations(png::Transformations::EXPAND | png::Transformations::ALPHA | png::Transformations::STRIP_16);
     let mut reader = decoder.read_info().ok()?;
     let (w, h) = (reader.info().width as usize, reader.info().height as usize);
-    rgba_len(w, h)?;
+    let rgba_size = rgba_len(w, h)?;
     let size = reader.output_buffer_size()?;
     if size > MAX_BYTES { return None; }
-    let mut buf = vec![0; size];
+    // Decode and expand in one allocation. In particular grayscale+alpha needs
+    // at most the final RGBA size, rather than keeping both full images alive.
+    let mut buf = vec![0; size.max(rgba_size)];
     let info = reader.next_frame(&mut buf).ok()?;
-    buf.truncate(info.buffer_size());
-    let rgba = match (info.color_type, info.bit_depth) {
-        (png::ColorType::Rgba, png::BitDepth::Eight) => buf,
-        (png::ColorType::Rgb, png::BitDepth::Eight) => buf.chunks_exact(3).flat_map(|p| [p[0], p[1], p[2], 255]).collect(),
-        (png::ColorType::GrayscaleAlpha, png::BitDepth::Eight) => buf.chunks_exact(2).flat_map(|p| [p[0], p[0], p[0], p[1]]).collect(),
-        (png::ColorType::Grayscale, png::BitDepth::Eight) => buf.iter().flat_map(|&g| [g, g, g, 255]).collect(),
+    if info.bit_depth != png::BitDepth::Eight { return None; }
+    let channels = match info.color_type {
+        png::ColorType::Rgba => 4,
+        png::ColorType::Rgb => 3,
+        png::ColorType::GrayscaleAlpha => 2,
+        png::ColorType::Grayscale => 1,
         _ => return None,
     };
-    Some((w, h, rgba))
+    if info.buffer_size() != w * h * channels { return None; }
+    if channels != 4 {
+        for pixel in (0..w * h).rev() {
+            let at = pixel * channels;
+            let rgba = match channels {
+                3 => [buf[at], buf[at + 1], buf[at + 2], 255],
+                2 => [buf[at], buf[at], buf[at], buf[at + 1]],
+                _ => [buf[at], buf[at], buf[at], 255],
+            };
+            buf[pixel * 4..pixel * 4 + 4].copy_from_slice(&rgba);
+        }
+    }
+    buf.truncate(rgba_size);
+    Some((w, h, buf))
 }
 
 #[cfg(test)]
@@ -95,5 +110,20 @@ mod tests {
         assert!(encode_png(0, 2, &[]).is_none());
         assert!(encode_png(1, 1, &[0; 3]).is_none());
         assert!(rgba_len(10000, 10000).is_none());
+    }
+
+    #[test] fn png_expands_channels_without_overwriting_unread_pixels() {
+        for (color, pixels, rgba) in [
+            (png::ColorType::Rgb, vec![1, 2, 3, 4, 5, 6], vec![1, 2, 3, 255, 4, 5, 6, 255]),
+            (png::ColorType::GrayscaleAlpha, vec![10, 20, 30, 40], vec![10, 10, 10, 20, 30, 30, 30, 40]),
+            (png::ColorType::Grayscale, vec![50, 60], vec![50, 50, 50, 255, 60, 60, 60, 255]),
+        ] {
+            let mut png = Vec::new();
+            let mut encoder = png::Encoder::new(&mut png, 2, 1);
+            encoder.set_color(color);
+            encoder.set_depth(png::BitDepth::Eight);
+            encoder.write_header().unwrap().write_image_data(&pixels).unwrap();
+            assert_eq!(decode_png(&png), Some((2, 1, rgba)));
+        }
     }
 }

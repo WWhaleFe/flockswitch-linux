@@ -10,6 +10,8 @@ use std::{
     time::Duration,
 };
 use x11_dl::{xinput2 as xi, xlib, xtest};
+use rustix::event::{eventfd, poll, EventfdFlags, PollFd, PollFlags};
+use std::{os::fd::{BorrowedFd, OwnedFd}, sync::Arc};
 
 enum Command {
     Capture(Sender<InputEvent>, Sender<Result<(), String>>),
@@ -38,14 +40,18 @@ pub fn probe() -> Result<(), String> {
 pub struct X11 {
     clipboard: crate::clipboard::Clipboard,
     commands: Sender<Command>,
+    wake: Arc<OwnedFd>,
     worker: Mutex<Option<JoinHandle<()>>>,
 }
 impl X11 {
     pub fn new() -> anyhow::Result<Self> {
         let (commands, rx) = mpsc::channel();
         let (ready, initialized) = mpsc::sync_channel(1);
+        let wake = Arc::new(eventfd(0, EventfdFlags::CLOEXEC | EventfdFlags::NONBLOCK)?);
+        let worker_wake = wake.clone();
         let worker = thread::Builder::new()
             .name("network-x11".into())
+            .stack_size(256 * 1024)
             .spawn(move || unsafe {
                 let result = (|| -> anyhow::Result<_> {
                     let x = xlib::Xlib::open()?;
@@ -70,7 +76,7 @@ impl X11 {
                     }
                 };
                 let root = (x.XDefaultRootWindow)(d);
-                let raw = xi::XInput2::open().ok().and_then(|input| {
+                let mut raw = xi::XInput2::open().ok().and_then(|input| {
                     let (mut opcode, mut event, mut error) = (0, 0, 0);
                     if (x.XQueryExtension)(
                         d,
@@ -86,18 +92,25 @@ impl X11 {
                     if (input.XIQueryVersion)(d, &mut major, &mut minor) != xlib::Success as i32 {
                         return None;
                     }
-                    let mut bits = [0u8; 4];
-                    xi::XISetMask(&mut bits, xi::XI_RawMotion);
-                    let mut mask = xi::XIEventMask {
-                        deviceid: xi::XIAllMasterDevices,
-                        mask_len: bits.len() as i32,
-                        mask: bits.as_mut_ptr(),
-                    };
-                    if (input.XISelectEvents)(d, root, &mut mask, 1) != xlib::Success as i32 {
-                        return None;
-                    }
                     Some((input, opcode))
                 });
+                // Raw motion is wanted only while capturing: selected on grab, cleared on
+                // release, so moving the local mouse does not wake this thread when idle.
+                let select_raw = |raw: &Option<(xi::XInput2, i32)>, on: bool| -> bool {
+                    raw.as_ref().is_none_or(|(input, _)| {
+                        let mut bits = [0u8; 4];
+                        if on {
+                            xi::XISetMask(&mut bits, xi::XI_RawMotion);
+                        }
+                        let mut mask = xi::XIEventMask {
+                            deviceid: xi::XIAllMasterDevices,
+                            mask_len: bits.len() as i32,
+                            mask: bits.as_mut_ptr(),
+                        };
+                        (input.XISelectEvents)(d, root, &mut mask, 1) == xlib::Success as i32
+                    })
+                };
+                let mut motion_rest = (0.0, 0.0);
                 let screen = (x.XDefaultScreen)(d);
                 let park = (
                     (x.XDisplayWidth)(d, screen) / 2,
@@ -113,6 +126,10 @@ impl X11 {
                 let mut scroll = (0.0, 0.0);
                 let mut running = true;
                 while running {
+                    // Clear before draining commands: a concurrent send either joins
+                    // this batch or leaves the fd readable for the next iteration.
+                    let mut count = [0u8; 8];
+                    let _ = rustix::io::read(&*worker_wake, &mut count);
                     for command in rx.try_iter() {
                         match command {
                             Command::Capture(sender, ack) => {
@@ -163,12 +180,17 @@ impl X11 {
                                             }
                                         }
                                     }
+                                    // Without raw motion the plain pointer events are used.
+                                    if !select_raw(&raw, true) {
+                                        raw = None;
+                                    }
                                     sink = Some(sender);
                                     let _ = ack.send(Ok(()));
                                 }
                             }
                             Command::Stop(ack) => {
                                 sink = None;
+                                select_raw(&raw, false);
                                 (x.XUngrabPointer)(d, xlib::CurrentTime);
                                 (x.XUngrabKeyboard)(d, xlib::CurrentTime);
                                 (x.XSync)(d, 0);
@@ -183,10 +205,13 @@ impl X11 {
                                     InputEvent::Motion { dx, dy } => {
                                         if let Some((px, py)) = crate::edge::platform::cursor() {
                                             let displays = displays();
+                                            // Whole pixels only; the fraction waits for the next event.
+                                            let wx = crate::net_logic::whole_pixels(&mut motion_rest.0, dx);
+                                            let wy = crate::net_logic::whole_pixels(&mut motion_rest.1, dy);
                                             if let Some((px, py)) = flock_net::geometry::clamp(
                                                 &displays,
-                                                px + dx,
-                                                py + dy,
+                                                px + wx,
+                                                py + wy,
                                             ) {
                                                 (test.XTestFakeMotionEvent)(
                                                     d, -1, px as i32, py as i32, 0,
@@ -309,7 +334,19 @@ impl X11 {
                         }
                     }
                     (x.XFlush)(d);
-                    thread::sleep(Duration::from_millis(2));
+                    if running && (x.XPending)(d) == 0 {
+                        // Safety: the X connection owns this fd until XCloseDisplay
+                        // below. Commands and X events both wake the same poll.
+                        let display_fd = BorrowedFd::borrow_raw((x.XConnectionNumber)(d));
+                        let mut fds = [PollFd::new(&display_fd, PollFlags::IN), PollFd::new(&*worker_wake, PollFlags::IN)];
+                        match poll(&mut fds, None) {
+                            Ok(_) | Err(rustix::io::Errno::INTR) => {}
+                            Err(e) => {
+                                log::warn!("network: X11 event wait failed: {e}");
+                                break;
+                            }
+                        }
+                    }
                 }
                 (x.XUngrabPointer)(d, xlib::CurrentTime);
                 (x.XUngrabKeyboard)(d, xlib::CurrentTime);
@@ -320,8 +357,20 @@ impl X11 {
         Ok(Self {
             clipboard: crate::clipboard::Clipboard::default(),
             commands,
+            wake,
             worker: Mutex::new(Some(worker)),
         })
+    }
+
+    fn send(&self, command: Command) -> anyhow::Result<()> {
+        self.commands.send(command)?;
+        loop {
+            match rustix::io::write(&*self.wake, &1u64.to_ne_bytes()) {
+                Ok(_) | Err(rustix::io::Errno::AGAIN) => return Ok(()),
+                Err(rustix::io::Errno::INTR) => continue,
+                Err(e) => return Err(e.into()),
+            }
+        }
     }
 }
 fn displays() -> Vec<Rect> {
@@ -337,7 +386,7 @@ impl Platform for X11 {
     fn set_clipboard_files(&self, files: &[std::path::PathBuf]) { self.clipboard.set_files(files); }
     fn clipboard_image_png(&self) -> Option<Vec<u8>> { self.clipboard.image() }
     fn set_clipboard_image_png(&self, png: &[u8]) { self.clipboard.set_image(png); }
-    fn received_dir(&self) -> Option<std::path::PathBuf> { Some(dirs::download_dir()?.join("flockswitch")) }
+    fn received_dir(&self) -> Option<std::path::PathBuf> { crate::net::received_dir() }
     fn os(&self) -> Os {
         Os::Linux
     }
@@ -360,23 +409,23 @@ impl Platform for X11 {
     fn start_capture(&self, sink: Sender<InputEvent>) -> anyhow::Result<()> {
         anyhow::ensure!(crate::net::network_edges_allowed(), "Network edges are paused");
         let (ack, done) = mpsc::channel();
-        self.commands.send(Command::Capture(sink, ack))?;
+        self.send(Command::Capture(sink, ack))?;
         done.recv_timeout(Duration::from_secs(2))?
             .map_err(anyhow::Error::msg)
     }
     fn stop_capture(&self) {
         let (ack, done) = mpsc::channel();
-        if self.commands.send(Command::Stop(ack)).is_ok() {
+        if self.send(Command::Stop(ack)).is_ok() {
             let _ = done.recv_timeout(Duration::from_secs(2));
         }
     }
     fn inject(&self, event: &InputEvent) {
-        let _ = self.commands.send(Command::Inject(event.clone()));
+        let _ = self.send(Command::Inject(event.clone()));
     }
 }
 impl Drop for X11 {
     fn drop(&mut self) {
-        let _ = self.commands.send(Command::Quit);
+        let _ = self.send(Command::Quit);
         if let Some(h) = self.worker.lock().unwrap().take() {
             let _ = h.join();
         }
@@ -388,6 +437,29 @@ impl Drop for X11 {
 mod smoke_tests {
     use super::*;
     use std::{path::PathBuf, sync::Once, time::Instant};
+
+    #[test]
+    fn commands_wake_an_idle_worker_without_x_events() {
+        let (commands, received) = mpsc::channel();
+        let wake = Arc::new(eventfd(0, EventfdFlags::CLOEXEC | EventfdFlags::NONBLOCK).unwrap());
+        let worker_wake = wake.clone();
+        let (done, completed) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            let mut fds = [PollFd::new(&*worker_wake, PollFlags::IN)];
+            poll(&mut fds, None).unwrap();
+            assert!(matches!(received.recv().unwrap(), Command::Quit));
+            done.send(()).unwrap();
+        });
+        let platform = X11 {
+            clipboard: crate::clipboard::Clipboard::default(),
+            commands,
+            wake,
+            worker: Mutex::new(None),
+        };
+        platform.send(Command::Quit).unwrap();
+        completed.recv_timeout(Duration::from_secs(2)).unwrap();
+        worker.join().unwrap();
+    }
 
     fn platform() -> X11 {
         static INIT: Once = Once::new();

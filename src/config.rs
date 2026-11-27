@@ -765,6 +765,9 @@ fn button_by_name(name: &str) -> Option<u16> {
 #[serde(default)]
 pub struct Config {
     pub network: flock_net::NetConfig,
+    /// Durable outbox for a sub's edits. Cleared only by matching master settings.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pending_key_rules: Option<std::collections::BTreeMap<String, flock_net::DirRules>>,
     /// Master switch. When false the buttons are left alone.
     pub enabled: bool,
     /// Which device carries the trigger buttons: "auto" (first mouse that has them),
@@ -856,6 +859,7 @@ impl Default for Config {
     fn default() -> Self {
         Config {
             network: flock_net::NetConfig::default(),
+            pending_key_rules: None,
             enabled: true,
             trigger_device: "auto".into(),
             follow: vec!["all".into()],
@@ -963,6 +967,7 @@ impl Config {
     /// Loads the config, writing the defaults on first run so users have a file to edit.
     pub fn load_or_create() -> Result<Config> {
         let path = Self::path();
+        let _lock = Self::lock_at(&path)?;
         // A failed import of test-build networking must never cost the user's own
         // settings: it is logged, left unmarked and tried again at the next start.
         if let Err(e) = Self::migrate_test_network(&dirs::config_dir().unwrap_or_else(|| PathBuf::from("."))) {
@@ -970,7 +975,7 @@ impl Config {
         }
         if !path.exists() {
             let cfg = Config::default();
-            cfg.save()?;
+            cfg.write_at(&path)?;
             return Ok(cfg);
         }
         let text = std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
@@ -1048,10 +1053,58 @@ impl Config {
 
     pub fn save(&self) -> Result<()> {
         let path = Self::path();
-        if let Some(dir) = path.parent() {
-            std::fs::create_dir_all(dir)?;
-        }
-        std::fs::write(&path, self.to_text()?)?;
+        let _lock = Self::lock_at(&path)?;
+        self.write_at(&path)
+    }
+
+    /// Serialize app and settings-process changes, always reading the latest file.
+    pub fn update(change: impl FnOnce(&mut Config)) -> Result<Config> {
+        Self::try_update(|config| { change(config); Ok(()) })
+    }
+
+    pub fn try_update(change: impl FnOnce(&mut Config) -> Result<()>) -> Result<Config> {
+        Self::load_or_create()?;
+        Self::try_update_at(&Self::path(), change)
+    }
+
+    #[cfg(test)]
+    fn update_at(path: &std::path::Path, change: impl FnOnce(&mut Config)) -> Result<Config> {
+        Self::try_update_at(path, |config| { change(config); Ok(()) })
+    }
+
+    fn try_update_at(path: &std::path::Path, change: impl FnOnce(&mut Config) -> Result<()>) -> Result<Config> {
+        let _lock = Self::lock_at(path)?;
+        let current = Self::parse(&std::fs::read_to_string(path)?)?;
+        let mut next = current.clone();
+        change(&mut next)?;
+        next.resolve_edge_owner(&current);
+        next.validate()?;
+        next.write_at(path)?;
+        Ok(next)
+    }
+
+    fn lock_at(path: &std::path::Path) -> Result<std::fs::File> {
+        std::fs::create_dir_all(path.parent().context("settings path has no parent")?)?;
+        // Never unlink the lock: all processes must lock the same inode.
+        let lock = std::fs::OpenOptions::new().create(true).truncate(false).read(true).write(true)
+            .open(path.with_extension("lock"))?;
+        lock.lock()?;
+        Ok(lock)
+    }
+
+    fn write_at(&self, path: &std::path::Path) -> Result<()> {
+        use std::io::Write;
+        let tmp = path.with_extension("tmp");
+        let result = (|| -> Result<()> {
+            let mut file = std::fs::File::create(&tmp)?;
+            file.write_all(self.to_text()?.as_bytes())?;
+            file.sync_all()?;
+            std::fs::rename(&tmp, path)?;
+            std::fs::File::open(path.parent().context("settings path has no parent")?)?.sync_all()?;
+            Ok(())
+        })();
+        if result.is_err() { let _ = std::fs::remove_file(tmp); }
+        result?;
         Ok(())
     }
 
@@ -2157,4 +2210,54 @@ logitech_channel = 2
         assert_eq!(cfg.network.peers[0].logitech_channel, 2);
         assert_eq!(cfg.network.name, "Linux test");
     }
+}
+
+#[cfg(test)]
+#[test]
+fn transactions_preserve_edits_and_reject_invalid_files() {
+    let root = std::env::temp_dir().join(format!("flockswitch-transactions-{}", std::process::id()));
+    std::fs::create_dir_all(&root).unwrap();
+    let path = root.join("config.toml");
+    std::fs::write(&path, Config::default().to_text().unwrap()).unwrap();
+    Config::update_at(&path, |c| c.hotkeys.on = true).unwrap();
+    Config::update_at(&path, |c| c.network.on = true).unwrap();
+    let text = std::fs::read_to_string(&path).unwrap();
+    let saved = Config::parse(&text).unwrap();
+    assert!(saved.hotkeys.on && saved.network.on);
+    assert!(Config::update_at(&path, |c| c.hotkeys.keys[0] = "invalid-key".into()).is_err());
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
+    std::fs::write(&path, "[invalid").unwrap();
+    assert!(Config::update_at(&path, |c| c.enabled = false).is_err());
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "[invalid");
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(test)]
+#[test]
+fn config_transaction_child() {
+    let Some(path) = std::env::var_os("FLOCKSWITCH_TEST_TRANSACTION") else { return };
+    for _ in 0..12 {
+        Config::update_at(std::path::Path::new(&path), |c| {
+            let previous = c.edges.dwell_ms;
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            c.edges.dwell_ms = previous + 1;
+        }).unwrap();
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn concurrent_processes_preserve_every_config_edit() {
+    let root = std::env::temp_dir().join(format!("flockswitch-process-transactions-{}", std::process::id()));
+    std::fs::create_dir_all(&root).unwrap();
+    let path = root.join("config.toml");
+    std::fs::write(&path, Config::default().to_text().unwrap()).unwrap();
+    let children: Vec<_> = (0..2).map(|_| std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "config::config_transaction_child"])
+        .env("FLOCKSWITCH_TEST_TRANSACTION", &path)
+        .stdout(std::process::Stdio::null()).spawn().unwrap()).collect();
+    for mut child in children { assert!(child.wait().unwrap().success()); }
+    let saved = Config::parse(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    assert_eq!(saved.edges.dwell_ms, Config::default().edges.dwell_ms + 24);
+    std::fs::remove_dir_all(root).unwrap();
 }

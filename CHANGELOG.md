@@ -1,5 +1,17 @@
 # Changelog
 
+## 2.1.0 - 2026-11-27
+
+- New settings window: one fixed-size window with a sidebar (Network: Connection and layout, Crossing, Keyboard, Clipboard, This computer; Logitech: Button switching, Shortcut switching, Edge switching, Devices; App: Effects, General) instead of tabs. Pages scroll inside the window, which never changes size; section headers share one height and boxes side by side line up; lime is used only for the "mouse is here" dot and the chosen role. A status card at the foot of the sidebar shows where the mouse is, the network state and the device, and a badge on General shows pending Linux setup items.
+- Layout map (Connection and layout): place the master and the subs on a 5 x 3 grid (click a computer, then an empty cell; master only, subs see it locked). Subs placed side by side now cross directly to each other on both X11 and GNOME Wayland (InputCapture barriers follow the layout).
+- A switch per paired computer, "Use other computers with this computer's mouse and keyboard" (master only).
+- **Find connections again** and automatic reconnecting after Linux wakes from sleep (`org.freedesktop.login1.Manager` `PrepareForSleep(false)`) or the screen is unlocked (`org.freedesktop.ScreenSaver` / `org.gnome.ScreenSaver` `ActiveChanged(false)`).
+- Clipboard page: sharing between subs (through the master), what is sent, the Wayland XWayland note, the received folder with its last file, and the transfer status.
+- Keyboard page, **When switching OS**: key rules for each pair of systems and direction (Linux with Mac, Windows or Android) - how modifier keys are matched (by function, by position, or unchanged) with an editable mapping table, the Korean/English keys of the sender (several) and the key the receiver understands, Caps Lock held long, the Hanja key, navigation keys and screen capture. A sub's edit goes to the master. **Compare keys by system** window. Existing 2.0 key settings carry over.
+- **Update now** appears whenever a newer version is known (including one the tray app found), keeping the three Linux update flows (self-replace with SHA-256 check and restart, Homebrew confirmation in Setup check, and download-only when the install folder is read-only).
+- Fix: shaking the mouse to find the cursor (X11) now counts from where the movement began, takes strokes of 30 points, watches both axes and polls every 10 ms while shake detection is on, so quick short shakes by hand are noticed reliably.
+- Preserves every Linux 2.0 capability: setup check card and approval modal, Wayland portal shortcut status, edge backend box, locate Wayland notes and X11-only shake note, `hid_denied` banner with setup shortcut, GNOME ASCII window title, and Korean font + symbol fallback lookup.
+
 ## 2.0.0 - 2026-11-27
 
 - Share any mouse, keyboard and clipboard between your own paired computers on a trusted local network. One master manages up to three subs, with TLS encryption, discovery, six-digit pairing and an emergency return shortcut.

@@ -256,7 +256,7 @@ async fn gnome_shell_version() -> Option<u32> {
 /// Plays the countdown once for the settings window, in a Wayland session: on a
 /// layer-shell surface, or through XWayland on GNOME. The cursor position is unknown,
 /// so it is drawn in the middle of the edge of the first display.
-pub fn preview(edges: &Edges) {
+pub fn preview(edges: &Edges, delay_ms: u64) {
     static TARGET: OnceLock<&'static str> = OnceLock::new();
     let target = *TARGET.get_or_init(|| {
         if crate::wl::Wl::connect(false, false).is_ok_and(|wl| wl.has_layer_shell()) {
@@ -273,7 +273,7 @@ pub fn preview(edges: &Edges) {
     if target.is_empty() {
         return;
     }
-    let (edge, duration) = crate::edge::preview_edge(edges);
+    let (edge, duration) = crate::edge::preview_edge(edges, delay_ms);
     overlay::edge_begin_at(edges, edge, None, None, Duration::ZERO, duration, true);
 }
 
@@ -320,6 +320,15 @@ impl Watch {
     /// rebuild the capture session (GNOME before 49 would ask for permission again).
     /// Pushing at a side whose computer is away is handed back by netcore at once.
     pub fn network_sides(&self) -> Vec<flock_net::Side> {
+        if let Some(status) = crate::net::live_status().filter(|s| s.running && !s.layout.is_empty() && !s.me.id.is_empty()) {
+            let sides: Vec<flock_net::Side> = [flock_net::Side::Left, flock_net::Side::Right, flock_net::Side::Top, flock_net::Side::Bottom]
+                .into_iter()
+                .filter(|&side| flock_net::layout::neighbour(&status.layout, &status.me.id, side).is_some())
+                .collect();
+            if !sides.is_empty() {
+                return sides;
+            }
+        }
         self.cfg.network.peers.iter().filter_map(|p| p.side).collect()
     }
 
@@ -369,7 +378,13 @@ impl Watch {
         move |progress| if progressive { rising_pulse(progress).0 } else { HAPTIC_TICK }
     }
 
-    /// Once per poll: picks up changed settings and, every 300 ms, the engine's status.
+    /// The idle dispatch deadline, capped by the next engine status check.
+    pub fn dispatch_interval(&self, pointer_on_edge: bool) -> Duration {
+        let wait = crate::edge_logic::dispatch_interval(pointer_on_edge);
+        wait.min(self.status_read.map_or(Duration::ZERO, |t| STATUS_POLL.saturating_sub(t.elapsed())))
+    }
+
+    /// Once per poll: picks up changed settings and, every 300 ms, engine status.
     /// True when the settings changed.
     pub fn poll(&mut self) -> bool {
         let mut changed = false;

@@ -104,6 +104,10 @@ pub struct StatusFile {
     pub shortcuts_portal: String,
     #[serde(default)]
     pub shortcuts_bound: Vec<BoundShortcut>,
+    /// A newer version the tray app has found (its number), so that the settings
+    /// window offers "Update now" at once.
+    #[serde(default)]
+    pub update_available: Option<String>,
 }
 
 fn status_path() -> std::path::PathBuf {
@@ -191,6 +195,20 @@ pub fn request_rescan() {
 
 pub fn take_rescan_file() -> bool {
     std::fs::remove_file(rescan_request_path()).is_ok()
+}
+
+/// "연결 다시 찾기" in the settings window: the supervisor also lets the input portal ask
+/// again after the user cancelled or denied it.
+fn reconnect_request_path() -> std::path::PathBuf {
+    Config::path().with_file_name("reconnect.request")
+}
+
+pub fn request_reconnect() {
+    let _ = std::fs::write(reconnect_request_path(), b"");
+}
+
+pub fn take_reconnect_file() -> bool {
+    std::fs::remove_file(reconnect_request_path()).is_ok()
 }
 
 /// The channel asked for through the request file, if any; the file is removed.
@@ -372,6 +390,7 @@ pub fn save_wheel_modes(modes: &std::collections::HashMap<String, u8>) {
 }
 
 pub struct Shared {
+    screen_signal: crate::idle::Signal,
     config: Mutex<Config>,
     /// Modification time of config.toml as last read or written by us.
     config_mtime: Mutex<Option<std::time::SystemTime>>,
@@ -413,6 +432,7 @@ impl Shared {
     pub fn new(cfg: Config) -> Shared {
         crate::i18n::set_language(&cfg.language);
         Shared {
+            screen_signal: crate::idle::Signal::default(),
             config: Mutex::new(cfg),
             config_mtime: Mutex::new(config_mtime()),
             version: AtomicU64::new(0),
@@ -430,6 +450,22 @@ impl Shared {
         self.config.lock().unwrap().clone()
     }
 
+    pub fn read_config<T>(&self, read: impl FnOnce(&Config) -> T) -> T {
+        read(&self.config.lock().unwrap())
+    }
+
+    pub fn screen_generation(&self) -> u64 {
+        self.screen_signal.generation()
+    }
+
+    pub fn wait_screen(&self, seen: u64, timeout: std::time::Duration) {
+        self.screen_signal.wait(seen, timeout);
+    }
+
+    pub fn screen_readiness(&self) -> std::io::Result<std::sync::Arc<std::os::fd::OwnedFd>> {
+        self.screen_signal.readiness()
+    }
+
     pub fn version(&self) -> u64 {
         self.version.load(Ordering::SeqCst)
     }
@@ -438,32 +474,31 @@ impl Shared {
     /// changes, so the UI can simply redraw from the current config.
     pub fn update_config(&self, change: impl FnOnce(&mut Config)) -> Result<()> {
         let mut current = self.config.lock().unwrap();
-        let mut next = current.clone();
-        change(&mut next);
-        next.resolve_edge_owner(&current);
-        next.validate()?;
-        next.save()?;
+        let next = Config::update(change)?;
         crate::i18n::set_language(&next.language);
         *current = next;
-        *self.config_mtime.lock().unwrap() = config_mtime();
+        // Another process may have saved after our transaction released its lock.
+        // Recheck the file rather than marking that unseen write as already loaded.
+        *self.config_mtime.lock().unwrap() = None;
         self.version.fetch_add(1, Ordering::SeqCst);
+        self.screen_signal.notify();
         Ok(())
     }
 
     /// Picks up edits made to config.toml by hand. An invalid edit is reported once and
     /// ignored, so the running settings stay as they were.
     pub fn reload_if_edited(&self) {
+        // Keep an older parsed snapshot from replacing a concurrent update_config.
+        let mut current = self.config.lock().unwrap();
         let now = config_mtime();
         if now.is_none() || now == *self.config_mtime.lock().unwrap() {
             return;
         }
-        // Read and parse without holding any lock.
         let parsed = std::fs::read_to_string(Config::path())
             .map_err(anyhow::Error::from)
             .and_then(|t| Config::parse(&t))
             .and_then(|c| c.validate().map(|_| c));
         // Lock order: config, then config_mtime - the same as update_config.
-        let mut current = self.config.lock().unwrap();
         let mut seen = self.config_mtime.lock().unwrap();
         if now == *seen {
             return; // our own save raced with this check
@@ -475,6 +510,7 @@ impl Shared {
                 crate::i18n::set_language(&cfg.language);
                 *current = cfg;
                 self.version.fetch_add(1, Ordering::SeqCst);
+                self.screen_signal.notify();
                 log::info!("settings file changed, reloaded");
             }
             Err(e) => log::warn!("settings file has an error, keeping current settings: {e:#}"),
@@ -502,6 +538,7 @@ impl Shared {
         change(&mut st);
         if *st != before {
             self.status_generation.fetch_add(1, Ordering::SeqCst);
+            self.screen_signal.notify();
         }
         let file = StatusFile {
             trigger: st.trigger.clone(),
@@ -517,6 +554,12 @@ impl Shared {
             shortcuts_portal: st.shortcuts_portal.clone(),
             shortcuts_bound: st.shortcuts_bound.clone(),
             version: env!("CARGO_PKG_VERSION").into(),
+            update_available: match &st.update {
+                crate::update::UpdateState::Available(r)
+                | crate::update::UpdateState::DownloadFailed(r)
+                | crate::update::UpdateState::InstallFailed(r) => Some(r.version.clone()),
+                _ => None,
+            },
         };
         drop(st);
         // Only touch the disk when something the settings window shows has changed.
@@ -553,6 +596,7 @@ impl Shared {
             LocateSource::Command => 2,
         };
         self.locate_request.store(code, Ordering::SeqCst);
+        self.screen_signal.notify();
     }
 
     pub fn take_locate_request(&self) -> Option<LocateSource> {

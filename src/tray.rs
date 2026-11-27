@@ -52,6 +52,7 @@ pub fn run(shared: Arc<Shared>, open_settings: bool) -> Result<()> {
     ctrlc::set_handler(move || s.stop.store(true, std::sync::atomic::Ordering::SeqCst))?;
     let mut engine = Some(spawn_engine(shared.clone()));
     let network = crate::net::spawn(shared.clone());
+    crate::wake::spawn(shared.clone());
     spawn_update_check(shared.clone());
     crate::overlay::set_ready();
     crate::edge_wayland::spawn(shared.clone());
@@ -146,7 +147,9 @@ pub fn run(shared: Arc<Shared>, open_settings: bool) -> Result<()> {
 
         reap_children();
         // Redraw when the engine found/lost devices or switched.
-        let now = (shared.status_generation(), shared.version(), NetState::of(&shared.config(), crate::net::live_status().as_ref()));
+        let network_status = crate::net::live_status();
+        let network_state = shared.read_config(|cfg| NetState::of(cfg, network_status.as_ref()));
+        let now = (shared.status_generation(), shared.version(), network_state);
         if ui.tray.is_some() && now != ui.shown {
             ui.refresh();
         }

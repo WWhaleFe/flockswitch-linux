@@ -197,16 +197,34 @@ impl Wl {
 
     /// Sends what is queued, waits up to `timeout` for events and handles them.
     pub fn dispatch(&mut self, timeout: Duration) -> Result<(), String> {
+        self.dispatch_or_wake(timeout, None)
+    }
+
+    /// Also listen for app settings/requests, so an idle dispatch need not poll them.
+    pub fn dispatch_or_wake(&mut self, timeout: Duration, wake: Option<&std::os::fd::OwnedFd>) -> Result<(), String> {
+        use std::os::fd::AsFd;
         let err = |e: &dyn std::fmt::Display| format!("{e}");
         self.queue.dispatch_pending(&mut self.state).map_err(|e| err(&e))?;
         self.conn.flush().map_err(|e| err(&e))?;
         if let Some(guard) = self.queue.prepare_read() {
             let readable = {
                 let fd = guard.connection_fd();
-                let mut fds = [rustix::event::PollFd::from_borrowed_fd(fd, rustix::event::PollFlags::IN)];
+                // A fixed array avoids an allocation on each dispatch. The second
+                // entry participates only when this caller has an app wake fd.
+                let mut fds = [
+                    rustix::event::PollFd::from_borrowed_fd(fd, rustix::event::PollFlags::IN),
+                    rustix::event::PollFd::from_borrowed_fd(wake.map_or(fd, |w| w.as_fd()), rustix::event::PollFlags::IN),
+                ];
                 let ts = rustix::event::Timespec::try_from(timeout).ok();
-                match rustix::event::poll(&mut fds, ts.as_ref()) {
-                    Ok(n) => n > 0,
+                let len = if wake.is_some() { 2 } else { 1 };
+                match rustix::event::poll(&mut fds[..len], ts.as_ref()) {
+                    Ok(_) => {
+                        if let Some(wake) = wake {
+                            let mut count = [0u8; 8];
+                            let _ = rustix::io::read(wake, &mut count);
+                        }
+                        !fds[0].revents().is_empty()
+                    }
                     Err(rustix::io::Errno::INTR) => false,
                     Err(e) => return Err(format!("poll: {e}")),
                 }

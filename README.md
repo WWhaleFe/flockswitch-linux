@@ -13,27 +13,36 @@ This repository is the Linux version. The others live in [flockswitch-mac](https
 
 > Not affiliated with Logitech. "Logitech", "MX Master", "Easy-Switch", "Bolt" and "Unifying" are trademarks of Logitech.
 
-## Network sharing in 2.0
+## Network sharing in 2.1
 
 Use any brand of mouse and keyboard, including built-in devices, on your own computers
-on the same trusted private network. Open **Settings → Network**, read and accept the
-notice on each computer, choose one **Master** and up to three **Subs**, enable sharing,
-and pair only when both screens show the same six digits. Set each sub's screen side
-on the master. Subs follow the master's switching, keyboard, clipboard and effect settings;
-local edge ownership, channel assignments and Linux setup preferences stay local.
+on the same trusted private network. Open **Settings → Connection and layout**, read and
+accept the notice on each computer, choose one **Master** and up to three **Subs**, enable
+sharing, and pair only when both screens show the same six digits. Place the master and
+subs on the 5 x 3 **Layout map** on the master; subs placed side by side cross directly
+to each other (including GNOME Wayland InputCapture barriers). On the master, each paired
+computer also has a switch for whether its mouse and keyboard can control other computers.
+Subs follow the master's layout, crossing, clipboard and effect settings (key rule edits
+from a sub are forwarded to the master); local edge ownership, channel assignments and
+Linux setup preferences stay local.
 
-Push against the selected edge to cross; push back at the arrival edge to return.
-**Ctrl+Alt+Shift+Q** returns control immediately. Network crossing never changes a
-Logitech hardware channel. Logitech buttons, gestures and channel shortcuts remain
-available; the Network tab recommends turning Easy-Switch off while sharing. Enabling
-sharing gives the edges to the network. Enabling Logitech edges again asks for
-confirmation and pauses network crossing, while receiving input continues.
+Push against a neighbour's edge to cross; push back at the arrival edge to return.
+**Ctrl+Alt+Shift+Q** returns control immediately. Use **Find connections again** if a
+computer does not show up; Linux also reconnects automatically after resuming from sleep
+(`login1` `PrepareForSleep`) or unlocking the screen (`ScreenSaver` `ActiveChanged`).
+Network crossing never changes a Logitech hardware channel. Logitech buttons, gestures and
+channel shortcuts remain available; Button switching recommends turning Easy-Switch off
+while sharing. Enabling sharing gives the edges to the network. Enabling Logitech edges
+again asks for confirmation and pauses network crossing, while receiving input continues.
 
-Text, images and files follow the cursor when clipboard sharing is enabled. The limit
-is fixed at **100 MB**. Received files stay in **Downloads/flockswitch** (or the
-network settings' received folder if Downloads cannot be resolved) and can be pasted
-into a file manager. Linux shows the two Mac Hangul remapping rows read-only with
-“Set on the Mac”. Cmd/Ctrl mapping and the Hangul key on Mac remain configurable.
+Text, images and files follow the cursor when clipboard sharing is enabled, including
+between subs through the master. The limit is fixed at **100 MB**. Received files stay in
+**Downloads/flockswitch** (or the network settings' received folder if Downloads cannot be
+resolved) and can be pasted into a file manager. Under **Keyboard → When switching OS**,
+configure modifier mapping (by function, by position, or unchanged, with an editable table),
+Korean/English keys, long-press Caps Lock, Hanja, navigation keys and screen capture per
+OS pair and direction (Linux with Mac, Windows or Android), and open **Compare keys by
+system** for a reference table.
 
 | Session | Network send | Network receive | Clipboard | Countdown | Real hardware validation |
 |---|---|---|---|---|---|
@@ -155,15 +164,19 @@ On a minimal install where the settings window doesn't open: `sudo apt-get insta
 
 ## Use
 
-The tray icon's menu shows the status, turns switching on or off, checks for updates, opens a report to the developer, and opens **Settings…** - a window with five tabs where every change applies at once:
+The tray icon's menu shows the status, turns switching on or off, checks for updates, opens a report to the developer, and opens **Settings…** - one fixed-size window with a sidebar of pages (Network: Connection and layout, Crossing, Keyboard, Clipboard, This computer; Logitech: Button switching, Shortcut switching, Edge switching, Devices; App: Effects, General). A page that is longer than the window scrolls inside it, and every change applies at once. The card at the foot of the sidebar shows where the mouse is (the lime dot means it is on this computer), what the network is doing and which device is the master mouse; a badge next to General shows pending Linux setup items.
 
-- **Switching**: on/off, and per button (wheel mode-shift, gesture, wheel click - several can be on): the channel it goes to - one channel, chosen on each computer since settings are kept per computer; this PC's own channel is shown but cannot be chosen. The gesture button can also switch by holding it and moving the mouse up, down, left or right, each direction with its own channel. With the wheel mode-shift button switching, **Restore the wheel mode on return** (on by default, `set keep_wheel_mode`) puts the wheel back to the ratchet or free-spinning mode it had on this computer when the mouse comes back: on a device where flockswitch has not taken the button yet (just after the mouse arrives there, e.g. on Android), a press flips the wheel instead.
-- **Shortcuts** (on the same tab): on X11, keyboard shortcuts, one per channel (Ctrl+Alt+1 / 2 / 3 until you change them), pressed on any keyboard. The ⓘ beside the title (and beside the find-the-cursor shortcut) lists which combinations work: Ctrl and/or Alt with a number or letter (Shift may be added), or an F key; the desktop's own combinations and ones another app has taken cannot be used, and the row says so. **On Wayland** they go through the system's shortcut service: see [Find the cursor and shortcuts on Wayland](#find-the-cursor-and-shortcuts-on-wayland).
-- **Edges** (same tab): rest the cursor against an outer edge of the screen for a moment (0.3 to 2 s, your choice) and the group and the master mouse go to the channel set for that side. No network: each computer watches its own screen, so turn it on on every computer and give each side the channel of the computer that stands there. While it waits an effect runs down near the cursor (ring, semicircle, bar, pulse, laser, vortex, scan, liquid or random). Each effect keeps its own colour and size, and the ring, semicircle and bar their own direction (the ring and semicircle can also shrink away instead); **Random** picks an effect each time, in that effect's colour and size, with a random direction and shrink-away where it has them. You can require Ctrl to be held. When the mouse comes back, the cursor appears at the edge it left by (X11). The corners do not count, and with several displays an edge that continues onto another display does not switch. Works on X11 and, in its own way, on Wayland: see [Screen edges on Wayland](#screen-edges-on-wayland).
-- **Network**: consent, pairing and connections, this computer and role, crossing delay and Control requirement, keyboard mappings and clipboard. One master manages up to three subs.
-- **Devices**: the master mouse, and the devices that move along (Bolt, Unifying and Bluetooth devices can be mixed; devices on another computer are listed too)
-- **Effects**: countdown style, colour, size and direction; haptics on a mouse with a motor, currently the MX Master 4 (a summary and the **Haptics Settings…** window: on/off, strength, a pulse as the mouse leaves and one when it is back, each with its own waveform or random, rising or even pulses at an edge, and **Test** to try them), find the cursor (a pulse ring, radar, spotlight or random effect in the colour and size you choose, from a shortcut, on arrival from another computer, with `flockswitch locate`, or by shaking the mouse for 0.5 to 2 s without a pause, optionally only while Ctrl, Alt or Shift is held; on X11 it needs a compositor, and on Wayland shaking is not available, see [below](#find-the-cursor-and-shortcuts-on-wayland))
-- **General**: language (Korean or English), start at login, updates (check for a new version, install it automatically or with **Update now**), report to the developer, settings backup (below), reset settings, uninstall, and at the top the setup check when something is missing (above). The settings window opens tall enough for the whole General tab, and grows (as far as the screen allows) when a page needs more room
+- **Connection and layout**: the sharing switch (after accepting the cautions), this computer's role (master or sub, changeable while no computer is paired), pairing with the matching six digits, nearby computers and adding one by IP, the paired computers (link and delay, a master-only switch for using that computer's mouse and keyboard on the others, **Unpair**), **Find connections again** (Linux also reconnects automatically after sleep or screen unlock), and the **Layout map** (5 x 3 grid on the master: click a computer then an empty cell; subs placed side by side cross directly to each other; subs see it locked). Linux session support status and any problem box appear here too.
+- **Crossing**: the wait before crossing (with the countdown chosen in Effects), crossing only while Ctrl is held, showing the cursor on arrival, and the return shortcut Ctrl+Alt+Shift+Q.
+- **Keyboard** (**When switching OS**): for each pair of systems and direction (Linux with Mac, Windows or Android), modifier matching (by function, by position, or unchanged) with an editable mapping table, sender Korean/English keys and receiver key, long-press Caps Lock, Hanja, navigation keys and screen capture. A sub's edit goes to the master. **Compare keys by system** shows a reference table.
+- **Clipboard**: share text, images and files with the cursor, share between subs through the master, Wayland XWayland note, the received folder with its last file, and transfer progress.
+- **This computer**: the role (changed in Connection and layout), name, port, IP addresses and device ID.
+- **Button switching**: on/off, and per button (wheel mode-shift, gesture, wheel click - several can be on): the channel it goes to - one channel, chosen on each computer since settings are kept per computer; this PC's own channel is shown but cannot be chosen. The gesture button can also switch by holding it and moving the mouse up, down, left or right, each direction with its own channel. With the wheel mode-shift button switching, **Restore the wheel mode on return** (on by default, `set keep_wheel_mode`) puts the wheel back to the ratchet or free-spinning mode it had on this computer when the mouse comes back: on a device where flockswitch has not taken the button yet (just after the mouse arrives there, e.g. on Android), a press flips the wheel instead.
+- **Shortcut switching**: on X11, keyboard shortcuts, one per channel (Ctrl+Alt+1 / 2 / 3 until you change them), pressed on any keyboard. The ⓘ beside the title (and beside the find-the-cursor shortcut) lists which combinations work: Ctrl and/or Alt with a number or letter (Shift may be added), or an F key; the desktop's own combinations and ones another app has taken cannot be used, and the row says so. **On Wayland** they go through the system's shortcut service: see [Find the cursor and shortcuts on Wayland](#find-the-cursor-and-shortcuts-on-wayland).
+- **Edge switching**: rest the cursor against an outer edge of the screen for a moment (0.3 to 2 s, your choice) and the group and the master mouse go to the channel set for that side. No network: each computer watches its own screen, so turn it on on every computer and give each side the channel of the computer that stands there. While it waits an effect runs down near the cursor (configured in Effects: ring, semicircle, bar, pulse, laser, vortex, scan, liquid or random). Each effect keeps its own colour and size, and the ring, semicircle and bar their own direction (the ring and semicircle can also shrink away instead); **Random** picks an effect each time, in that effect's colour and size, with a random direction and shrink-away where it has them. You can require Ctrl to be held. When the mouse comes back, the cursor appears at the edge it left by (X11). The corners do not count, and with several displays an edge that continues onto another display does not switch. Works on X11 and, in its own way, on Wayland: see [Screen edges on Wayland](#screen-edges-on-wayland).
+- **Devices**: the master mouse, and the devices that move along (Bolt, Unifying and Bluetooth devices can be mixed; devices on another computer are listed too).
+- **Effects**: countdown style, colour, size and direction; haptics on a mouse with a motor, currently the MX Master 4 (a summary and the **Haptics Settings…** window: on/off, strength, a pulse as the mouse leaves and one when it is back, each with its own waveform or random, rising or even pulses at an edge, and **Test** to try them); find the cursor (a pulse ring, radar, spotlight or random effect in the colour and size you choose, from a shortcut, on arrival from another computer, with `flockswitch locate`, or by shaking the mouse for 0.5 to 2 s without a pause, optionally only while Ctrl, Alt or Shift is held; on X11 it needs a compositor, and on Wayland shaking is not available, see [below](#find-the-cursor-and-shortcuts-on-wayland)).
+- **General**: at the top the Linux setup check card when something is missing (above), language (Korean or English), start at login, updates (check for a new version, install it automatically, or **Update now** whenever a newer version is known, using self-replace, Homebrew confirmation, or download-only as appropriate), settings backup (below), report to the developer, reset settings, and uninstall.
 
 Linux has no Logi Options+, so no button has to be set aside first. If you use **Solaar**, give the buttons you turn on in flockswitch no Solaar setting or rule; both apps can stay installed otherwise. When flockswitch quits or a button is turned off, the button is put back exactly as it was.
 

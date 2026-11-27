@@ -56,6 +56,7 @@ pub fn run(shared: Arc<Shared>) {
     };
     log::info!("layer-shell: connected (cursor-shape {})", if wl.has_cursor_shape() { "yes" } else { "no: the compositor picks the cursor over the strips" });
     overlay::use_layer_shell();
+    let readiness = shared.screen_readiness().map_err(|e| log::warn!("layer-shell: app wake fd unavailable: {e}")).ok();
     let mut watch = Watch::new(shared.clone());
     let mut dwell = Dwell::new();
     let mut strips: Vec<Strip> = Vec::new();
@@ -68,7 +69,8 @@ pub fn run(shared: Arc<Shared>) {
     let mut out = Vec::new();
 
     while !shared.stopped() {
-        if let Err(e) = wl.dispatch(POLL) {
+        let wait = if readiness.is_some() { watch.dispatch_interval(on.is_some() || dwell.counting_down()) } else { POLL };
+        if let Err(e) = wl.dispatch_or_wake(wait, readiness.as_deref()) {
             log::warn!("layer-shell: Wayland connection lost ({e}); edge switching stops");
             set_status(&shared, "none", "no-wayland");
             break;

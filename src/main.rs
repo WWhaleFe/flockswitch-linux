@@ -4,6 +4,7 @@
 mod backup;
 mod config;
 mod clipboard;
+mod idle;
 mod device;
 mod net;
 mod net_logic;
@@ -24,6 +25,7 @@ mod locate_wayland;
 mod overlay;
 mod overlay_render;
 mod overlay_wayland;
+mod settings_logic;
 mod settings_ui;
 mod setup;
 mod setup_logic;
@@ -31,8 +33,11 @@ mod shared;
 mod shortcuts_portal;
 mod tray;
 mod update;
+mod wake;
 mod window_size;
 mod wl;
+
+pub const APP_NAME: &str = "flockswitch";
 
 use anyhow::{bail, Result};
 use config::Config;
@@ -142,7 +147,11 @@ fn main() {
     } else {
         None
     };
-    Config::migrate_old_name();
+    // Screenshot mode (FLOCKSWITCH_SHOTS) never touches the real settings folder.
+    let shots = args.first().map(String::as_str) == Some("settings") && settings_ui::shots_dir().is_some();
+    if !shots {
+        Config::migrate_old_name();
+    }
     // `flockswitch setup` talks to the person at the terminal; what it runs goes to
     // setup.log, and only when it may install something.
     if args.first().map(String::as_str) == Some("setup") {
@@ -154,7 +163,9 @@ fn main() {
     }
     // The settings window has no console when started from the menu: log to its own
     // file so a window that fails to open (graphics drivers) leaves a trace.
-    let log_file = if tray_mode {
+    let log_file = if shots {
+        None
+    } else if tray_mode {
         Some(log_path())
     } else if args.first().map(String::as_str) == Some("settings") {
         Some(log_path().with_file_name("settings.log"))
@@ -186,9 +197,9 @@ fn real_main(args: &[String]) -> Result<()> {
             let first_start = !Config::path().exists();
             let mut cfg = load_config();
             if first_start {
-                cfg.setup.first_check = true;
-                if let Err(e) = cfg.save() {
-                    log::warn!("cannot save the settings: {e:#}");
+                match Config::update(|c| c.setup.first_check = true) {
+                    Ok(next) => cfg = next,
+                    Err(e) => log::warn!("cannot save the settings: {e:#}"),
                 }
             }
             tray::run(Arc::new(Shared::new(cfg)), args.get(1).map(String::as_str) == Some("--settings"))
@@ -198,7 +209,8 @@ fn real_main(args: &[String]) -> Result<()> {
             // One settings window at a time. Opening it again knocks on the open
             // window's port (sending only the page asked for, if any), which brings that
             // window to the front.
-            let addr = std::net::SocketAddr::from(([127, 0, 0, 1], INSTANCE_PORT + 1));
+            let port = if settings_ui::shots_dir().is_some() { 0 } else { INSTANCE_PORT + 1 };
+            let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
             let Some(lock) = std::net::TcpListener::bind(addr).ok() else {
                 // "setup" or "update" also turns it to the General tab.
                 if let Ok(mut knock) = std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_secs(1)) {
@@ -247,7 +259,7 @@ fn real_main(args: &[String]) -> Result<()> {
                 bail!("flockswitch is not running; start it first (the running flockswitch shows the cursor)");
             }
             if Config::load_or_create().is_ok_and(|c| !c.locate.on) {
-                eprintln!("note: finding the cursor is off (Settings → General, or `flockswitch set locate true`), so nothing will show");
+                eprintln!("note: finding the cursor is off (Settings → Effects, or `flockswitch set locate true`), so nothing will show");
             }
             leave_request(&shared::locate_request_path(), "")
         }
@@ -276,9 +288,7 @@ fn real_main(args: &[String]) -> Result<()> {
             let (Some(key), Some(value)) = (args.get(1), args.get(2)) else {
                 bail!("usage: flockswitch set <key> <value>  (see 'flockswitch help')");
             };
-            let mut cfg = Config::load_or_create()?;
-            cfg.set(key, value)?;
-            cfg.save()?;
+            Config::try_update(|cfg| cfg.set(key, value))?;
             println!("{key} = {value}  ({})", Config::path().display());
             Ok(())
         }
@@ -299,6 +309,7 @@ fn run_headless() -> Result<()> {
     let s = shared.clone();
     ctrlc::set_handler(move || s.stop.store(true, Ordering::SeqCst))?;
     edge_wayland::spawn(shared.clone());
+    wake::spawn(shared.clone());
     let mut engine = Engine::new(shared.clone())?;
     let network = net::spawn(shared.clone());
     let result = engine.run();
@@ -496,12 +507,15 @@ pub fn uninstall() {
         }
     }
     if let Some(dir) = Config::path().parent() {
-        if let Ok(entries) = std::fs::read_dir(dir) {
-            for e in entries.flatten() {
-                let _ = std::fs::remove_file(e.path());
+        // The folder is flockswitch's own: it holds the network key (net/identity.der)
+        // and the clipboard transfer work folders as well as the files.
+        if dir.file_name().is_some_and(|n| n == "flockswitch") {
+            if let Err(e) = std::fs::remove_dir_all(dir) {
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    log::warn!("could not remove {}: {e}", dir.display());
+                }
             }
         }
-        let _ = std::fs::remove_dir(dir);
     }
     log::info!("uninstalled settings and start-at-login");
 }
