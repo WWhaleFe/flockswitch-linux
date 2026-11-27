@@ -1,5 +1,12 @@
 # Changelog
 
+## 2.5.0 - 2026-11-27
+
+- Crossing: on a controlled screen, any edge that touches another computer on the layout now leads there, not only the edge the cursor came in by. A computer wrapped around by the master's monitors (an L) that was entered from the top goes back over its left edge, say, to the monitor that is there. From a sub controlled with the master's mouse, the cursor goes straight on to the sub next to it (the master passes the input on). Both computers need this version; with an older one the cursor goes back only over the edge it came in by, as before.
+- Layout: the master keeps the monitors a sub told it, so the sub's tiles keep their arrangement while it is away. Pick a computer's tile and click **Read this computer's monitor arrangement again** to place its tiles the way its monitors are arranged.
+- Connect: the pairing box now appears right under the layout map (above the nearby list), so its code and buttons are in reach without scrolling up.
+- Keyboard: the **Keys and shortcuts by system** window (top right of the Keyboard page) now has a table of **everyday shortcuts** on macOS, Windows, Linux and Android (copy and paste, undo, switching and quitting apps, search, lock screen and more) and says which keys to press for each modifier mapping. Keys such as Command and Control can be remapped in the Keyboard page's table for each pair of systems and direction.
+
 ## 2.4.0 - 2026-11-27
 
 - Layout map: a computer with several monitors now moves as one. Moving one of its monitor tiles moves the others by the same number of cells, so the shape of its monitor arrangement stays as it is. All tiles of the picked computer are highlighted, only the spots where the whole group fits are marked, and an outline of the whole group shows where it would land. Tiles can also be dragged instead of clicked. Saved tiles of a monitor that is unplugged now move along too.

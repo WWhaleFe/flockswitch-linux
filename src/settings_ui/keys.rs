@@ -323,7 +323,7 @@ impl SettingsApp {
         });
     }
 
-    /// "Compare keys by system": a window with the table of what each system calls what.
+    /// "Keys and shortcuts by system": tables of what each system calls what, and its everyday shortcuts.
     pub(super) fn keycmp_window(&mut self, ctx: &egui::Context, t: &Texts) {
         if !self.keys_cmp {
             return;
@@ -344,9 +344,16 @@ impl SettingsApp {
                 ui.label(RichText::new(t.keys_cmp_button).font(bold(17.0)).color(p.text));
                 ui.add_space(12.0);
                 egui::ScrollArea::vertical().auto_shrink([false, false]).max_height(ui.available_height() - 48.0).show(ui, |ui| {
-                    comparison_table(ui, p, t);
+                    comparison_table(ui, p, &t.keys_cmp_labels, &t.keys_cmp_cells);
                     ui.add_space(12.0);
                     ui.label(RichText::new(t.keys_cmp_note).size(12.5).color(p.muted));
+                    // The everyday shortcuts of each system, and which ones to press.
+                    ui.add_space(22.0);
+                    ui.label(RichText::new(t.keys_sc_title).font(bold(15.0)).color(p.text));
+                    ui.add_space(8.0);
+                    ui.label(RichText::new(t.keys_sc_note).size(12.5).color(p.muted));
+                    ui.add_space(8.0);
+                    comparison_table(ui, p, &t.keys_sc_labels, &t.keys_sc_cells);
                     ui.add_space(22.0);
                     ui.label(RichText::new(t.keys_guide_title).font(bold(15.0)).color(p.text));
                     ui.add_space(8.0);
@@ -365,7 +372,7 @@ impl SettingsApp {
 }
 
 /// The comparison table: a row per kind of key, a column per system.
-fn comparison_table(ui: &mut Ui, p: Palette, t: &Texts) {
+fn comparison_table(ui: &mut Ui, p: Palette, labels: &[&str], cells: &[[&str; 4]]) {
     let width = ui.available_width() - 8.0;
     let label_w = 130.0;
     let col_w = (width - label_w) / 4.0;
@@ -379,8 +386,7 @@ fn comparison_table(ui: &mut Ui, p: Palette, t: &Texts) {
             p.muted,
         );
     }
-    for (row, label) in t.keys_cmp_labels.iter().enumerate() {
-        let cells = &t.keys_cmp_cells[row];
+    for (label, cells) in labels.iter().zip(cells) {
         let galleys: Vec<_> = cells.iter().map(|c| ui.painter().layout(c.to_string(), FontId::proportional(13.0), p.text, col_w - 12.0)).collect();
         let label_g = ui.painter().layout(label.to_string(), bold(13.0), p.text, label_w - 12.0);
         let height = galleys.iter().map(|g| g.size().y).fold(label_g.size().y, f32::max) + 18.0;

@@ -187,6 +187,8 @@ impl Service {
             capture_block: None,
             capture_backoff: Duration::ZERO,
             outward: false,
+            motion: (0.0, 0.0),
+            pass_side: None,
             started: Instant::now(),
             last_write: Instant::now() - Duration::from_secs(1),
             written: None,
@@ -612,6 +614,10 @@ struct Control {
     /// Last cooldown length: 2 s, doubling to 30 s while captures keep failing.
     capture_backoff: Duration,
     outward: bool,
+    /// The last motion injected while controlled (to tell which edge it pushes against).
+    motion: (f64, f64),
+    /// While controlled: the edge over which control was passed on (Pass), and when.
+    pass_side: Option<(Side, Instant)>,
     started: Instant,
     last_write: Instant,
     written: Option<Status>,
@@ -1402,15 +1408,26 @@ impl Control {
                             l.send(Msg::ReleaseAll);
                         }
                     }
-                    Msg::Leave { pos, display } => {
+                    Msg::Leave { pos, display, side } => {
                         if matches!(&self.state,State::Controlling{peer,..} if peer==&id)
                             && pos.is_finite()
                         {
-                            if let State::Controlling { pos: ref mut p, display: ref mut d, .. } = &mut self.state {
+                            if let State::Controlling { pos: ref mut p, display: ref mut d, side: ref mut s, .. } = &mut self.state {
                                 *p = pos;
                                 *d = display;
+                                if let Some(side) = side {
+                                    *s = side;
+                                }
                             }
                             self.local(false);
+                        }
+                    }
+                    Msg::Pass { to, side, pos, whole, display } => {
+                        if matches!(&self.state, State::Controlling { peer, .. } if peer == &id)
+                            && pos.is_finite()
+                            && whole.is_finite()
+                        {
+                            self.pass_control(&id, to, side, pos.clamp(0.0, 1.0), whole.clamp(0.0, 1.0), display);
                         }
                     }
                     Msg::Clipboard { text } => {
@@ -2107,6 +2124,11 @@ impl Control {
             }
         }
         if let State::Controlled { entered, .. } = old {
+            // Passed on over another edge: the cursor stays at that edge.
+            let entered = match self.pass_side.take() {
+                Some((side, at)) if at.elapsed() < Duration::from_secs(2) => side,
+                _ => entered,
+            };
             if let Some((x, y)) = self.platform.cursor() {
                 let displays = self.platform.displays();
                 let pos = geometry::edge_ratio(&displays, entered, x, y);
@@ -2158,6 +2180,7 @@ impl Control {
                 }
             }
             InputEvent::Motion { dx, dy } => {
+                self.motion = (*dx, *dy);
                 if let State::Controlled { entered, .. } = self.state {
                     self.outward = match entered {
                         Side::Left => *dx < 0.0,
@@ -2399,39 +2422,108 @@ impl Control {
                 self.cross_to(peer, side, exit);
             }
             State::Controlled { peer, entered } => {
-                let native_out = self.last_cursor.is_some_and(|(px, py)| match entered {
-                    Side::Left => x < px,
-                    Side::Right => x > px,
-                    Side::Top => y < py,
-                    Side::Bottom => y > py,
-                });
                 let control_ok = !self.config.require_control || self.control_held(&peer);
-                let hit = edge.filter(|(_, side)| *side == entered);
-                if let Some((exit, _)) = hit.filter(|_| (self.outward || native_out) && control_ok) {
-                    let back = self.way_back(&cells, &peer, exit.display, entered);
-                    if let Some(msg) = back.map(|target| {
-                        // A peer that knows monitors gets the position along the monitor's
-                        // edge and the monitor to land on; an older one the whole edge.
-                        let shows = self.links.get(&peer).is_some_and(|l| l.features.iter().any(|f| f == "displays"));
-                        match target {
-                            Some(d) if shows => Msg::Leave { pos: exit.pos, display: Some(d) },
-                            _ => Msg::Leave { pos: exit.whole, display: None },
-                        }
-                    }) {
-                        self.send_clipboard(&peer);
-                        if let Some(l) = self.links.get(&peer) {
-                            l.send(msg);
-                        }
-                        self.local(false);
-                        if layout::neighbour_of(&cells, &self.identity.id, exit.display, entered).is_some_and(|(id, _)| id == peer) {
-                            self.switch_channel(&peer);
-                        }
+                if let Some((exit, side)) = edge.filter(|_| control_ok) {
+                    let toward = |dx: f64, dy: f64| match side {
+                        Side::Left => dx < 0.0,
+                        Side::Right => dx > 0.0,
+                        Side::Top => dy < 0.0,
+                        Side::Bottom => dy > 0.0,
+                    };
+                    let pushing = if side == entered { self.outward } else { toward(self.motion.0, self.motion.1) };
+                    let native_out = self.last_cursor.is_some_and(|(px, py)| toward(x - px, y - py));
+                    if pushing || native_out {
+                        self.leave_controlled(&cells, &peer, entered, exit, side);
                     }
                 }
             }
             State::Controlling { .. } => {}
         }
         self.last_cursor = cursor;
+    }
+    /// While controlled by `peer`, the cursor pushes out over `side` of monitor `exit.display`.
+    /// Whatever the layout puts next to that edge gets the cursor: the controlling computer
+    /// (on the monitor that is there, so a computer wrapped around by its monitors can leave
+    /// over any edge that touches one), or another computer, to which the controlling one
+    /// passes control (sub to sub). The edge it came in by keeps the rules from before.
+    fn leave_controlled(&mut self, cells: &[Cell], peer: &str, entered: Side, exit: Exit, side: Side) {
+        let me = self.identity.id.clone();
+        let next = layout::neighbour_of(cells, &me, exit.display, side).map(|(id, d)| (id.to_string(), d));
+        if let Some((to, d)) = next.as_ref().filter(|(to, _)| to != peer) {
+            if self.ask_to_pass(peer, to, d.to_owned(), exit, side) {
+                return;
+            }
+            if side != entered {
+                return;
+            }
+        }
+        let back = match next {
+            Some((to, d)) if to == peer => Some(self.target_display(cells, peer, d)),
+            _ if side == entered => self.way_back(cells, peer, exit.display, entered),
+            _ => None,
+        };
+        let Some(target) = back else { return };
+        // A peer that knows monitors gets the position along the monitor's edge and the
+        // monitor to land on; an older one the whole edge. Over another edge than the one it
+        // came in by, the peer is told its own side to come back at.
+        let shows = self.links.get(peer).is_some_and(|l| l.features.iter().any(|f| f == "displays"));
+        let back_side = (side != entered).then(|| side.opposite());
+        let msg = match target {
+            Some(d) if shows => Msg::Leave { pos: exit.pos, display: Some(d), side: back_side },
+            _ => Msg::Leave { pos: exit.whole, display: None, side: back_side },
+        };
+        self.send_clipboard(peer);
+        if let Some(l) = self.links.get(peer) {
+            l.send(msg);
+        }
+        if side != entered {
+            self.pass_side = Some((side, Instant::now()));
+        }
+        self.local(false);
+        if layout::neighbour_of(cells, &me, exit.display, side).is_some_and(|(id, _)| id == peer) {
+            self.switch_channel(peer);
+        }
+    }
+    /// Asks the controlling computer `peer` to move control on to `to` (Pass). False when it
+    /// cannot (a peer before 2.4). The cursor stays here until `peer` answers with
+    /// ReleaseAll; while the edge is pushed the request is repeated now and then.
+    fn ask_to_pass(&mut self, peer: &str, to: &str, display: u8, exit: Exit, side: Side) -> bool {
+        let Some(l) = self.links.get(peer) else { return false };
+        if !l.features.iter().any(|f| f == "pass") {
+            return false;
+        }
+        if self.pass_side.is_some_and(|(s, at)| s == side && at.elapsed() < Duration::from_millis(300)) {
+            return true;
+        }
+        l.send(Msg::Pass { to: to.to_string(), side, pos: exit.pos, whole: exit.whole, display: Some(display) });
+        self.pass_side = Some((side, Instant::now()));
+        true
+    }
+    /// The computer `from` that this one controls asked to pass control on to `to`.
+    fn pass_control(&mut self, from: &str, to: String, side: Side, pos: f64, whole: f64, display: Option<u8>) {
+        if to == self.identity.id || !self.open(&to) || self.is_paused(&to) || !self.me_can_send() {
+            log::info!("{from} asked to pass control to {to}: not possible here");
+            return;
+        }
+        let cells = self.my_cells();
+        let target = display.and_then(|d| self.target_display(&cells, &to, d));
+        log::info!("control passes from {from} to {to}");
+        if let Some(l) = self.links.get(from) {
+            l.send(Msg::ReleaseAll);
+        }
+        self.send_clipboard(&to);
+        if let Some(l) = self.links.get(&to) {
+            l.send(match target {
+                Some(d) if l.features.iter().any(|f| f == "displays") => Msg::Enter { side, pos, display: Some(d) },
+                _ => Msg::Enter { side, pos: whole, display: None },
+            });
+        }
+        if let State::Controlling { peer, .. } = &mut self.state {
+            *peer = to.clone();
+        }
+        self.captured_keys.clear();
+        self.mapper = KeyMapper::default();
+        self.switch_channel(&to);
     }
     /// Whether the cursor may go back to `peer` over the `entered` edge of monitor `display`:
     /// None when not; Some(Some(m)) when the layout puts the peer's monitor m there; Some(None)
@@ -3507,6 +3599,8 @@ mod tests {
             capture_block: None,
             capture_backoff: Duration::ZERO,
             outward: false,
+            motion: (0.0, 0.0),
+            pass_side: None,
             started: Instant::now(),
             last_write: Instant::now() - Duration::from_secs(1),
             written: None,
@@ -4996,7 +5090,7 @@ mod tests {
         let enter = sent(&rx).into_iter().find(|m| matches!(m, Msg::Enter { .. })).unwrap();
         assert_eq!(enter, Msg::Enter { side: Side::Right, pos: 250.0 / 999.0, display: Some(0) });
         // Back: the peer sends Leave with our monitor; we land on that monitor's right edge.
-        message(&mut r.c, SUB, Msg::Leave { pos: 0.5, display: Some(0) });
+        message(&mut r.c, SUB, Msg::Leave { pos: 0.5, display: Some(0), side: None });
         assert!(matches!(r.c.state, State::Local));
         let (x, y) = *r.p.warps.lock().unwrap().last().unwrap();
         assert_eq!((x, y), (997.0, 499.5));
@@ -5005,7 +5099,7 @@ mod tests {
         r.p.warps.lock().unwrap().clear();
         *r.p.cursor_at.lock().unwrap() = Some((1999.0, 250.0));
         r.c.state = State::Controlling { peer: SUB.into(), side: Side::Right, pos: 0.1, display: Some(1) };
-        message(&mut r.c, SUB, Msg::Leave { pos: 1.0, display: None });
+        message(&mut r.c, SUB, Msg::Leave { pos: 1.0, display: None, side: None });
         assert_eq!(r.p.warps.lock().unwrap().last().copied(), Some((1997.0, 999.0)));
     }
     #[test]
@@ -5137,7 +5231,7 @@ mod tests {
         r.c.poll_cursor();
         assert!(matches!(r.c.state, State::Local));
         let leave = sent(&rx).into_iter().find(|m| matches!(m, Msg::Leave { .. })).unwrap();
-        assert_eq!(leave, Msg::Leave { pos: 400.0 / 999.0, display: Some(0) });
+        assert_eq!(leave, Msg::Leave { pos: 400.0 / 999.0, display: Some(0), side: None });
         // Coming in on the right side: the second monitor has no peer next to it, so the cursor
         // stays on this computer.
         r.c.state = State::Controlled { peer: SUB.into(), entered: Side::Right };
@@ -5193,6 +5287,94 @@ mod tests {
         assert!(matches!(enter, Msg::Enter { side: Side::Right, display: Some(0), .. }), "{enter:?}");
     }
     #[test]
+    fn a_wrapped_computer_goes_back_over_any_edge_that_touches_the_controllers_monitor() {
+        let mut r = rig(Role::Sub);
+        let me = r.c.identity.id.clone();
+        r.c.config.peers.push(peer(MASTER, Role::Master));
+        let rx = link_features(&mut r.c, MASTER, Role::Master, &["group", "keyrules", "displays", "pass"]);
+        *r.p.rects.lock().unwrap() = vec![big(0.0)];
+        r.c.refresh_displays();
+        // The master's monitors wrap this computer like an L: monitor 0 above it, monitor 1 left of it.
+        r.c.group = Some((vec![Cell::of_display(MASTER, 0, 1, 0), Cell::of_display(MASTER, 1, 0, 1), Cell::new(&me, 1, 1)], vec![]));
+        r.c.peer_displays.insert(MASTER.into(), vec![big(0.0), big(1000.0)]);
+        // It came in over the top; pushed out over the left edge it goes back to monitor 1.
+        r.c.state = State::Controlled { peer: MASTER.into(), entered: Side::Top };
+        r.c.motion = (-5.0, 0.0);
+        *r.p.cursor_at.lock().unwrap() = Some((0.0, 400.0));
+        r.c.poll_cursor();
+        assert!(matches!(r.c.state, State::Local));
+        let leave = sent(&rx).into_iter().find(|m| matches!(m, Msg::Leave { .. })).unwrap();
+        assert_eq!(leave, Msg::Leave { pos: 400.0 / 999.0, display: Some(1), side: Some(Side::Right) });
+        // Moving the other way (inward) at that edge leaves nothing.
+        r.c.state = State::Controlled { peer: MASTER.into(), entered: Side::Top };
+        r.c.motion = (5.0, 0.0);
+        r.c.last_cursor = Some((0.0, 400.0));
+        r.c.poll_cursor();
+        assert!(matches!(r.c.state, State::Controlled { .. }));
+        // The bottom edge has nothing next to it: it stays.
+        r.c.motion = (0.0, 5.0);
+        *r.p.cursor_at.lock().unwrap() = Some((500.0, 999.0));
+        r.c.poll_cursor();
+        assert!(matches!(r.c.state, State::Controlled { .. }));
+    }
+
+    #[test]
+    fn a_controlled_computer_asks_its_controller_to_pass_control_to_the_computer_next_to_it() {
+        let mut r = rig(Role::Sub);
+        let me = r.c.identity.id.clone();
+        r.c.config.peers.push(peer(MASTER, Role::Master));
+        let rx = link_features(&mut r.c, MASTER, Role::Master, &["group", "keyrules", "displays", "pass"]);
+        *r.p.rects.lock().unwrap() = vec![big(0.0)];
+        r.c.refresh_displays();
+        // The master above, another sub on the left.
+        r.c.group = Some((vec![Cell::new(MASTER, 1, 0), Cell::new(OTHER, 0, 1), Cell::new(&me, 1, 1)], vec![]));
+        r.c.state = State::Controlled { peer: MASTER.into(), entered: Side::Top };
+        r.c.motion = (-5.0, 0.0);
+        *r.p.cursor_at.lock().unwrap() = Some((0.0, 400.0));
+        r.c.poll_cursor();
+        let pass = sent(&rx).into_iter().find(|m| matches!(m, Msg::Pass { .. })).expect("pass asked");
+        assert!(matches!(pass, Msg::Pass { ref to, side: Side::Left, display: Some(0), .. } if to == OTHER), "{pass:?}");
+        // The cursor stays until the master lets go, then stays at the left edge.
+        assert!(matches!(r.c.state, State::Controlled { .. }));
+        r.c.poll_cursor();
+        assert!(!sent(&rx).iter().any(|m| matches!(m, Msg::Pass { .. })), "not repeated at once");
+        message(&mut r.c, MASTER, Msg::ReleaseAll);
+        assert!(matches!(r.c.state, State::Local));
+        assert!(r.p.cursor().unwrap().0 < 1.0, "{:?}", r.p.cursor());
+        // A master before 2.4 cannot pass: nothing is asked and the cursor stays.
+        r.c.links.get_mut(MASTER).unwrap().features = vec!["group".into(), "displays".into()];
+        r.c.state = State::Controlled { peer: MASTER.into(), entered: Side::Top };
+        r.c.pass_side = None;
+        r.c.poll_cursor();
+        assert!(!sent(&rx).iter().any(|m| matches!(m, Msg::Pass { .. } | Msg::Leave { .. })));
+        assert!(matches!(r.c.state, State::Controlled { .. }));
+    }
+
+    #[test]
+    fn the_controller_passes_control_on_to_the_computer_it_was_asked_for() {
+        let mut r = rig(Role::Master);
+        r.c.config.peers.push(peer(SUB, Role::Sub));
+        r.c.config.peers.push(peer(OTHER, Role::Sub));
+        let from = link_features(&mut r.c, SUB, Role::Sub, &["group", "keyrules", "displays", "pass"]);
+        let to = link_features(&mut r.c, OTHER, Role::Sub, &["group", "keyrules", "displays", "pass"]);
+        controlling(&mut r.c, SUB);
+        message(&mut r.c, SUB, Msg::Pass { to: OTHER.into(), side: Side::Left, pos: 0.4, whole: 0.3, display: Some(0) });
+        assert!(sent(&from).iter().any(|m| matches!(m, Msg::ReleaseAll)));
+        assert!(sent(&to).iter().any(|m| matches!(m, Msg::Enter { side: Side::Left, .. })));
+        assert!(matches!(&r.c.state, State::Controlling { peer, .. } if peer == OTHER));
+        // Only the computer being controlled may ask, and only for an open link.
+        message(&mut r.c, SUB, Msg::Pass { to: SUB.into(), side: Side::Right, pos: 0.5, whole: 0.5, display: None });
+        assert!(matches!(&r.c.state, State::Controlling { peer, .. } if peer == OTHER));
+        message(&mut r.c, OTHER, Msg::Pass { to: THIRD.into(), side: Side::Right, pos: 0.5, whole: 0.5, display: None });
+        assert!(matches!(&r.c.state, State::Controlling { peer, .. } if peer == OTHER));
+        // A Leave that names a side brings the cursor back at that side.
+        message(&mut r.c, OTHER, Msg::Leave { pos: 0.5, display: None, side: Some(Side::Bottom) });
+        assert!(matches!(r.c.state, State::Local));
+        let (_, y) = *r.p.warps.lock().unwrap().last().unwrap();
+        assert!(y > 90.0, "placed at the bottom edge, got y = {y}");
+    }
+
+    #[test]
     fn a_controlled_monitor_without_a_cell_may_go_back_like_in_2_1() {
         let mut r = rig(Role::Master);
         let me = r.c.identity.id.clone();
@@ -5212,7 +5394,7 @@ mod tests {
         r.c.poll_cursor();
         assert!(matches!(r.c.state, State::Local));
         let leave = sent(&rx).into_iter().find(|m| matches!(m, Msg::Leave { .. })).unwrap();
-        assert_eq!(leave, Msg::Leave { pos: 400.0 / 999.0, display: None });
+        assert_eq!(leave, Msg::Leave { pos: 400.0 / 999.0, display: None, side: None });
     }
     #[test]
     fn a_peer_that_said_paused_is_left_alone_for_a_minute_unless_it_dials() {

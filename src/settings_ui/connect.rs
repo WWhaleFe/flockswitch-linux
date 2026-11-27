@@ -153,10 +153,6 @@ impl SettingsApp {
             }
         }
 
-        if let Some(pairing) = live.and_then(|s| s.pairing.as_ref()) {
-            gap(ui);
-            self.pairing_card(ui, t, p, pairing);
-        }
 
         // The layout map.
         gap(ui);
@@ -167,6 +163,13 @@ impl SettingsApp {
             }
         });
         card_pad(ui, p, |ui| self.layout_block(ui, t, p, status.as_ref()));
+
+        // A pairing in progress sits right under the map, next to the list it was started
+        // from, so its code and buttons are in reach without scrolling back up.
+        if let Some(pairing) = live.and_then(|s| s.pairing.as_ref()) {
+            gap(ui);
+            self.pairing_card(ui, t, p, pairing);
+        }
 
         // Nearby computers, and the paired ones.
         gap(ui);
@@ -508,6 +511,24 @@ impl SettingsApp {
                     }
                 }
                 self.layout_pick = None;
+            }
+        }
+
+        // Put the picked computer's tiles back the way its monitors are arranged.
+        if let Some((id, display)) = self.layout_pick.clone().filter(|_| editable) {
+            let tiles = cells.iter().filter(|c| c.id == id).count();
+            if tiles > 1 {
+                ui.add_space(10.0);
+                if button(ui, p, t.layout_rescan, ButtonKind::Plain).clicked() {
+                    let next = logic::reset_monitors(&cells, &id, display);
+                    let keep = next.iter().find(|c| c.id == id).map(|c| c.display).unwrap_or(display);
+                    self.apply(|c| {
+                        // The service places the other monitors again from the arrangement it knows.
+                        c.network.layout.retain(|x| !(x.id == id && x.display != keep));
+                        logic::set_layout(&mut c.network, &me, next)
+                    });
+                    self.layout_pick = None;
+                }
             }
         }
 

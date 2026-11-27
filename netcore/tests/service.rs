@@ -1506,3 +1506,35 @@ fn a_mac_that_unpaired_while_the_master_was_off_can_pair_with_it_again() {
         s.stop();
     }
 }
+
+#[test]
+fn the_masters_mouse_goes_on_from_one_sub_to_the_sub_next_to_it_and_back() {
+    // Master in the middle, A right of it, B below A: from A the cursor goes down to B
+    // without passing the master, and from B back up to A, and from A left to the master.
+    let mut g = Group::new(&[Os::Mac, Os::Linux]);
+    g.place(&[(1, 1), (2, 1), (2, 2)]);
+    let (a, b) = (&g.subs[0], &g.subs[1]);
+    wait("subs learn the grid", || a.svc.status().layout.len() == 3 && b.svc.status().layout.len() == 3);
+    wait("master arms its right edge", || g.m.platform.armed.lock().unwrap().contains(&Side::Right));
+    g.m.platform.warp(99.0, 50.0);
+    wait("master controls A", || modes(&g) == ["controlling", "controlled", "local"]);
+    // Away from the corner, then down on A: A asks the master to pass control to B.
+    g.m.platform.send(InputEvent::Motion { dx: 40.0, dy: 0.0 });
+    g.m.platform.send(InputEvent::Motion { dx: 0.0, dy: 80.0 });
+    wait("master controls B", || {
+        modes(&g) == ["controlling", "local", "controlled"] && g.m.svc.status().state.peer.as_deref() == Some(b.id.as_str())
+    });
+    // B came in over its top edge: the master's keys now reach B.
+    let key = InputEvent::Key { usage: 5, down: true };
+    g.m.platform.send(key.clone());
+    wait("key on B", || b.platform.records().contains(&key));
+    // Up again: back to A (through the master), then left on A: back on the master.
+    g.m.platform.send(InputEvent::Motion { dx: 0.0, dy: -80.0 });
+    wait("master controls A again", || {
+        modes(&g) == ["controlling", "controlled", "local"] && g.m.svc.status().state.peer.as_deref() == Some(a.id.as_str())
+    });
+    g.m.platform.send(InputEvent::Motion { dx: 0.0, dy: -40.0 });
+    g.m.platform.send(InputEvent::Motion { dx: -80.0, dy: 0.0 });
+    wait("back on the master", || modes(&g) == ["local", "local", "local"]);
+    g.stop();
+}
