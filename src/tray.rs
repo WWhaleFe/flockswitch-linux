@@ -134,6 +134,8 @@ pub fn run(shared: Arc<Shared>, open_settings: bool) -> Result<()> {
             shared.stop.store(true, std::sync::atomic::Ordering::SeqCst);
         }
         if shared.stopped() {
+            // An open settings window has nothing left to talk to: close it.
+            crate::settings_ui::tell_settings_to_quit();
             if let Some(h) = engine.take() {
                 join_briefly(h); // lets the engine hand the button back first
             }

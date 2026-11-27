@@ -61,6 +61,63 @@ pub enum Opening {
     Setup,
 }
 
+/// The word the background app sends to the open settings window when it quits.
+pub const KNOCK_QUIT: &[u8] = b"quit";
+
+/// Set when the background app is gone (or said it quits): the window closes.
+static CLOSE_NOW: AtomicBool = AtomicBool::new(false);
+
+/// What a knock on the settings port asks for.
+#[derive(Debug, PartialEq)]
+enum Knock {
+    Raise,
+    General,
+    Quit,
+}
+
+/// The meaning of the bytes of a knock (empty: an older copy knocking without a word).
+fn parse_knock(bytes: &[u8]) -> Knock {
+    match bytes {
+        b"setup" | b"update" => Knock::General,
+        KNOCK_QUIT => Knock::Quit,
+        _ => Knock::Raise,
+    }
+}
+
+/// Tells an open settings window that the background app quits, so it closes too.
+pub fn tell_settings_to_quit() {
+    use std::io::Write;
+    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], crate::INSTANCE_PORT + 1));
+    if let Ok(mut stream) = std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(300)) {
+        let _ = stream.write_all(KNOCK_QUIT);
+    }
+}
+
+/// Follows whether the background app is running. A window opened on its own (no
+/// background app ever seen) stays; once the app was seen and is gone for two polls in
+/// a row, the window should close.
+#[derive(Default)]
+struct BackgroundWatch {
+    seen: bool,
+    missing: u8,
+}
+
+impl BackgroundWatch {
+    /// One poll; true when the window should close.
+    fn poll(&mut self, running: bool) -> bool {
+        if running {
+            self.seen = true;
+            self.missing = 0;
+            return false;
+        }
+        if !self.seen {
+            return false;
+        }
+        self.missing = self.missing.saturating_add(1);
+        self.missing >= 2
+    }
+}
+
 /// The window: one fixed size, no resizing, no maximize button, GNOME ASCII title safety.
 fn window_builder(title: &str, icon: egui::IconData) -> egui::ViewportBuilder {
     egui::ViewportBuilder::default()
@@ -103,6 +160,7 @@ pub fn run(lock: std::net::TcpListener, opening: Opening) -> Result<()> {
             let raise = Arc::new(AtomicBool::new(false));
             let general = Arc::new(AtomicBool::new(false));
             let (ctx, flag, to_general) = (cc.egui_ctx.clone(), raise.clone(), general.clone());
+            let watch_ctx = ctx.clone();
             std::thread::spawn(move || {
                 for knock in lock.incoming() {
                     // An older copy knocks without a word; a page name follows otherwise.
@@ -115,11 +173,25 @@ pub fn run(lock: std::net::TcpListener, opening: Opening) -> Result<()> {
                             s.read(&mut page).ok()
                         })
                         .unwrap_or(0);
-                    if matches!(&page[..n], b"setup" | b"update") {
-                        to_general.store(true, Ordering::Relaxed);
+                    match parse_knock(&page[..n]) {
+                        Knock::Quit => CLOSE_NOW.store(true, Ordering::SeqCst),
+                        Knock::General => {
+                            to_general.store(true, Ordering::Relaxed);
+                            flag.store(true, Ordering::Relaxed);
+                        }
+                        Knock::Raise => flag.store(true, Ordering::Relaxed),
                     }
-                    flag.store(true, Ordering::Relaxed);
                     ctx.request_repaint();
+                }
+            });
+            std::thread::spawn(move || {
+                let mut watch = BackgroundWatch::default();
+                loop {
+                    std::thread::sleep(Duration::from_secs(1));
+                    if watch.poll(crate::main_instance_running()) {
+                        CLOSE_NOW.store(true, Ordering::SeqCst);
+                        watch_ctx.request_repaint();
+                    }
                 }
             });
             Ok(Box::new(SettingsApp::new(&cc.egui_ctx, raise, general, opening)))
@@ -830,6 +902,10 @@ impl SettingsApp {
         if matches!(*self.update.lock().unwrap(), UpdateUi::Restarting) {
             self.haptics_dialog = None;
             self.stop_recording();
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
+        // The background app quit: close, unless an uninstall is showing its result.
+        if CLOSE_NOW.load(Ordering::SeqCst) && !matches!(self.uninstall, Uninstall::Waiting(_) | Uninstall::Done) {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
         if self.last_refresh.elapsed() >= REFRESH {
@@ -3642,6 +3718,30 @@ impl SettingsApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn knock_words() {
+        assert_eq!(parse_knock(b"quit"), Knock::Quit);
+        assert_eq!(parse_knock(b"setup"), Knock::General);
+        assert_eq!(parse_knock(b"update"), Knock::General);
+        assert_eq!(parse_knock(b""), Knock::Raise);
+        assert_eq!(parse_knock(b"quitx"), Knock::Raise);
+    }
+
+    #[test]
+    fn background_watch_closes_only_after_the_app_was_seen() {
+        let mut alone = BackgroundWatch::default();
+        assert!(!alone.poll(false) && !alone.poll(false) && !alone.poll(false));
+        let mut w = BackgroundWatch::default();
+        assert!(!w.poll(true));
+        assert!(!w.poll(false));
+        assert!(w.poll(false));
+        let mut blip = BackgroundWatch::default();
+        blip.poll(true);
+        assert!(!blip.poll(false));
+        assert!(!blip.poll(true));
+        assert!(!blip.poll(false));
+    }
 
     #[test]
     fn the_window_has_one_fixed_size() {
