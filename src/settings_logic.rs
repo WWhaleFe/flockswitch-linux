@@ -22,17 +22,58 @@ pub fn cell_at(cells: &[Cell], col: u8, row: u8) -> Option<&Cell> {
     cells.iter().find(|c| (c.col, c.row) == (col, row))
 }
 
-/// Moves (or first places) one monitor tile, monitor `display` of computer `id`, into the
-/// empty cell (`col`, `row`); the computer's other monitor tiles stay where they are. None
-/// when that is not allowed: the cell is outside the grid or taken, or `id` is not one of
-/// `known` (this computer and the paired ones).
+/// Moves (or first places) computer `id` so that its monitor `display` lands on (`col`, `row`).
+/// All of that computer's monitor tiles move together by the same number of cells, so the
+/// shape of its monitor arrangement stays as it is. None when that is not allowed: a tile
+/// would leave the grid or land on another computer's cell, or `id` is not one of `known`
+/// (this computer and the paired ones). Landing on the computer's own tiles is fine.
 pub fn move_to(cells: &[Cell], known: &[String], id: &str, display: u8, col: u8, row: u8) -> Option<Vec<Cell>> {
-    if col >= COLS || row >= ROWS || !known.iter().any(|k| k == id) || cell_at(cells, col, row).is_some() {
+    let offset = group_offset(cells, known, id, display, col, row)?;
+    let mut next: Vec<Cell> = cells.iter().filter(|c| c.id != id).cloned().collect();
+    let own: Vec<&Cell> = cells.iter().filter(|c| c.id == id).collect();
+    if own.is_empty() {
+        next.push(Cell::of_display(id, display, col, row));
+    } else {
+        next.extend(own.into_iter().filter_map(|c| shifted(c, offset)));
+    }
+    Some(next)
+}
+
+/// How far (columns, rows) the tiles of `id` move when its monitor `display` goes to
+/// (`col`, `row`); (0, 0) for a computer that has no tile yet. None when it may not go there.
+pub fn group_offset(cells: &[Cell], known: &[String], id: &str, display: u8, col: u8, row: u8) -> Option<(i16, i16)> {
+    if col >= COLS || row >= ROWS || !known.iter().any(|k| k == id) {
         return None;
     }
-    let mut next: Vec<Cell> = cells.iter().filter(|c| !(c.id == id && c.display == display)).cloned().collect();
-    next.push(Cell::of_display(id, display, col, row));
-    Some(next)
+    let own: Vec<&Cell> = cells.iter().filter(|c| c.id == id).collect();
+    // The picked monitor is the anchor; a monitor without a tile of its own moves the whole
+    // computer by its first tile.
+    let offset = match own.iter().find(|c| c.display == display).or(own.first()) {
+        Some(anchor) => (i16::from(col) - i16::from(anchor.col), i16::from(row) - i16::from(anchor.row)),
+        None => (0, 0),
+    };
+    if own.is_empty() {
+        return cell_at(cells, col, row).is_none().then_some(offset);
+    }
+    for c in &own {
+        let to = shifted(c, offset)?;
+        if cell_at(cells, to.col, to.row).is_some_and(|o| o.id != id) {
+            return None;
+        }
+    }
+    Some(offset)
+}
+
+/// The tiles of `id` in `cells` moved by `offset`; tiles that would leave the grid are left
+/// out (for a monitor that is unplugged now, whose saved tile follows its computer).
+pub fn shift(cells: &[Cell], id: &str, offset: (i16, i16)) -> Vec<Cell> {
+    cells.iter().filter_map(|c| if c.id == id { shifted(c, offset) } else { Some(c.clone()) }).collect()
+}
+
+fn shifted(c: &Cell, (dc, dr): (i16, i16)) -> Option<Cell> {
+    let col = u8::try_from(i16::from(c.col) + dc).ok().filter(|v| *v < COLS)?;
+    let row = u8::try_from(i16::from(c.row) + dr).ok().filter(|v| *v < ROWS)?;
+    Some(Cell { col, row, ..c.clone() })
 }
 
 /// `next` plus the saved cells of monitors the service does not list now (a monitor that
@@ -245,18 +286,29 @@ mod tests {
     }
 
     #[test]
-    fn a_click_moves_one_monitor_tile_only() {
+    fn moving_one_monitor_tile_moves_the_whole_computer_and_keeps_its_shape() {
         let known = ids(&["me", "a"]);
-        let cells = vec![cell("me", 2, 1), cell("a", 1, 1), Cell::of_display("a", 1, 0, 1)];
-        let moved = move_to(&cells, &known, "a", 1, 0, 3).unwrap();
+        // a has two monitors side by side, left of the master.
+        let cells = vec![cell("me", 2, 1), Cell::of_display("a", 0, 0, 1), Cell::of_display("a", 1, 1, 1)];
+        // Its right monitor goes to (5, 3): the left one follows to (4, 3).
+        let moved = move_to(&cells, &known, "a", 1, 5, 3).unwrap();
         assert_eq!(moved.len(), 3);
-        assert!(moved.contains(&cell("a", 1, 1)), "the first monitor stays");
-        assert!(moved.contains(&Cell::of_display("a", 1, 0, 3)));
-        assert!(cell_at(&moved, 0, 1).is_none());
-        // Own monitors next to each other are no pair of computers.
-        assert!(direct_pairs(&moved, "me").is_empty());
-        let two = vec![cell("me", 2, 1), cell("a", 0, 0), Cell::of_display("a", 1, 1, 0), cell("b", 0, 1), Cell::of_display("b", 1, 1, 1)];
-        assert_eq!(direct_pairs(&two, "me"), vec![("a".to_string(), "b".to_string())]);
+        assert!(moved.contains(&Cell::of_display("a", 0, 4, 3)) && moved.contains(&Cell::of_display("a", 1, 5, 3)));
+        assert!(moved.contains(&cell("me", 2, 1)));
+        // One step right lands the left monitor on the right one's old cell: allowed.
+        let moved = move_to(&cells, &known, "a", 0, 1, 0).unwrap();
+        assert!(moved.contains(&Cell::of_display("a", 0, 1, 0)) && moved.contains(&Cell::of_display("a", 1, 2, 0)));
+        // The other monitor would land on the master, or leave the grid: refused.
+        assert!(move_to(&cells, &known, "a", 0, 1, 1).is_none());
+        assert!(move_to(&cells, &known, "a", 1, 0, 0).is_none());
+        assert_eq!(group_offset(&cells, &known, "a", 1, 5, 3), Some((4, 2)));
+        // Tiles of an unplugged monitor follow with `shift`; one pushed off the grid is dropped.
+        let saved = vec![cell("me", 2, 1), Cell::of_display("a", 0, 0, 1), Cell::of_display("a", 2, 0, 0)];
+        assert_eq!(shift(&saved, "a", (1, 0)), vec![cell("me", 2, 1), Cell::of_display("a", 0, 1, 1), Cell::of_display("a", 2, 1, 0)]);
+        assert_eq!(shift(&saved, "a", (0, -1)), vec![cell("me", 2, 1), Cell::of_display("a", 0, 0, 0)]);
+        // Two monitors of one computer side by side are not a pair of computers.
+        let two = vec![cell("me", 2, 1), Cell::of_display("a", 0, 0, 0), Cell::of_display("a", 1, 1, 0)];
+        assert!(direct_pairs(&two, "me").is_empty());
     }
 
     #[test]

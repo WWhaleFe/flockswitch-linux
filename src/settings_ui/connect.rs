@@ -464,7 +464,15 @@ impl SettingsApp {
             });
         }
         let picked = self.layout_pick.clone().filter(|_| editable);
-        let click = draw_map(ui, p, t, &grid, picked.as_ref().map(|(id, d)| (id.as_str(), *d)), editable);
+        // Where the picked computer may go: its picked monitor on that cell, the others alongside.
+        let placeable: Vec<String> = std::iter::once(me.clone()).chain(net.peers.iter().map(|x| x.id.clone())).collect();
+        let targets: Vec<bool> = (0..COLS * ROWS)
+            .map(|i| {
+                let (col, row) = (i % COLS, i / COLS);
+                picked.as_ref().is_some_and(|(id, d)| logic::group_offset(&cells, &placeable, id, *d, col, row).is_some())
+            })
+            .collect();
+        let click = draw_map(ui, p, t, &grid, picked.as_ref().map(|(id, d)| (id.as_str(), *d)), editable, &targets);
 
         // Computers paired but not on the map yet.
         let known: Vec<String> = std::iter::once(me.clone()).chain(net.peers.iter().map(|x| x.id.clone())).collect();
@@ -491,8 +499,12 @@ impl SettingsApp {
             }
             MapClick::Place(col, row) => {
                 if let Some((id, display)) = picked {
-                    if let Some(next) = logic::move_to(&cells, &known, &id, display, col, row) {
-                        self.apply(|c| logic::set_layout(&mut c.network, &me, next));
+                    if let (Some(next), Some(offset)) = (logic::move_to(&cells, &known, &id, display, col, row), logic::group_offset(&cells, &known, &id, display, col, row)) {
+                        self.apply(|c| {
+                            // Saved tiles of its unplugged monitors move along with the computer.
+                            c.network.layout = logic::shift(&c.network.layout, &id, offset);
+                            logic::set_layout(&mut c.network, &me, next)
+                        });
                     }
                 }
                 self.layout_pick = None;
@@ -783,7 +795,10 @@ fn button_small(ui: &mut Ui, p: Palette, label: &str) -> Response {
 }
 
 /// Draws the 6x4 map and says what was clicked.
-fn draw_map(ui: &mut Ui, p: Palette, t: &Texts, grid: &[Option<MapCell>], picked: Option<(&str, u8)>, editable: bool) -> MapClick {
+/// `targets` (one per cell, row by row) says where the picked computer may be put. A tile is
+/// picked by a click or by starting to drag it; the whole computer, every monitor tile of it,
+/// goes where it is dropped (a click on a target, or the end of the drag).
+fn draw_map(ui: &mut Ui, p: Palette, t: &Texts, grid: &[Option<MapCell>], picked: Option<(&str, u8)>, editable: bool, targets: &[bool]) -> MapClick {
     let (pad, gutter, cell_h) = (14.0_f32, 10.0_f32, 76.0_f32);
     let (cols, rows) = (f32::from(COLS), f32::from(ROWS));
     let width = ui.available_width();
@@ -803,6 +818,20 @@ fn draw_map(ui: &mut Ui, p: Palette, t: &Texts, grid: &[Option<MapCell>], picked
     }
     let cell_w = (width - 2.0 * pad - (cols - 1.0) * gutter) / cols;
     let mut click = MapClick::Nothing;
+    let cell_rect = |col: u8, row: u8| {
+        Rect::from_min_size(
+            rect.min + Vec2::new(pad + f32::from(col) * (cell_w + gutter), pad + f32::from(row) * (cell_h + gutter)),
+            Vec2::new(cell_w, cell_h),
+        )
+    };
+    let pointer = ui.ctx().pointer_latest_pos();
+    let target_at = |col: u8, row: u8| editable && targets.get(usize::from(row) * usize::from(COLS) + usize::from(col)).copied().unwrap_or(false);
+    // The picked monitor's cell, and the cell under the pointer that it would move to.
+    let anchor = picked.and_then(|(id, d)| {
+        (0..COLS * ROWS).find(|&i| grid[usize::from(i)].as_ref().is_some_and(|c| c.id == id && c.display == d)).map(|i| (i % COLS, i / COLS))
+    });
+    let mut dragging = false;
+    let mut released = false;
     for row in 0..ROWS {
         for col in 0..COLS {
             let r = Rect::from_min_size(
@@ -810,10 +839,22 @@ fn draw_map(ui: &mut Ui, p: Palette, t: &Texts, grid: &[Option<MapCell>], picked
                 Vec2::new(cell_w, cell_h),
             );
             let occupant = grid[usize::from(row) * usize::from(COLS) + usize::from(col)].as_ref();
-            let drop = occupant.is_none() && picked.is_some() && editable;
-            let sense = if editable && (occupant.is_some() || drop) { Sense::click() } else { Sense::hover() };
+            let drop = target_at(col, row);
+            let sense = if editable && occupant.is_some() {
+                Sense::click_and_drag()
+            } else if drop {
+                Sense::click()
+            } else {
+                Sense::hover()
+            };
             let resp = ui.interact(r, ui.scope_id().with(("map-cell", col, row)), sense);
-            let resp = if sense == Sense::click() { resp.on_hover_cursor(egui::CursorIcon::PointingHand) } else { resp };
+            let resp = if sense != Sense::hover() { resp.on_hover_cursor(egui::CursorIcon::PointingHand) } else { resp };
+            if resp.dragged() {
+                dragging = true;
+            }
+            if resp.drag_stopped() {
+                released = true;
+            }
             match occupant {
                 Some(cell) => {
                     resp.widget_info(|| WidgetInfo::labeled(Role::Button, editable, &cell.name));
@@ -831,6 +872,9 @@ fn draw_map(ui: &mut Ui, p: Palette, t: &Texts, grid: &[Option<MapCell>], picked
                     }
                     if picked == Some((cell.id.as_str(), cell.display)) {
                         painter.rect_stroke(r.expand(2.0), 14, Stroke::new(2.0, p.text), StrokeKind::Outside);
+                    } else if picked.is_some_and(|(id, _)| id == cell.id) {
+                        // The computer's other monitors: they move along with the picked one.
+                        painter.rect_stroke(r.expand(2.0), 14, Stroke::new(1.5, p.muted), StrokeKind::Outside);
                     }
                     let name_w = r.width() - 28.0 - if cell.here { 16.0 } else { 0.0 };
                     let name = elided(ui, &cell.name, bold(14.0), p.text, name_w);
@@ -847,14 +891,18 @@ fn draw_map(ui: &mut Ui, p: Palette, t: &Texts, grid: &[Option<MapCell>], picked
                     painter.circle_filled(dot, 3.0, if cell.away { p.off } else { p.green });
                     let detail = elided(ui, &cell.detail, FontId::proportional(12.0), p.muted, r.width() - 40.0);
                     painter.galley(Pos2::new(r.left() + 28.0, r.bottom() - 18.0 - detail.size().y / 2.0), detail, p.muted);
+                    let own_target = drop && picked.is_some_and(|(id, d)| id == cell.id && d != cell.display);
                     if resp.clicked() {
+                        click = if own_target { MapClick::Place(col, row) } else { MapClick::Pick(cell.id.clone(), cell.display) };
+                    } else if resp.drag_started() && picked != Some((cell.id.as_str(), cell.display)) {
                         click = MapClick::Pick(cell.id.clone(), cell.display);
                     }
                 }
                 None => {
                     resp.widget_info(|| WidgetInfo::labeled(Role::Button, drop, t.layout_empty));
                     if drop {
-                        painter.rect_filled(r, 12, p.text.gamma_multiply(if resp.hovered() { 0.14 } else { 0.07 }));
+                        let over = resp.hovered() || pointer.is_some_and(|q| r.contains(q));
+                        painter.rect_filled(r, 12, p.text.gamma_multiply(if over { 0.14 } else { 0.07 }));
                         painter.rect_stroke(r, 12, Stroke::new(1.5, p.muted), StrokeKind::Inside);
                     } else {
                         painter.rect_stroke(r, 12, Stroke::new(1.0, p.border), StrokeKind::Inside);
@@ -865,6 +913,28 @@ fn draw_map(ui: &mut Ui, p: Palette, t: &Texts, grid: &[Option<MapCell>], picked
                 }
             }
         }
+    }
+    // Under the pointer, the outline of every tile of the picked computer where it would go.
+    let hovered = pointer.and_then(|q| (0..COLS * ROWS).map(|i| (i % COLS, i / COLS)).find(|&(c, r)| cell_rect(c, r).contains(q)));
+    if let (Some((id, _)), Some((ac, ar)), Some((hc, hr))) = (picked, anchor, hovered) {
+        if target_at(hc, hr) && (dragging || (hc, hr) != (ac, ar)) {
+            let (dc, dr) = (i16::from(hc) - i16::from(ac), i16::from(hr) - i16::from(ar));
+            for i in 0..COLS * ROWS {
+                if grid[usize::from(i)].as_ref().is_some_and(|c| c.id == id) {
+                    let (c, r) = (i16::from(i % COLS) + dc, i16::from(i / COLS) + dr);
+                    if let (Ok(c), Ok(r)) = (u8::try_from(c), u8::try_from(r)) {
+                        painter.rect_stroke(cell_rect(c, r).shrink(3.0), 10, Stroke::new(2.0, p.text.gamma_multiply(0.7)), StrokeKind::Inside);
+                    }
+                }
+            }
+        }
+    }
+    // The end of a drag puts the computer down where the pointer is.
+    if released && picked.is_some() {
+        click = match hovered {
+            Some((c, r)) if target_at(c, r) && Some((c, r)) != anchor => MapClick::Place(c, r),
+            _ => MapClick::Nothing,
+        };
     }
     click
 }

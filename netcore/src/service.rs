@@ -205,6 +205,7 @@ impl Service {
         };
         control.refresh_displays();
         control.setup_discovery();
+        control.dial_all_now();
         let handle = thread::Builder::new()
             .name("flock-net-control".into())
             .spawn(move || control.run())?;
@@ -668,7 +669,9 @@ impl Control {
             return;
         }
         let outgoing = socket.is_none();
-        if outgoing && !self.inflight.insert(addr) {
+        // One automatic dial per address at a time. A pairing the user asked for goes out
+        // even while an earlier link to that address is still closing.
+        if outgoing && !self.inflight.insert(addr) && !pair {
             return;
         }
         let cancel = Arc::new(AtomicBool::new(false));
@@ -883,7 +886,7 @@ impl Control {
                 self.disconnect(&p.id, "paused");
             } else if was && !p.paused {
                 self.retry.remove(&p.id);
-                self.down_since.remove(&p.id);
+                self.dial_now(&p.id);
             }
         }
         if !config.on {
@@ -939,6 +942,26 @@ impl Control {
         if rediscover {
             self.setup_discovery();
         }
+        if rebind && self.config.on {
+            // Switched on again: a backoff grown before or while it was off does not apply.
+            self.retry.clear();
+            self.dial_all_now();
+        }
+    }
+    /// The side that was just switched on or resumed dials at once, whichever id is smaller:
+    /// the other side may be waiting out a pause quiet or a long backoff. A link that comes
+    /// up from both sides at once is settled in `Event::Connected`.
+    fn dial_now(&mut self, id: &str) {
+        match Instant::now().checked_sub(FALLBACK_DIAL) {
+            Some(t) => { self.down_since.insert(id.into(), t); }
+            None => { self.down_since.remove(id); }
+        }
+    }
+    fn dial_all_now(&mut self) {
+        let ids: Vec<String> = self.config.peers.iter().map(|p| p.id.clone()).collect();
+        for id in ids {
+            self.dial_now(&id);
+        }
     }
     fn request(&mut self, request: Request) {
         if let Request::Pause { pause, paused } = &request {
@@ -984,10 +1007,12 @@ impl Control {
                 self.recent_paired.remove(&unpair);
                 self.config.peers.retain(|p| p.id != unpair);
                 self.config.layout.retain(|c| c.id != unpair);
+                // Say "unpaired" before `clear_group` closes the master's link with a reason
+                // that would leave the master still paired to this computer.
+                self.disconnect(&unpair, "unpaired");
                 if was_master {
                     self.clear_group();
                 }
-                self.disconnect(&unpair, "unpaired");
                 self.prune_peer_state();
                 (self.hooks.on_unpaired)(unpair);
             }
@@ -1015,7 +1040,7 @@ impl Control {
             self.disconnect(id, "paused");
         } else {
             self.retry.remove(id);
-            self.down_since.remove(id);
+            self.dial_now(id);
             self.peer_paused_until.remove(id);
         }
     }
@@ -1216,16 +1241,31 @@ impl Control {
                         Msg::PairRequest | Msg::PairAccept | Msg::PairReject | Msg::Bye { .. }
                     )
                 {
+                    // While we pair with it, a peer that still holds us as paired may send
+                    // session traffic until it reads our PairRequest: drop that, keep the link.
+                    if self.pairing.as_ref().is_some_and(|p| p.peer == id) {
+                        return;
+                    }
                     self.disconnect(&id, "unpaired message");
                     return;
                 }
                 // Anything but a goodbye or hello on a paired link means the peer accepts us.
-                if !self.unpaired_seen.is_empty() && !matches!(msg, Msg::Bye { .. } | Msg::Hello { .. }) {
+                // ReleaseAll does not: every closing link sends it just before its Bye.
+                if !self.unpaired_seen.is_empty() && !matches!(msg, Msg::Bye { .. } | Msg::Hello { .. } | Msg::ReleaseAll) {
                     self.unpaired_seen.remove(&id);
                 }
                 match msg {
                     Msg::Hello { .. } => self.disconnect(&id, "duplicate hello"),
-                    Msg::PairRequest => self.begin_pair(&id),
+                    Msg::PairRequest => {
+                        // The peer asks to pair on a link we hold as paired: it has forgotten
+                        // this computer (unpaired there while the goodbye was lost). Pair anew,
+                        // with the code shown on both sides as usual.
+                        if l.paired && self.pairing.is_none() {
+                            log::info!("{id} asks to pair again: it no longer knows this computer");
+                            l.paired = false;
+                        }
+                        self.begin_pair(&id)
+                    }
                     Msg::PairAccept => {
                         if let Some(p) = &mut self.pairing {
                             if p.peer == id {
@@ -1391,10 +1431,10 @@ impl Control {
                             let was_master = self.config.peers.iter().any(|p| p.id == id && p.role == Role::Master);
                             self.config.peers.retain(|p| p.id != id);
                             self.config.layout.retain(|c| c.id != id);
+                            self.disconnect(&id, "bye");
                             if was_master {
                                 self.clear_group();
                             }
-                            self.disconnect(&id, "bye");
                             self.prune_peer_state();
                             (self.hooks.on_unpaired)(id);
                         } else {
@@ -1823,6 +1863,7 @@ impl Control {
         }
         self.retry.clear();
         self.down_since.clear();
+        self.dial_all_now();
         self.reconnecting = Some(Instant::now());
         // A wake-up or network change can leave the listener and the mDNS advertisement
         // stale: check the listener and, after a wake-up, start discovery afresh.
@@ -4623,6 +4664,8 @@ mod tests {
         assert_eq!(r.c.config.peers.len(), 1);
         *r.c.unpaired_seen.get_mut(MASTER).unwrap() -= Duration::from_secs(11);
         let _rx = link(&mut r.c, MASTER, Role::Master);
+        // Every closing link sends ReleaseAll before its Bye: that is no working session.
+        message(&mut r.c, MASTER, Msg::ReleaseAll);
         message(&mut r.c, MASTER, Msg::Bye { reason: "unpaired message".into() });
         assert!(r.c.config.peers.is_empty());
     }
