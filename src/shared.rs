@@ -59,6 +59,9 @@ pub struct Status {
     pub shortcuts_portal: String,
     /// What the system bound them to, as it describes the keys.
     pub shortcuts_bound: Vec<BoundShortcut>,
+    /// The RemoteDesktop permission for network sharing on Wayland: "asking",
+    /// "restoring", "remembered", "not-remembered", or empty (net_wayland.rs).
+    pub remote_desktop: String,
 }
 
 /// A shortcut the system registered for flockswitch (Wayland), for the settings window.
@@ -104,6 +107,9 @@ pub struct StatusFile {
     pub shortcuts_portal: String,
     #[serde(default)]
     pub shortcuts_bound: Vec<BoundShortcut>,
+    /// The RemoteDesktop permission on Wayland (empty before 2.1.2, and on X11).
+    #[serde(default)]
+    pub remote_desktop: String,
     /// A newer version the tray app has found (its number), so that the settings
     /// window offers "Update now" at once.
     #[serde(default)]
@@ -553,6 +559,7 @@ impl Shared {
             edge_note: st.edge_note.clone(),
             shortcuts_portal: st.shortcuts_portal.clone(),
             shortcuts_bound: st.shortcuts_bound.clone(),
+            remote_desktop: st.remote_desktop.clone(),
             version: env!("CARGO_PKG_VERSION").into(),
             update_available: match &st.update {
                 crate::update::UpdateState::Available(r)

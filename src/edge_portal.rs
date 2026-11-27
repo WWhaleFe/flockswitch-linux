@@ -74,22 +74,7 @@ fn token_path() -> std::path::PathBuf {
 }
 
 fn load_token() -> Option<String> {
-    std::fs::read_to_string(token_path()).ok().map(|t| t.trim().to_string()).filter(|t| !t.is_empty())
-}
-
-fn save_token(token: &str) {
-    use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
-    let written = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(token_path())
-        .and_then(|mut f| f.write_all(token.as_bytes()));
-    if let Err(e) = written {
-        log::warn!("input-capture: cannot save the restore token: {e}");
-    }
+    crate::net_logic::load_restore_token(&token_path())
 }
 
 /// The session's object path (for the log and its Closed signal), read by serializing
@@ -259,8 +244,11 @@ impl Portal {
     }
 
     async fn run(&mut self) {
-        // Denied (or ended by the system): asked again only after the settings change.
-        let mut denied_for: Option<u64> = None;
+        // Denied (or ended by the system): asked again only after the edge settings
+        // change. Keyed by those settings, not by every settings write: the network writes
+        // some itself (a computer's name, the master's effect settings), and each of those
+        // would bring the system's question back.
+        let mut denied_for: Option<String> = None;
         // Sessions that failed or ended soon after they were made, one after another.
         // Each new session may ask the user again, so after a few flockswitch waits
         // for the settings to change instead of asking on and on.
@@ -280,11 +268,13 @@ impl Portal {
                 continue;
             }
             noted_off = false;
-            if denied_for == Some(self.watch.shared.version()) {
+            if denied_for.as_ref() == Some(&self.watch.ask_key()) {
                 async_io::Timer::after(POLL * 4).await;
                 continue;
             }
-            denied_for = None;
+            if denied_for.take().is_some() {
+                log::info!("input-capture: the edge settings changed; asking again");
+            }
             self.note(&format!("asking:{}", self.version));
             let opened = Instant::now();
             match self.open().await {
@@ -303,7 +293,7 @@ impl Portal {
                         End::Again(why) if failures >= 3 => {
                             log::warn!("input-capture: {why}, the third time in a row soon after starting; trying again when the edge settings change");
                             self.note("error");
-                            denied_for = Some(self.watch.shared.version());
+                            denied_for = Some(self.watch.ask_key());
                             failures = 0;
                         }
                         End::Again(why) => {
@@ -320,19 +310,19 @@ impl Portal {
                         End::Closed => {
                             log::info!("input-capture: the portal closed the session; asking again when the edge settings change");
                             self.note("closed");
-                            denied_for = Some(self.watch.shared.version());
+                            denied_for = Some(self.watch.ask_key());
                         }
                     }
                 }
                 Err(OpenError::Denied) => {
                     log::info!("input-capture: the user did not allow input capture; asking again when the edge settings change");
                     self.note("denied");
-                    denied_for = Some(self.watch.shared.version());
+                    denied_for = Some(self.watch.ask_key());
                 }
                 Err(OpenError::Failed(e)) if failures >= 2 => {
                     log::warn!("input-capture: {e}; the third time in a row; trying again when the edge settings change");
                     self.note("error");
-                    denied_for = Some(self.watch.shared.version());
+                    denied_for = Some(self.watch.ask_key());
                     failures = 0;
                 }
                 Err(OpenError::Failed(e)) => {
@@ -348,7 +338,7 @@ impl Portal {
 
     /// Asks for a session, connects to EIS and listens to its signals.
     async fn open(&mut self) -> Result<Live, OpenError> {
-        let ic = InputCapture::new().await?;
+        let ic = InputCapture::with_connection(crate::edge_wayland::portal_connection().await?).await?;
         let wanted = Capabilities::Pointer | Capabilities::Keyboard;
         let (session, caps) = if self.version >= 2 {
             let session = ic.create_session2(CreateSession2Options::default()).await?;
@@ -356,20 +346,28 @@ impl Portal {
             log::info!(
                 "input-capture: CreateSession2 → {}; Start (remember until revoked, {})",
                 session_path(&session),
-                if token.is_some() { "with the saved restore token" } else { "no restore token yet: the system asks" }
+                if token.is_some() { "with the saved restore token: the system should not ask" } else { "no restore token saved: the system asks" }
             );
-            let options = StartOptions::default().set_capabilities(wanted).set_persist_mode(PersistMode::ExplicitlyRevoked).set_restore_token(token);
-            let response = ic.start(&session, None, options).await?.response()?;
-            match response.restore_token() {
-                Some(t) => {
-                    save_token(t);
-                    log::info!("input-capture: restore token saved (no question next time)");
-                }
-                None => log::info!("input-capture: no restore token (the answer is not remembered)"),
+            let options = StartOptions::default().set_capabilities(wanted).set_persist_mode(PersistMode::ExplicitlyRevoked).set_restore_token(token.clone());
+            let started = async { ic.start(&session, None, options).await?.response() }.await;
+            let action = crate::net_logic::token_after_start(token.as_deref(), started.is_ok(), started.as_ref().ok().and_then(|r| r.restore_token()));
+            log::info!("{}", crate::net_logic::token_log("input-capture", token.is_some(), &action));
+            if let Err(e) = crate::net_logic::apply_token(&token_path(), &action) {
+                log::warn!("input-capture: cannot update the restore token file: {e}");
             }
+            let response = match started {
+                Ok(r) => r,
+                Err(e) => {
+                    let _ = session.close().await;
+                    return Err(e.into());
+                }
+            };
             (session, response.capabilities())
         } else {
-            log::info!("input-capture: CreateSession (portal v1: the system asks every time a session is made)");
+            log::info!(
+                "input-capture: CreateSession (portal v1: GNOME 50 and older cannot remember the answer, so the system asks each time a session is made; \
+                 this one is kept as long as it lasts)"
+            );
             ic.create_session(None, CreateSessionOptions::default().set_capabilities(wanted)).await?
         };
         if self.watch.network_wanted() && (!caps.contains(Capabilities::Keyboard) || !caps.contains(Capabilities::Pointer)) {
@@ -544,13 +542,21 @@ impl Portal {
             match ev {
                 Ev::Tick => {
                     if self.watch.poll() {
-                        if !self.watch.edges_wanted() {
+                        // Where the system cannot remember the answer (portal v1, GNOME 50
+                        // and older), a closed session means asking again: edge switching or
+                        // network sharing turned off only pauses it (no barriers) until
+                        // flockswitch quits.
+                        if !self.watch.edges_wanted() && !logic::keep_idle_session(self.version, self.reconfigure) {
                             return End::Inactive;
                         }
-                        let paused = !self.watch.cfg.enabled && !self.watch.network_wanted();
+                        let paused = (!self.watch.cfg.enabled && !self.watch.network_wanted()) || !self.watch.edges_wanted();
                         if paused != live.paused {
                             live.paused = paused;
                             self.end_capture(live, None, "paused").await;
+                            if paused && !self.watch.edges_wanted() {
+                                log::info!("input-capture: edge switching is off; the session is kept without barriers (this system cannot remember the answer, so closing it would mean asking again)");
+                                self.note(&format!("off:{}", self.version));
+                            }
                             if paused && self.reconfigure && live.enabled {
                                 match live.ic.disable(&live.session, DisableOptions::default()).await {
                                     Ok(()) => log::info!("input-capture: paused: disabled"),

@@ -253,8 +253,14 @@ pub fn spawn(shared: Arc<Shared>) -> JoinHandle<()> {
                         platform_retry = Instant::now() - PLATFORM_RETRY_MIN;
                     }
                 } else {
-                    // Changed settings are a new request: ask again at once.
-                    if (reconnect_asked || previous.as_ref() != Some(config)) && platform.is_none() {
+                    // Looking for computers again is a new request: ask again at once. Other
+                    // settings changes are not: the network itself writes some (a computer's
+                    // name, the master's effect settings), and each would bring the system's
+                    // question back after the user turned it down.
+                    if platform.is_none() && (crate::net_logic::ask_again_after_deny(reconnect_asked) || previous.as_ref().is_none_or(|c| !c.on)) {
+                        if platform_blocked {
+                            log::info!("network: asking for the input permission again ({})", if reconnect_asked { "looking for computers again" } else { "sharing turned on" });
+                        }
                         platform_blocked = false;
                         platform_wait = PLATFORM_RETRY_MIN;
                         platform_retry = Instant::now() - PLATFORM_RETRY_MIN;
@@ -269,7 +275,10 @@ pub fn spawn(shared: Arc<Shared>) -> JoinHandle<()> {
                         if let Some(reason) = crate::net_wayland::eis_failed() {
                             let opened = crate::net_wayland::eis_opened();
                             let retry_later = opened || crate::net_wayland::eis_no_answer();
-                            log::warn!("network: input session ended{}: {reason}", if retry_later { ", restarting" } else { "" });
+                            log::warn!(
+                                "network: input session ended{}: {reason}",
+                                if opened { ", making a new one (the saved restore token should keep the system from asking)" } else if retry_later { ", trying again" } else { "" }
+                            );
                             LIVE.lock().unwrap().take();
                             if let Some(s) = service.take() {
                                 s.stop();
@@ -282,6 +291,7 @@ pub fn spawn(shared: Arc<Shared>) -> JoinHandle<()> {
                             } else if retry_later {
                                 platform_wait = (platform_wait * 2).min(PLATFORM_RETRY_MAX);
                             } else {
+                                log::info!("network: the input permission was turned down; not asking again until sharing is turned off and on or 연결 다시 찾기 (look again) is pressed");
                                 platform_blocked = true;
                             }
                             publish_error(config, reason);
@@ -437,7 +447,9 @@ pub fn spawn(shared: Arc<Shared>) -> JoinHandle<()> {
                 // Woke from sleep or unlocked: look for the other computers again now.
                 if crate::wake::take() {
                     if let Some(s) = &service {
-                        log::info!("wake or unlock: reconnecting");
+                        // Only the network connections: the RemoteDesktop and InputCapture
+                        // sessions stay, so the system does not ask again.
+                        log::info!("wake or unlock: reconnecting (input sessions kept)");
                         let _ = s.reconnect();
                     }
                 }
