@@ -19,9 +19,11 @@ Use any brand of mouse and keyboard, including built-in devices, on your own com
 on the same trusted private network. Open **Settings → Connection and layout**, read and
 accept the notice on each computer, choose one **Master** and up to three **Subs**, enable
 sharing, and pair only when both screens show the same six digits. Place the master and
-subs on the 5 x 3 **Layout map** on the master; subs placed side by side cross directly
-to each other (including GNOME Wayland InputCapture barriers). On the master, each paired
-computer also has a switch for whether its mouse and keyboard can control other computers.
+subs on the 6 x 4 **Layout map** on the master (one tile per monitor: a computer with two
+monitors has two tiles, and the cursor crosses at that monitor's edge); subs placed side
+by side cross directly to each other (including GNOME Wayland InputCapture barriers). On the master, each paired
+computer also has a switch for whether its mouse and keyboard can control other computers,
+and every computer has **Pause connection** (no connecting or crossing while the pairing stays).
 Subs follow the master's layout, crossing, clipboard and effect settings (key rule edits
 from a sub are forwarded to the master); local edge ownership, channel assignments and
 Linux setup preferences stay local.
@@ -42,7 +44,9 @@ resolved) and can be pasted into a file manager. Under **Keyboard → When switc
 configure modifier mapping (by function, by position, or unchanged, with an editable table),
 Korean/English keys, long-press Caps Lock, Hanja, navigation keys and screen capture per
 OS pair and direction (Linux with Mac, Windows or Android), and open **Compare keys by
-system** for a reference table.
+system** for a reference table; a **Details** guide next to it says what works between
+which systems. A Linux receiver gets the Korean/English toggle as the Hangul key
+(KEY_HANGEUL), which must be a toggle key in ibus-hangul (the default) or fcitx5-hangul.
 
 | Session | Network send | Network receive | Clipboard | Countdown | Real hardware validation |
 |---|---|---|---|---|---|
@@ -177,9 +181,9 @@ On a minimal install where the settings window doesn't open: `sudo apt-get insta
 
 The tray icon's menu shows the status, turns switching on or off, checks for updates, opens a report to the developer, and opens **Settings…** - one fixed-size window with a sidebar of pages (Network: Connection and layout, Crossing, Keyboard, Clipboard, This computer; Logitech: Button switching, Shortcut switching, Edge switching, Devices; App: Effects, General). A page that is longer than the window scrolls inside it, and every change applies at once. The card at the foot of the sidebar shows where the mouse is (the lime dot means it is on this computer), what the network is doing and which device is the master mouse; a badge next to General shows pending Linux setup items.
 
-- **Connection and layout**: the sharing switch (after accepting the cautions), this computer's role (master or sub, changeable while no computer is paired), pairing with the matching six digits, nearby computers and adding one by IP, the paired computers (link and delay, a master-only switch for using that computer's mouse and keyboard on the others, **Unpair**), **Find connections again** (Linux also reconnects automatically after sleep or screen unlock), and the **Layout map** (5 x 3 grid on the master: click a computer then an empty cell; subs placed side by side cross directly to each other; subs see it locked). Linux session support status and any problem box appear here too.
+- **Connection and layout**: the sharing switch (after accepting the cautions), this computer's role (master or sub, changeable while no computer is paired), pairing with the matching six digits, nearby computers and adding one by IP, the paired computers (link and delay, a master-only switch for using that computer's mouse and keyboard on the others, **Pause connection**, **Unpair**), **Find connections again** (Linux also reconnects automatically after sleep or screen unlock), and the **Layout map** (6 x 4 grid on the master, one tile per monitor: click a tile then an empty cell; subs placed side by side cross directly to each other; subs see it locked). Linux session support status and any problem box appear here too.
 - **Crossing**: the wait before crossing (with the countdown chosen in Effects), crossing only while Ctrl is held, showing the cursor on arrival, and the return shortcut Ctrl+Alt+Shift+Q.
-- **Keyboard** (**When switching OS**): for each pair of systems and direction (Linux with Mac, Windows or Android), modifier matching (by function, by position, or unchanged) with an editable mapping table, sender Korean/English keys and receiver key, long-press Caps Lock, Hanja, navigation keys and screen capture. A sub's edit goes to the master. **Compare keys by system** shows a reference table.
+- **Keyboard** (**When switching OS**): for each pair of systems and direction (Linux with Mac, Windows or Android), modifier matching (by function, by position, or unchanged) with an editable mapping table, sender Korean/English keys and receiver key, long-press Caps Lock, Hanja, navigation keys and screen capture. A sub's edit goes to the master. **Compare keys by system** shows a reference table, and the **Details** guide says what works between which systems and what does not cross (the toggle reaches a Linux receiver as the Hangul key, KEY_HANGEUL).
 - **Clipboard**: share text, images and files with the cursor, share between subs through the master, Wayland XWayland note, the received folder with its last file, and transfer progress.
 - **This computer**: the role (changed in Connection and layout), name, port, IP addresses and device ID.
 - **Button switching**: on/off, and per button (wheel mode-shift, gesture, wheel click - several can be on): the channel it goes to - one channel, chosen on each computer since settings are kept per computer; this PC's own channel is shown but cannot be chosen. The gesture button can also switch by holding it and moving the mouse up, down, left or right, each direction with its own channel. With the wheel mode-shift button switching, **Restore the wheel mode on return** (on by default, `set keep_wheel_mode`) puts the wheel back to the ratchet or free-spinning mode it had on this computer when the mouse comes back: on a device where flockswitch has not taken the button yet (just after the mouse arrives there, e.g. on Android), a press flips the wheel instead.

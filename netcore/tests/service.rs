@@ -917,7 +917,7 @@ impl Group {
     /// Places the master and subs on the grid (cells in order: master, then each sub).
     fn place(&mut self, cells: &[(u8, u8)]) {
         let ids: Vec<&str> = std::iter::once(&self.m).chain(&self.subs).map(|n| n.id.as_str()).collect();
-        self.mcfg.layout = ids.iter().zip(cells).map(|(id, (col, row))| Cell { id: (*id).into(), col: *col, row: *row }).collect();
+        self.mcfg.layout = ids.iter().zip(cells).map(|(id, (col, row))| Cell::new(id, *col, *row)).collect();
         self.m.svc.update_config(self.mcfg.clone()).unwrap();
     }
     fn stop(&self) {
@@ -1064,7 +1064,7 @@ impl Raw {
     }
 }
 fn enter() -> flock_net::proto::Msg {
-    flock_net::proto::Msg::Enter { side: Side::Left, pos: 0.5 }
+    flock_net::proto::Msg::Enter { side: Side::Left, pos: 0.5, display: None }
 }
 
 #[test]

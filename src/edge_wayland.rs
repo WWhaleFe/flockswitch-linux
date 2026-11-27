@@ -421,7 +421,7 @@ impl Watch {
         if let Some(status) = crate::net::live_status().filter(|s| s.running && !s.layout.is_empty() && !s.me.id.is_empty()) {
             let sides: Vec<flock_net::Side> = [flock_net::Side::Left, flock_net::Side::Right, flock_net::Side::Top, flock_net::Side::Bottom]
                 .into_iter()
-                .filter(|&side| flock_net::layout::neighbour(&status.layout, &status.me.id, side).is_some())
+                .filter(|&side| flock_net::layout::neighbour_on_side(&status.layout, &status.me.id, side).is_some())
                 .collect();
             if !sides.is_empty() {
                 return sides;

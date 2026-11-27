@@ -141,9 +141,10 @@ impl DirRules {
             // A Mac user switches with Caps Lock or Shift+Space wherever the keys go.
             (Os::Mac, Os::Android) => (vec![HangulKey::CapsLock, HangulKey::ShiftSpace], HangulKey::ShiftSpace),
             (Os::Mac, _) => (vec![HangulKey::CapsLock, HangulKey::ShiftSpace], HangulKey::Lang1),
-            (Os::Windows | Os::Linux, Os::Mac) => (vec![HangulKey::Lang1], HangulKey::CapsLock),
-            (_, Os::Android) => (vec![HangulKey::Lang1], HangulKey::ShiftSpace),
-            _ => (vec![HangulKey::Lang1], HangulKey::Lang1),
+            // Windows and Linux: the Hangul key (Lang1) and Shift+Space (2.2).
+            (Os::Windows | Os::Linux, Os::Mac) => (vec![HangulKey::Lang1, HangulKey::ShiftSpace], HangulKey::CapsLock),
+            (_, Os::Android) => (vec![HangulKey::Lang1, HangulKey::ShiftSpace], HangulKey::ShiftSpace),
+            _ => (vec![HangulKey::Lang1, HangulKey::ShiftSpace], HangulKey::Lang1),
         };
         Self { hangul_src, hangul_dst, hanja: src != Os::Mac, ..Self::default() }
     }
@@ -983,7 +984,7 @@ mod rules_tests {
         let d = DirRules::default_for(Os::Mac, Os::Windows);
         assert_eq!((d.hangul_src.clone(), d.hangul_dst, d.hanja, d.caps_long_press), (vec![HangulKey::CapsLock, HangulKey::ShiftSpace], HangulKey::Lang1, false, true));
         let d = DirRules::default_for(Os::Linux, Os::Mac);
-        assert_eq!((d.hangul_src.clone(), d.hangul_dst, d.hanja), (vec![HangulKey::Lang1], HangulKey::CapsLock, true));
+        assert_eq!((d.hangul_src.clone(), d.hangul_dst, d.hanja), (vec![HangulKey::Lang1, HangulKey::ShiftSpace], HangulKey::CapsLock, true));
         assert_eq!(DirRules::default_for(Os::Windows, Os::Android).hangul_dst, HangulKey::ShiftSpace);
         assert_eq!(DirRules::default_for(Os::Windows, Os::Linux).hangul_dst, HangulKey::Lang1);
         assert_eq!(d.nav, [true; 4]);
@@ -1015,7 +1016,7 @@ mod rules_tests {
         assert_eq!((r.mod_mode, r.hangul_src, r.hangul_dst), (ModMode::Off, vec![], HangulKey::CapsLock));
         let config = NetConfig { mac_shift_space_to_hangul: false, ..NetConfig::default() };
         assert_eq!(DirRules::from_legacy(Os::Mac, Os::Windows, &config).hangul_src, vec![HangulKey::CapsLock]);
-        assert_eq!(DirRules::from_legacy(Os::Linux, Os::Mac, &config).hangul_src, vec![HangulKey::Lang1]);
+        assert_eq!(DirRules::from_legacy(Os::Linux, Os::Mac, &config).hangul_src, vec![HangulKey::Lang1, HangulKey::ShiftSpace]);
     }
 
     // The 2.0 Mac Caps Lock and Shift+Space tests, through the new path.
@@ -1066,9 +1067,8 @@ mod rules_tests {
             k(0x2c, true), k(0x2c, false), k(0xe1, false)];
         for (src, dst) in [(Os::Mac, Os::Linux), (Os::Windows, Os::Mac), (Os::Windows, Os::Linux), (Os::Linux, Os::Windows)] {
             let rules = DirRules { hanja: false, nav: [false; 4], capture: false, ..off(src, dst) };
-            let rules = if dst == Os::Mac { DirRules { hangul_src: vec![HangulKey::Lang1], ..rules } } else { rules };
-            // A Mac source converts Caps Lock and Shift+Space by default; without them the keys pass.
-            let rules = if src == Os::Mac { DirRules { hangul_src: vec![], ..rules } } else { rules };
+            // Every source converts Shift+Space by default (2.2); without it the keys pass.
+            let rules = DirRules { hangul_src: vec![], ..rules };
             assert_eq!(run_at(src, dst, &rules, input.clone()), input, "{src:?}>{dst:?}");
         }
         let rules = DirRules { hangul_src: vec![], ..off(Os::Mac, Os::Windows) };
@@ -1406,5 +1406,116 @@ mod rules_tests {
         let r = DirRules::default_for(Os::Windows, Os::Mac);
         let out = run_at(Os::Windows, Os::Mac, &r, vec![k(0xe0, true), k(LEFT, true), k(LEFT, false), k(0xe0, false)]);
         assert!(!out.windows(2).any(|w| w == [k(0xe0, true), k(0xe0, false)]));
+    }
+
+    /// The signal the receiving computer gets for one Korean/English toggle, by `hangul_dst`:
+    /// the usage and the modifier that must be held while it goes down (None: no modifier).
+    fn toggle_signal(dst: HangulKey) -> (u16, Option<u16>) {
+        match dst {
+            HangulKey::Lang1 => (LANG1, None),
+            HangulKey::CapsLock => (0x39, None),
+            HangulKey::RightAlt => (0xe6, None),
+            HangulKey::ShiftSpace => (SPACE, Some(LSHIFT)),
+            HangulKey::ControlSpace => (SPACE, Some(LCTRL)),
+            HangulKey::SuperSpace => (SPACE, Some(LGUI)),
+        }
+    }
+    /// Plays `input` through the mapper and checks what the receiver sees: how many times the
+    /// toggle happened, and that nothing stays held afterwards (key state is simulated).
+    fn toggles_and_stuck_keys(src: Os, dst: Os, rules: &DirRules, input: Vec<InputEvent>) -> (usize, Vec<u16>) {
+        let (usage, modifier) = toggle_signal(rules.hangul_dst);
+        let mut m = KeyMapper::default();
+        let t0 = Instant::now();
+        let mut held: HashSet<u16> = HashSet::new();
+        let mut toggles = 0;
+        let mut out = vec![];
+        for (i, e) in input.into_iter().enumerate() {
+            out.extend(m.map(e, src, dst, rules, t0 + Duration::from_millis(40 * i as u64)));
+        }
+        for e in out {
+            if let InputEvent::Key { usage: u, down } = e {
+                if down {
+                    if u == usage && !held.contains(&u) && modifier.is_none_or(|m| held.iter().any(|h| *h == m || *h == m + 4)) {
+                        toggles += 1;
+                    }
+                    held.insert(u);
+                } else {
+                    held.remove(&u);
+                }
+            }
+        }
+        let mut stuck: Vec<u16> = held.into_iter().collect();
+        stuck.sort();
+        (toggles, stuck)
+    }
+    #[test]
+    fn all_nine_pairs_toggle_korean_exactly_once_for_every_default_key() {
+        // What the receiver is told to expect, by direction (the receiver-side work depends on it).
+        let expect_dst = |src: Os, dst: Os| match (src, dst) {
+            (_, Os::Mac) => HangulKey::CapsLock,
+            (_, Os::Android) => HangulKey::ShiftSpace,
+            _ => HangulKey::Lang1,
+        };
+        let mut checked = 0;
+        for (src, dst) in all_pairs() {
+            let rules = DirRules::default_for(src, dst);
+            assert_eq!(rules.hangul_dst, expect_dst(src, dst), "{src:?}>{dst:?}");
+            assert!(rules.hangul_src.contains(&HangulKey::ShiftSpace), "{src:?}>{dst:?} lists Shift+Space");
+            let usual = if src == Os::Mac { HangulKey::CapsLock } else { HangulKey::Lang1 };
+            assert!(rules.hangul_src.contains(&usual), "{src:?}>{dst:?} lists the system's usual key");
+            let usual_key = if src == Os::Mac { 0x39 } else { LANG1 };
+            // (name, sender key events)
+            let cases: Vec<(&str, Vec<InputEvent>)> = vec![
+                ("usual key", vec![k(usual_key, true), k(usual_key, false)]),
+                ("usual key twice", vec![k(usual_key, true), k(usual_key, false), k(usual_key, true), k(usual_key, false)]),
+                ("left shift+space", vec![k(LSHIFT, true), k(SPACE, true), k(SPACE, false), k(LSHIFT, false)]),
+                ("right shift+space", vec![k(0xe5, true), k(SPACE, true), k(SPACE, false), k(0xe5, false)]),
+                ("shift+space with repeat", vec![k(LSHIFT, true), k(SPACE, true), k(SPACE, true), k(SPACE, true), k(SPACE, false), k(LSHIFT, false)]),
+                ("shift+space, shift released first", vec![k(LSHIFT, true), k(SPACE, true), k(LSHIFT, false), k(SPACE, false)]),
+            ];
+            for (name, input) in cases {
+                let twice = name.ends_with("twice");
+                let (toggles, stuck) = toggles_and_stuck_keys(src, dst, &rules, input);
+                assert_eq!(toggles, if twice { 2 } else { 1 }, "{src:?}>{dst:?}: {name}");
+                assert!(stuck.is_empty(), "{src:?}>{dst:?}: {name} leaves {stuck:?} held");
+                checked += 1;
+            }
+            // Plain typing (a letter, Shift+letter, Space without Shift) never toggles.
+            let typing = vec![k(4, true), k(4, false), k(LSHIFT, true), k(4, true), k(4, false), k(LSHIFT, false), k(SPACE, true), k(SPACE, false)];
+            let (toggles, stuck) = toggles_and_stuck_keys(src, dst, &rules, typing);
+            assert_eq!((toggles, stuck.is_empty()), (0, true), "{src:?}>{dst:?}: typing");
+        }
+        assert_eq!(checked, 9 * 6);
+    }
+    #[test]
+    fn shift_space_to_a_receiver_that_toggles_on_shift_space_is_sent_once() {
+        // Android's own toggle is Shift+Space: one chord arrives, with Shift lifted and put
+        // back around it, never a second toggle.
+        for src in [Os::Mac, Os::Windows, Os::Linux] {
+            let rules = DirRules::default_for(src, Os::Android);
+            let out = run_at(src, Os::Android, &rules, vec![k(LSHIFT, true), k(SPACE, true), k(SPACE, false), k(LSHIFT, false)]);
+            assert_eq!(out.iter().filter(|e| matches!(e, InputEvent::Key { usage: SPACE, down: true })).count(), 1, "{src:?}");
+            assert!(out.contains(&k(SPACE, true)) && out.contains(&k(SPACE, false)));
+        }
+    }
+    #[test]
+    fn what_each_receiver_gets_for_a_toggle() {
+        // The events the receiver-side code must understand (documented for the ports).
+        let cases = [
+            (Os::Mac, Os::Windows, taps(LANG1)),
+            (Os::Linux, Os::Windows, taps(LANG1)),
+            (Os::Mac, Os::Linux, taps(LANG1)),
+            (Os::Windows, Os::Linux, taps(LANG1)),
+            (Os::Windows, Os::Mac, taps(0x39)),
+            (Os::Linux, Os::Mac, taps(0x39)),
+            (Os::Mac, Os::Android, vec![k(LSHIFT, true), k(SPACE, true), k(SPACE, false), k(LSHIFT, false)]),
+            (Os::Windows, Os::Android, vec![k(LSHIFT, true), k(SPACE, true), k(SPACE, false), k(LSHIFT, false)]),
+            (Os::Linux, Os::Android, vec![k(LSHIFT, true), k(SPACE, true), k(SPACE, false), k(LSHIFT, false)]),
+        ];
+        for (src, dst, expected) in cases {
+            let rules = DirRules::default_for(src, dst);
+            let usual = if src == Os::Mac { 0x39 } else { LANG1 };
+            assert_eq!(run_at(src, dst, &rules, taps(usual)), expected, "{src:?}>{dst:?}");
+        }
     }
 }

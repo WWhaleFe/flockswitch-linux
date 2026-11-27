@@ -439,6 +439,12 @@ mod smoke_tests {
     use std::{path::PathBuf, sync::Once, time::Instant};
 
     #[test]
+    fn the_korean_english_toggle_is_the_hangul_keycode() {
+        // XTest takes the evdev code plus 8: KEY_HANGEUL (122) is X keycode 130 (Hangul).
+        assert_eq!(input::hid_to_evdev(flock_net::keymap::LANG1).map(|code| code + 8), Some(130));
+    }
+
+    #[test]
     fn commands_wake_an_idle_worker_without_x_events() {
         let (commands, received) = mpsc::channel();
         let wake = Arc::new(eventfd(0, EventfdFlags::CLOEXEC | EventfdFlags::NONBLOCK).unwrap());

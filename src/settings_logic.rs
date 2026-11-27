@@ -22,16 +22,30 @@ pub fn cell_at(cells: &[Cell], col: u8, row: u8) -> Option<&Cell> {
     cells.iter().find(|c| (c.col, c.row) == (col, row))
 }
 
-/// Moves (or first places) the computer `id` into the empty cell (`col`, `row`). None
-/// when that is not allowed: the cell is outside the grid or taken, or `id` is not one
-/// of `known` (this computer and the paired ones).
-pub fn move_to(cells: &[Cell], known: &[String], id: &str, col: u8, row: u8) -> Option<Vec<Cell>> {
+/// Moves (or first places) one monitor tile, monitor `display` of computer `id`, into the
+/// empty cell (`col`, `row`); the computer's other monitor tiles stay where they are. None
+/// when that is not allowed: the cell is outside the grid or taken, or `id` is not one of
+/// `known` (this computer and the paired ones).
+pub fn move_to(cells: &[Cell], known: &[String], id: &str, display: u8, col: u8, row: u8) -> Option<Vec<Cell>> {
     if col >= COLS || row >= ROWS || !known.iter().any(|k| k == id) || cell_at(cells, col, row).is_some() {
         return None;
     }
-    let mut next: Vec<Cell> = cells.iter().filter(|c| c.id != id).cloned().collect();
-    next.push(Cell { id: id.into(), col, row });
+    let mut next: Vec<Cell> = cells.iter().filter(|c| !(c.id == id && c.display == display)).cloned().collect();
+    next.push(Cell::of_display(id, display, col, row));
     Some(next)
+}
+
+/// `next` plus the saved cells of monitors the service does not list now (a monitor that
+/// is unplugged): they stay in the saved layout, as long as their spot is still free.
+pub fn keep_hidden(mut next: Vec<Cell>, saved: &[Cell]) -> Vec<Cell> {
+    for c in saved {
+        let listed = next.iter().any(|n| n.id == c.id && n.display == c.display);
+        let known = next.iter().any(|n| n.id == c.id);
+        if !listed && known && cell_at(&next, c.col, c.row).is_none() {
+            next.push(c.clone());
+        }
+    }
+    next
 }
 
 /// The known computers that have no cell (peers without a 2.0 side start like this).
@@ -46,7 +60,8 @@ pub fn direct_pairs(cells: &[Cell], me: &str) -> Vec<(String, String)> {
     for (i, a) in cells.iter().enumerate() {
         for b in &cells[i + 1..] {
             let near = a.col.abs_diff(b.col) + a.row.abs_diff(b.row) == 1;
-            if near && a.id != me && b.id != me {
+            let new = !pairs.iter().any(|(x, y)| (x, y) == (&a.id, &b.id) || (x, y) == (&b.id, &a.id));
+            if near && a.id != me && b.id != me && a.id != b.id && new {
                 pairs.push((a.id.clone(), b.id.clone()));
             }
         }
@@ -57,7 +72,7 @@ pub fn direct_pairs(cells: &[Cell], me: &str) -> Vec<(String, String)> {
 /// Saves `cells` as the master's layout and re-derives every peer's 2.0 side from it
 /// (the service does the same once it runs; this keeps the file right meanwhile).
 pub fn set_layout(net: &mut NetConfig, me: &str, cells: Vec<Cell>) {
-    let cells = layout::with_master(&cells, me);
+    let cells = layout::with_master(&keep_hidden(cells, &net.layout), me);
     for p in &mut net.peers {
         p.side = layout::side_of(&cells, me, &p.id);
     }
@@ -191,7 +206,7 @@ mod tests {
     use flock_net::{PeerConfig, Side};
 
     fn cell(id: &str, col: u8, row: u8) -> Cell {
-        Cell { id: id.into(), col, row }
+        Cell::new(id, col, row)
     }
     fn ids(list: &[&str]) -> Vec<String> {
         list.iter().map(|s| s.to_string()).collect()
@@ -213,20 +228,48 @@ mod tests {
         let known = ids(&["me", "a", "b"]);
         let cells = vec![cell("me", 2, 1), cell("a", 1, 1)];
         // To an empty cell.
-        let moved = move_to(&cells, &known, "a", 4, 2).unwrap();
+        let moved = move_to(&cells, &known, "a", 0, 4, 2).unwrap();
         assert_eq!(cell_at(&moved, 4, 2).map(|c| c.id.as_str()), Some("a"));
         assert!(cell_at(&moved, 1, 1).is_none());
         assert_eq!(moved.len(), 2);
         // An unplaced computer is placed.
-        let placed = move_to(&cells, &known, "b", 0, 0).unwrap();
+        let placed = move_to(&cells, &known, "b", 0, 0, 0).unwrap();
         assert_eq!(placed.len(), 3);
         // The master moves too.
-        assert!(move_to(&cells, &known, "me", 2, 0).is_some());
+        assert!(move_to(&cells, &known, "me", 0, 2, 0).is_some());
         // Taken cell, outside the grid, unknown computer: refused.
-        assert!(move_to(&cells, &known, "a", 2, 1).is_none());
-        assert!(move_to(&cells, &known, "a", 5, 0).is_none());
-        assert!(move_to(&cells, &known, "a", 0, 3).is_none());
-        assert!(move_to(&cells, &known, "ghost", 0, 0).is_none());
+        assert!(move_to(&cells, &known, "a", 0, 2, 1).is_none());
+        assert!(move_to(&cells, &known, "a", 0, COLS, 0).is_none());
+        assert!(move_to(&cells, &known, "a", 0, 0, ROWS).is_none());
+        assert!(move_to(&cells, &known, "ghost", 0, 0, 0).is_none());
+    }
+
+    #[test]
+    fn a_click_moves_one_monitor_tile_only() {
+        let known = ids(&["me", "a"]);
+        let cells = vec![cell("me", 2, 1), cell("a", 1, 1), Cell::of_display("a", 1, 0, 1)];
+        let moved = move_to(&cells, &known, "a", 1, 0, 3).unwrap();
+        assert_eq!(moved.len(), 3);
+        assert!(moved.contains(&cell("a", 1, 1)), "the first monitor stays");
+        assert!(moved.contains(&Cell::of_display("a", 1, 0, 3)));
+        assert!(cell_at(&moved, 0, 1).is_none());
+        // Own monitors next to each other are no pair of computers.
+        assert!(direct_pairs(&moved, "me").is_empty());
+        let two = vec![cell("me", 2, 1), cell("a", 0, 0), Cell::of_display("a", 1, 1, 0), cell("b", 0, 1), Cell::of_display("b", 1, 1, 1)];
+        assert_eq!(direct_pairs(&two, "me"), vec![("a".to_string(), "b".to_string())]);
+    }
+
+    #[test]
+    fn cells_of_unplugged_monitors_survive_a_save() {
+        let saved = vec![cell("me", 2, 1), cell("a", 1, 1), Cell::of_display("a", 1, 0, 1), Cell::of_display("gone", 1, 5, 3)];
+        // The service lists only the first monitor of a now.
+        let shown = vec![cell("me", 2, 1), cell("a", 1, 1)];
+        let kept = keep_hidden(shown.clone(), &saved);
+        assert!(kept.contains(&Cell::of_display("a", 1, 0, 1)));
+        assert!(!kept.iter().any(|c| c.id == "gone"), "a computer not shown at all is dropped");
+        // Its spot was taken meanwhile: not restored.
+        let taken = vec![cell("me", 2, 1), cell("a", 1, 1), cell("b", 0, 1)];
+        assert_eq!(keep_hidden(taken.clone(), &saved), taken);
     }
 
     #[test]

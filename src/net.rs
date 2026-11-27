@@ -192,6 +192,7 @@ fn publish_error(config: &NetConfig, error: String) {
                 port: config.port,
                 error: Some(error),
                 can_send: true,
+                displays: vec![],
             },
             discovered: vec![],
             peers: vec![],

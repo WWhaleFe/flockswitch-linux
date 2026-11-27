@@ -33,11 +33,11 @@ pub fn peer_name(net: &NetConfig, status: Option<&flock_net::Status>, id: &str) 
 /// and a connected, paired computer sits on that side of the layout (a master's sub or,
 /// on a sub, another sub).
 pub fn side_ready(status: &flock_net::Status, side: flock_net::Side) -> bool {
-    let next = flock_net::layout::neighbour(&status.layout, &status.me.id, side);
+    let next = flock_net::layout::neighbour_on_side(&status.layout, &status.me.id, side);
     status.running
         && status.me.can_send
         && status.state.mode == "local"
-        && next.is_some_and(|id| status.peers.iter().any(|s| s.id == id && s.connected))
+        && next.is_some_and(|id| status.peers.iter().any(|s| s.id == id && s.connected && !s.paused))
 }
 
 /// The master unpaired or was unpaired: forget the computer `id` and, when no master is
@@ -275,7 +275,7 @@ mod tests {
         config.network.peers.push(flock_net::PeerConfig { id: "p1".into(), name: "Laptop".into(), ..Default::default() });
         let status = |mode: &str, peer: Option<&str>| flock_net::Status {
             running: true,
-            me: flock_net::MeStatus { id: String::new(), name: String::new(), port: 0, error: None, can_send: true },
+            me: flock_net::MeStatus { id: String::new(), name: String::new(), port: 0, error: None, can_send: true, displays: vec![] },
             discovered: vec![],
             peers: vec![],
             state: flock_net::StateStatus { mode: mode.into(), peer: peer.map(Into::into) },
@@ -295,12 +295,12 @@ mod tests {
     }
 
     fn peer_status(id: &str, name: &str, connected: bool, keyrules: bool) -> flock_net::PeerStatus {
-        flock_net::PeerStatus { id: id.into(), name: name.into(), os: None, connected, rtt_ms: None, can_send: true, via_master: true, keyrules }
+        flock_net::PeerStatus { id: id.into(), name: name.into(), os: None, connected, rtt_ms: None, can_send: true, via_master: true, keyrules, displays: vec![], paused: false }
     }
     fn live(peers: Vec<flock_net::PeerStatus>, mode: &str, peer: Option<&str>) -> flock_net::Status {
         flock_net::Status {
             running: true,
-            me: flock_net::MeStatus { id: "me".into(), name: String::new(), port: 0, error: None, can_send: true },
+            me: flock_net::MeStatus { id: "me".into(), name: String::new(), port: 0, error: None, can_send: true, displays: vec![] },
             discovered: vec![],
             peers,
             state: flock_net::StateStatus { mode: mode.into(), peer: peer.map(Into::into) },
@@ -308,8 +308,8 @@ mod tests {
             transfer: None,
             following: None,
             layout: vec![
-                flock_net::Cell { id: "me".into(), col: 1, row: 1 },
-                flock_net::Cell { id: "p2".into(), col: 2, row: 1 },
+                flock_net::Cell::new("me", 1, 1),
+                flock_net::Cell::new("p2", 2, 1),
             ],
             reconnecting: false,
             keys: Default::default(),
@@ -349,8 +349,8 @@ mod tests {
         sub.network.role = Role::Sub;
         sub.network.peers.push(flock_net::PeerConfig { id: "master".into(), role: Role::Master, ..Default::default() });
         sub.network.peers.push(flock_net::PeerConfig { id: "other".into(), role: Role::Sub, ..Default::default() });
-        sub.network.layout.push(flock_net::Cell { id: "master".into(), col: 0, row: 0 });
-        sub.network.layout.push(flock_net::Cell { id: "other".into(), col: 1, row: 0 });
+        sub.network.layout.push(flock_net::Cell::new("master", 0, 0));
+        sub.network.layout.push(flock_net::Cell::new("other", 1, 0));
         sub.pending_key_rules = Some(sub.network.all_rules());
         forget_peer(&mut sub, "other");
         assert!(sub.pending_key_rules.is_some() && sub.network.layout.len() == 1);

@@ -257,6 +257,13 @@ impl Platform for Wayland {
             c.position = flock_net::geometry::edge_position(&capture_displays(), side, pos);
         });
     }
+    fn place_on_return_display(&self, side: Side, display: u8, pos: f64) {
+        with_session(self.generation, |_| {
+            let mut c = capture().lock().unwrap();
+            // Same zones as place_on_return, for one monitor of several.
+            c.position = flock_net::geometry::display_edge_position(&capture_displays(), display, side, pos);
+        });
+    }
     fn start_capture(&self, sink: Sender<InputEvent>) -> anyhow::Result<()> {
         let session = SESSION.lock().unwrap();
         anyhow::ensure!(session.generation == self.generation, "Network session was superseded");

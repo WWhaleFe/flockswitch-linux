@@ -611,7 +611,7 @@ mod tests {
         cfg.network.role = flock_net::Role::Sub;
         cfg.network.name = "desk".into();
         cfg.network.peers.push(flock_net::PeerConfig::default());
-        cfg.network.layout.push(flock_net::layout::Cell { id: "abc123".into(), col: 1, row: 1 });
+        cfg.network.layout.push(flock_net::layout::Cell::new("abc123", 1, 1));
         let text = export_text(&cfg, "desk", "2026-11-27 12:00:00").unwrap();
         let loaded = parse(&text).unwrap();
         assert!(loaded.network.peers.is_empty() && loaded.network.layout.is_empty());

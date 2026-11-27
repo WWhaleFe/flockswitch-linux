@@ -88,6 +88,11 @@ impl SettingsApp {
             let note = if self.cfg.pending_key_rules.is_some() { t.keys_sync_pending } else { t.keys_note_sub };
             note_box(ui, p, NoteKind::Info, note, None);
         }
+        // What works between which systems, always in view; "Details" opens the full guide.
+        gap(ui);
+        if note_box(ui, p, NoteKind::Info, t.keys_guide_note, Some(t.keys_guide_button)) {
+            self.keys_cmp = true;
+        }
         gap(ui);
         section_head(ui, p, t.keys_section, None, |ui| head_note(ui, t.keys_section_note, p.muted));
         card_pad(ui, p, |ui| self.key_pane(ui, t, p));
@@ -317,6 +322,10 @@ impl SettingsApp {
                     comparison_table(ui, p, t);
                     ui.add_space(12.0);
                     ui.label(RichText::new(t.keys_cmp_note).size(12.5).color(p.muted));
+                    ui.add_space(22.0);
+                    ui.label(RichText::new(t.keys_guide_title).font(bold(15.0)).color(p.text));
+                    ui.add_space(8.0);
+                    guide_list(ui, p, t);
                 });
                 ui.add_space(10.0);
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -356,5 +365,20 @@ fn comparison_table(ui: &mut Ui, p: Palette, t: &Texts) {
         for (i, g) in galleys.into_iter().enumerate() {
             ui.painter().galley(Pos2::new(rect.left() + label_w + i as f32 * col_w, rect.top() + 9.0), g, p.text);
         }
+    }
+}
+
+/// The compatibility guide: a heading and a paragraph per kind of key.
+fn guide_list(ui: &mut Ui, p: Palette, t: &Texts) {
+    let width = ui.available_width() - 8.0;
+    let label_w = 130.0;
+    for [head, text] in t.keys_guide.iter() {
+        let head_g = ui.painter().layout(head.to_string(), bold(13.0), p.text, label_w - 12.0);
+        let text_g = ui.painter().layout(text.to_string(), FontId::proportional(13.0), p.text, width - label_w);
+        let height = head_g.size().y.max(text_g.size().y) + 18.0;
+        let (rect, _) = ui.allocate_exact_size(Vec2::new(width, height), Sense::hover());
+        ui.painter().hline(rect.x_range(), rect.top(), Stroke::new(1.0, p.border));
+        ui.painter().galley(Pos2::new(rect.left(), rect.top() + 9.0), head_g, p.text);
+        ui.painter().galley(Pos2::new(rect.left() + label_w, rect.top() + 9.0), text_g, p.text);
     }
 }
