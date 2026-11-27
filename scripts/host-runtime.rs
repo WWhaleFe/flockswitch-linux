@@ -70,7 +70,10 @@ mod shared {
         pub fn update_config(&self, change: impl FnOnce(&mut Config)) -> anyhow::Result<()> {
             self.saves.fetch_add(1, Ordering::SeqCst);
             let mut current = self.config.lock().unwrap();
-            let mut next = current.clone();
+            // Match Shared::update_config: merge into the latest disk snapshot.
+            let mut next = if self.save_path.is_file() {
+                Config::parse(&std::fs::read_to_string(&self.save_path)?)?
+            } else { current.clone() };
             change(&mut next);
             std::fs::write(&self.save_path, next.to_text()?)?;
             *current = next;
@@ -95,10 +98,38 @@ mod overlay {
 
 mod net {
     use crate::{config::Edge, net_logic::apply_master_settings, shared::Shared};
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
     include!(concat!(env!("CARGO_MANIFEST_DIR"), "/runtime-net.rs"));
     pub fn network_side_ready(_: Edge) -> bool { false }
     pub fn cross(_: Edge, _: f64, _: f64) { panic!("unexpected network crossing"); }
+
+    #[test]
+    fn sub_key_edit_preserves_a_newer_master_edit_on_disk() {
+        use crate::{config::Config, shared::Wake};
+        let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let path = std::env::temp_dir().join(format!("flockswitch-key-merge-{}-{stamp}.toml", std::process::id()));
+        let shared = Arc::new(Shared::new(Wake::Unchanged, path.clone()));
+        shared.update_config(|c| c.network.keys = c.network.all_rules()).unwrap();
+        let hooks = hooks(shared.clone());
+        let mut sub = shared.config().network.keys;
+        sub.get_mut("linux>mac").unwrap().capture = false;
+        // The settings window saves another pair before the service reloads it.
+        let mut disk = shared.config();
+        disk.network.keys.get_mut("mac>linux").unwrap().capture = false;
+        disk.locate.on = true;
+        std::fs::write(&path, disk.to_text().unwrap()).unwrap();
+        (hooks.persist_key_rules)(&sub).unwrap();
+        // The service still has its own merged snapshot for a second request;
+        // Shared now includes the master's new pair. Compare against the service.
+        sub.get_mut("mac>windows").unwrap().capture = false;
+        (hooks.persist_key_rules)(&sub).unwrap();
+        let saved = Config::parse(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert!(!saved.network.keys["mac>linux"].capture, "master's newer pair was lost");
+        assert!(!saved.network.keys["linux>mac"].capture);
+        assert!(!saved.network.keys["mac>windows"].capture);
+        assert!(saved.locate.on);
+    }
 
     #[test]
     fn key_rule_save_failure_is_returned_and_success_survives_restart() {
@@ -150,6 +181,71 @@ mod net {
         let _ = std::fs::remove_file(&path);
         assert!(after.network.peers.is_empty() && after.network.layout.is_empty());
         assert!(after.pending_key_rules.is_none());
+    }
+}
+
+mod net_wayland {
+    use flock_net::{InputEvent, Side};
+    use std::{sync::{atomic::Ordering, mpsc::Sender, Mutex, OnceLock}, time::Instant};
+    include!(concat!(env!("CARGO_MANIFEST_DIR"), "/runtime-wayland.rs"));
+    static TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn a_late_probe_and_old_eis_callbacks_cannot_register_in_the_new_generation() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        let old = begin_start();
+        let (finish_probe, probe_finished) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            probe_finished.recv().unwrap();
+            assert!(!current_start(old), "a superseded probe must be rejected");
+            assert!(with_session(old, |session| {
+                session.failed = Some("old failure".into());
+                session.opened = true;
+                session.no_answer = true;
+            }).is_none());
+            drop(Wayland { generation: old });
+        });
+        disable();
+        let new = begin_start();
+        with_session(new, |session| session.failed = Some("current failure".into())).unwrap();
+        finish_probe.send(()).unwrap();
+        worker.join().unwrap();
+        let session = SESSION.lock().unwrap();
+        assert_eq!(session.generation, new);
+        assert_eq!(session.failed.as_deref(), Some("current failure"));
+        assert!(!session.opened && !session.no_answer);
+    }
+
+    #[test]
+    fn dropping_an_old_start_preserves_the_new_sessions_capture() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        let old = Wayland { generation: begin_start() };
+        disable();
+        let new = Wayland { generation: begin_start() };
+        let (tx, rx) = std::sync::mpsc::channel();
+        {
+            let mut c = capture().lock().unwrap();
+            c.sides = vec![Side::Right];
+            c.active = true;
+            c.sink = Some(tx);
+            c.hit = Some((Side::Right, 0.5));
+            c.pending.push(InputEvent::Key { usage: 4, down: true });
+        }
+        REMOTE.store(true, Ordering::Release);
+        drop(old);
+        let preserved = {
+            let c = capture().lock().unwrap();
+            if let Some(sink) = &c.sink { sink.send(InputEvent::Key { usage: 5, down: true }).unwrap(); }
+            c.sides == vec![Side::Right] && rx.try_recv().is_ok()
+                && c.hit == Some((Side::Right, 0.5)) && c.pending.len() == 1
+                && c.release.is_none() && REMOTE.load(Ordering::Acquire)
+        };
+        drop(new);
+        assert!(preserved, "old platform Drop cleared the new session");
+        let c = capture().lock().unwrap();
+        assert!(c.sides.is_empty() && c.sink.is_none() && c.pending.is_empty());
+        assert!(c.hit.is_none() && c.release.is_some());
+        assert!(!REMOTE.load(Ordering::Acquire));
     }
 }
 

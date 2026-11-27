@@ -61,8 +61,17 @@ net = (root / 'src/net.rs').read_text()
 hook_start = net.index('                            let paired = shared.clone();')
 hook_end = net.index('                            match Service::start', hook_start)
 (scratch / 'runtime-net.rs').write_text(
-    'fn hooks(shared: Arc<Shared>) -> flock_net::Hooks {\n'
+    'fn hooks(shared: Arc<Shared>) -> flock_net::Hooks {\nlet config = shared.config().network;\n'
     + net[hook_start:hook_end] + '\nhooks\n}\n')
+wayland = (root / 'src/net_wayland.rs').read_text()
+drop_start = wayland.index('impl Drop for Wayland')
+drop_end = wayland.index('        self.cancelled.store', drop_start)
+(scratch / 'runtime-wayland.rs').write_text(
+    wayland[wayland.index('#[derive(Default)]'):wayland.index('#[derive(Default)]\nstruct Model')]
+    + item(wayland, r'^static REMOTE:', ';') + '\n'
+    + item(wayland, r'^static REMOTE_ENDED:', ';') + '\n'
+    + 'struct Wayland { generation: u64 }\n'
+    + wayland[drop_start:drop_end] + '\n    }\n}\n')
 with (scratch / 'facades.rs').open('a') as out:
     out.write(f'include!("{root / "scripts/host-runtime.rs"}");\n')
     out.write('mod shake_checks {\nuse std::time::{Duration, Instant};\n')

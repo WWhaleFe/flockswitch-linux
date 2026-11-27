@@ -206,6 +206,7 @@ pub fn spawn(shared: Arc<Shared>) -> JoinHandle<()> {
         .name("network".into())
         .spawn(move || {
             let mut service: Option<Arc<Service>> = None;
+            let mut service_keys = None;
             let mut mode = String::from("local");
             let mut platform: Option<Arc<dyn Platform>> = None;
             let mut previous = None;
@@ -218,7 +219,7 @@ pub fn spawn(shared: Arc<Shared>) -> JoinHandle<()> {
             // The user cancelled or denied the portal dialog: only a settings change (or
             // turning sharing off and on) asks again.
             let mut platform_blocked = false;
-            let mut starting: Option<std::sync::mpsc::Receiver<anyhow::Result<Arc<dyn Platform>>>> = None;
+            let mut starting: Option<(u64, std::sync::mpsc::Receiver<anyhow::Result<Arc<dyn Platform>>>)> = None;
             let mut retry = Instant::now() - Duration::from_secs(5);
             let mut key_retry = Instant::now() - Duration::from_secs(2);
             while !shared.stopped() {
@@ -239,6 +240,7 @@ pub fn spawn(shared: Arc<Shared>) -> JoinHandle<()> {
                 let reconnect_asked = crate::shared::take_reconnect_file();
                 if !config.on {
                     if previous.as_ref().is_none_or(|c: &NetConfig| c.on) {
+                        crate::net_wayland::disable();
                         LIVE.lock().unwrap().take();
                         mode = "local".into();
                         if let Some(s) = service.take() {
@@ -249,7 +251,6 @@ pub fn spawn(shared: Arc<Shared>) -> JoinHandle<()> {
                         platform_wait = PLATFORM_RETRY_MIN;
                         platform_blocked = false;
                         platform_retry = Instant::now() - PLATFORM_RETRY_MIN;
-                        crate::net_wayland::disable();
                     }
                 } else {
                     // Changed settings are a new request: ask again at once.
@@ -289,10 +290,12 @@ pub fn spawn(shared: Arc<Shared>) -> JoinHandle<()> {
                     // A start that failed (no EIS yet, portal not answering) is tried again
                     // later. It runs on its own thread: probing the portal can take seconds
                     // and the supervisor must keep answering stop and settings changes.
-                    if let Some(rx) = &starting {
+                    if let Some((generation, rx)) = &starting {
                         match rx.try_recv() {
                             Ok(Ok(p)) => {
-                                platform = Some(p);
+                                if crate::net_wayland::current_start(*generation) {
+                                    platform = Some(p);
+                                }
                                 starting = None;
                             }
                             Ok(Err(e)) => {
@@ -311,12 +314,13 @@ pub fn spawn(shared: Arc<Shared>) -> JoinHandle<()> {
                         && platform_retry.elapsed() >= platform_wait
                     {
                         platform_retry = Instant::now();
+                        let generation = crate::net_wayland::begin_start();
                         let (tx, rx) = std::sync::mpsc::channel();
                         let wayland_shared = shared.clone();
                         let spawned = thread::Builder::new().name("network-platform".into()).spawn(move || {
                             let result: anyhow::Result<Arc<dyn Platform>> =
                                 if crate::edge_wayland::session_is_wayland() {
-                                    crate::net_wayland::Wayland::new(wayland_shared)
+                                    crate::net_wayland::Wayland::new(wayland_shared, generation)
                                         .map(|p| Arc::new(p) as Arc<dyn Platform>)
                                 } else {
                                     crate::net_x11::X11::new().map(|p| Arc::new(p) as Arc<dyn Platform>)
@@ -324,7 +328,7 @@ pub fn spawn(shared: Arc<Shared>) -> JoinHandle<()> {
                             let _ = tx.send(result);
                         });
                         match spawned {
-                            Ok(_) => starting = Some(rx),
+                            Ok(_) => starting = Some((generation, rx)),
                             Err(e) => publish_error(config, format!("{e:#}")),
                         }
                     }
@@ -336,6 +340,10 @@ pub fn spawn(shared: Arc<Shared>) -> JoinHandle<()> {
                             let changed = shared.clone();
                             let master = shared.clone();
                             let key_rules = shared.clone();
+                            // The hook receives the service's merged table, not the
+                            // sub's patch. Compare with the table given to the service.
+                            let previous_keys = Arc::new(Mutex::new(config.keys.clone()));
+                            let persisted_keys = previous_keys.clone();
                             let hooks = flock_net::Hooks {
                                 switch_logitech: Box::new(|_| {}),
                                 on_paired: Box::new(move |peer| {
@@ -369,7 +377,16 @@ pub fn spawn(shared: Arc<Shared>) -> JoinHandle<()> {
                                     }
                                 }),
                                 persist_key_rules: Box::new(move |keys| {
-                                    key_rules.update_config(|c| c.network.keys = keys.clone())
+                                    let mut previous = persisted_keys.lock().unwrap();
+                                    key_rules.update_config(|c| {
+                                        // update_config reads and locks the latest disk
+                                        // settings. Only overwrite pairs changed by this edit.
+                                        c.network.keys.extend(keys.iter()
+                                            .filter(|(pair, rule)| previous.get(*pair) != Some(*rule))
+                                            .map(|(pair, rule)| (pair.clone(), rule.clone())));
+                                    })?;
+                                    *previous = keys.clone();
+                                    Ok(())
                                 }),
                                 ..flock_net::Hooks::default()
                             };
@@ -378,13 +395,17 @@ pub fn spawn(shared: Arc<Shared>) -> JoinHandle<()> {
                                     let s = Arc::new(s);
                                     *LIVE.lock().unwrap() = Some(Live { service: s.clone(), config: config.clone() });
                                     service = Some(s);
+                                    service_keys = Some(previous_keys);
                                 },
                                 Err(e) => publish_error(config, format!("{e:#}")),
                             }
                         }
                     } else if previous.as_ref() != Some(config) {
                         if let Some(s) = &service {
-                            let _ = s.update_config(config.clone());
+                            if let Some(keys) = &service_keys {
+                                let mut keys = keys.lock().unwrap();
+                                if s.update_config(config.clone()).is_ok() { *keys = config.keys.clone(); }
+                            }
                             if let Some(live) = LIVE.lock().unwrap().as_mut() { live.config = config.clone(); }
                         }
                     }
@@ -435,11 +456,11 @@ pub fn spawn(shared: Arc<Shared>) -> JoinHandle<()> {
             }
             LIVE.lock().unwrap().take();
             EDGES_ALLOWED.store(false, Ordering::Release);
+            crate::net_wayland::disable();
             if let Some(s) = service {
                 s.stop();
             }
             drop(platform);
-            crate::net_wayland::disable();
         })
         .expect("spawning network service")
 }

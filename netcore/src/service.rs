@@ -8,7 +8,7 @@ use crate::{
 };
 use anyhow::{Context, Result};
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     io::Read,
     net::{SocketAddr, TcpListener, TcpStream},
     sync::{
@@ -150,6 +150,7 @@ impl Service {
             skew: Duration::ZERO,
             last_wall: SystemTime::now(),
             outgoing: None,
+            waiting_sends: VecDeque::new(),
             file_jobs: files::Jobs::default(),
             transfer_revision: 0,
             incoming: None,
@@ -435,15 +436,18 @@ struct Link {
     bulk: Arc<AtomicUsize>,
 }
 impl Link {
-    fn send(&self, msg: Msg) {
+    fn send(&self, msg: Msg) -> bool {
         if let Err(msg) = self.tx.try_send(msg) {
-            // Motion and other replaceable updates may be dropped under backpressure.
-            // Losing a state transition could leave keys or buttons held remotely.
+            // Lost input transitions or group settings require a fresh connection.
+            // Motion and other replaceable updates may still be dropped.
             if matches!(msg, Msg::Input(InputEvent::Key { .. } | InputEvent::Button { .. })
-                | Msg::Enter { .. } | Msg::Leave { .. } | Msg::ReleaseAll) {
+                | Msg::Enter { .. } | Msg::Leave { .. } | Msg::ReleaseAll
+                | Msg::Layout { .. } | Msg::MasterSettings(_) | Msg::Group { .. }) {
                 self.cancel.store(true, Ordering::Release);
             }
+            return false;
         }
+        true
     }
 }
 impl Drop for Link {
@@ -530,6 +534,8 @@ struct Control {
     last_wall: SystemTime,
     /// A clipboard transfer on its way out, to this peer.
     outgoing: Option<(String, crate::transfer::Outgoing)>,
+    /// Prepared transfers for other targets, in request order, one per peer.
+    waiting_sends: VecDeque<(String, String, crate::transfer::Outgoing)>,
     file_jobs: files::Jobs,
     transfer_revision: u64,
     /// A clipboard transfer on its way in, from this peer.
@@ -697,6 +703,7 @@ impl Control {
         self.file_jobs.cancel_direction(1);
         if let Some((_, incoming)) = self.incoming.take() { incoming.abandon(); }
         self.outgoing = None;
+        self.waiting_sends.clear();
         self.pending_clip.clear();
         self.local(true);
         self.platform.arm_edges(&[]);
@@ -724,7 +731,7 @@ impl Control {
     fn poll_interval(&self) -> Duration {
         if self.file_jobs.busy() || (!self.links.is_empty() && !self.config.app_drives_edges)
             || self.edge_wait.is_some() || self.edge_hit.is_some()
-            || !matches!(self.state, State::Local) || self.outgoing.is_some() || self.incoming.is_some()
+            || !matches!(self.state, State::Local) || self.outgoing.is_some() || !self.waiting_sends.is_empty() || self.incoming.is_some()
         {
             POLL
         } else if self.config.on {
@@ -797,12 +804,13 @@ impl Control {
             if let Some((_, incoming)) = self.incoming.take() { incoming.abandon(); }
         }
         if !config.on || !config.share_clipboard {
-            if self.file_jobs.busy() || self.outgoing.is_some() || self.incoming.is_some() {
+            if self.file_jobs.busy() || self.outgoing.is_some() || !self.waiting_sends.is_empty() || self.incoming.is_some() {
                 self.fail_running_transfer();
             }
             self.file_jobs.cancel_direction(0);
             self.file_jobs.cancel_direction(1);
             self.outgoing = None;
+            self.waiting_sends.clear();
             self.pending_clip.clear();
             self.deferred_clipboard.clear();
             if let Some((_, incoming)) = self.incoming.take() { incoming.abandon(); }
@@ -1097,7 +1105,7 @@ impl Control {
                             self.fail_pair();
                         }
                     }
-                    Msg::Ping { t } => l.send(Msg::Pong { t }),
+                    Msg::Ping { t } => { l.send(Msg::Pong { t }); }
                     Msg::Layout { side } => {
                         if from_master {
                             let mine = side.map(Side::opposite);
@@ -1280,6 +1288,7 @@ impl Control {
             self.outgoing = None;
             self.transfer_note("send", "files", "failed");
         }
+        self.waiting_sends.retain(|(peer, _, _)| peer != id);
         if self.incoming.as_ref().is_some_and(|(peer, _)| peer == id) {
             if let Some((_, incoming)) = self.incoming.take() {
                 incoming.abandon();
@@ -1317,17 +1326,19 @@ impl Control {
         let group = (self.my_cells(), self.roster());
         self.told.retain(|id, _| self.links.get(id).is_some_and(|l| l.paired));
         for p in &self.config.peers {
-            let Some(l) = self.links.get(&p.id).filter(|l| l.paired && l.role == Role::Sub) else {
+            let Some(l) = self.links.get(&p.id).filter(|l|
+                l.paired && l.role == Role::Sub && !l.cancel.load(Ordering::Acquire)) else {
                 continue;
             };
             let now = (p.side, settings.clone(), group.clone());
             if self.told.get(&p.id) != Some(&now) {
-                l.send(Msg::Layout { side: p.side });
-                l.send(Msg::MasterSettings(settings.clone()));
-                if l.features.iter().any(|f| f == "group") {
-                    l.send(Msg::Group { cells: group.0.clone(), roster: group.1.clone() });
+                if l.send(Msg::Layout { side: p.side })
+                    && l.send(Msg::MasterSettings(settings.clone()))
+                    && (!l.features.iter().any(|f| f == "group")
+                        || l.send(Msg::Group { cells: group.0.clone(), roster: group.1.clone() }))
+                {
+                    self.told.insert(p.id.clone(), now);
                 }
-                self.told.insert(p.id.clone(), now);
             }
         }
     }
@@ -1784,7 +1795,7 @@ impl Control {
                         l.send(Msg::Input(event));
                     }
                 }
-                None => l.send(Msg::Input(event)),
+                None => { l.send(Msg::Input(event)); }
             }
         }
     }
@@ -2059,22 +2070,30 @@ impl Control {
         self.next_transfer
     }
     fn begin_send(&mut self, peer: &str, kind: &str, out: crate::transfer::Outgoing, sig: Vec<u8>) {
+        // A different target must not interrupt the same clipboard's active send.
+        // New content still supersedes every target waiting for the old clipboard.
+        let changed = self.outgoing.iter().map(|(peer, _)| peer)
+            .chain(self.waiting_sends.iter().map(|(peer, _, _)| peer))
+            .any(|peer| self.pending_clip.get(peer).is_some_and(|(_, old)| old != &sig));
+        if changed { self.drop_stale_sends(); }
+        if !self.clip_wanted(peer, &sig) { return; }
+        self.pending_clip.insert(peer.into(), (out.id(), sig));
+        self.waiting_sends.push_back((peer.into(), kind.into(), out));
+        self.start_next_send();
+    }
+    fn start_next_send(&mut self) {
+        if self.outgoing.is_some() { return; }
+        let Some((peer, kind, out)) = self.waiting_sends.pop_front() else { return };
         self.transfer_revision = self.transfer_revision.wrapping_add(1);
         self.status.lock().unwrap().transfer = Some(TransferStatus {
             direction: "send".into(),
-            kind: kind.into(),
+            kind,
             done_bytes: 0,
             total_bytes: out.total,
             stage: "running".into(),
             saved_in: None,
         });
-        // A newer transfer replaces one still going; the peer drops the old one when the
-        // new one starts.
-        if let Some((old_peer, _)) = self.outgoing.take() {
-            self.pending_clip.remove(&old_peer);
-        }
-        self.pending_clip.insert(peer.into(), (out.id(), sig));
-        self.outgoing = Some((peer.into(), out));
+        self.outgoing = Some((peer, out));
     }
     fn transfer_note(&mut self, direction: &str, kind: &str, stage: &str) {
         self.status.lock().unwrap().transfer = Some(TransferStatus {
@@ -2089,6 +2108,7 @@ impl Control {
     /// Hands the next pieces of a transfer to its link, a few at a time, so input sent
     /// meanwhile is never stuck behind a long queue.
     fn flush_transfer(&mut self) {
+        self.start_next_send();
         let Some((peer, out)) = &mut self.outgoing else { return };
         let Some(link) = self.links.get(peer.as_str()) else {
             self.pending_clip.remove(peer.as_str());
@@ -2145,7 +2165,11 @@ impl Control {
     /// content, hashing or already streaming, would overwrite that peer's newer clipboard.
     fn drop_stale_sends(&mut self) {
         let hashing = self.file_jobs.cancel_direction(0);
-        if self.outgoing.take().is_some() || hashing {
+        let outgoing = self.outgoing.take();
+        if let Some((peer, _)) = &outgoing { self.pending_clip.remove(peer); }
+        let waiting = !self.waiting_sends.is_empty();
+        for (peer, _, _) in self.waiting_sends.drain(..) { self.pending_clip.remove(&peer); }
+        if outgoing.is_some() || waiting || hashing {
             self.fail_running_transfer();
         }
     }
@@ -2839,6 +2863,7 @@ mod tests {
             skew: Duration::ZERO,
             last_wall: SystemTime::now(),
             outgoing: None,
+            waiting_sends: VecDeque::new(),
             file_jobs: files::Jobs::default(),
             transfer_revision: 0,
             incoming: None,
@@ -2947,6 +2972,148 @@ mod tests {
         link.send(Msg::Ping { t: 1 });
         assert!(!link.cancel.load(Ordering::Acquire));
         assert_eq!(rx.try_iter().count(), LINK_QUEUE);
+    }
+
+    #[test]
+    fn rejected_sub_sync_closes_the_link_and_resyncs_after_reconnect() {
+        // Reject Layout, MasterSettings and Group in turn, including partial admission.
+        for available in 0..3 {
+            let mut r = rig(Role::Master);
+            r.c.config.peers.push(peer(SUB, Role::Sub));
+            let rx = link(&mut r.c, SUB, Role::Sub);
+            r.c.tell_subs();
+            rx.try_iter().for_each(drop);
+            let before = r.c.told[SUB].clone();
+            r.c.config.clipboard_relay = !r.c.config.clipboard_relay;
+            for _ in 0..LINK_QUEUE - available {
+                r.c.links[SUB].send(Msg::Ping { t: 1 });
+            }
+            r.c.tell_subs();
+            assert_eq!(r.c.told.get(SUB), Some(&before));
+            assert!(r.c.links[SUB].cancel.load(Ordering::Acquire));
+            rx.try_iter().for_each(drop);
+            r.c.tell_subs();
+            assert_eq!(r.c.told.get(SUB), Some(&before));
+            assert!(rx.try_recv().is_err());
+            r.c.event(Event::Closed(SUB.into(), 1));
+            assert!(!r.c.told.contains_key(SUB));
+            let rx = link(&mut r.c, SUB, Role::Sub);
+            r.c.tell_subs();
+            let frames: Vec<_> = rx.try_iter().collect();
+            assert!(matches!(frames.as_slice(),
+                [Msg::Layout { .. }, Msg::MasterSettings(_), Msg::Group { .. }]));
+            assert!(r.c.told.contains_key(SUB));
+        }
+    }
+
+    #[test]
+    fn prepared_files_wait_for_the_previous_peer_to_finish() {
+        let mut r = rig(Role::Master);
+        r.c.config.peers.extend([peer(SUB, Role::Sub), peer(OTHER, Role::Sub)]);
+        let b = link(&mut r.c, SUB, Role::Sub);
+        let c = link(&mut r.c, OTHER, Role::Sub);
+        let path = r.dir.join("large-file");
+        let bytes = vec![42; crate::transfer::CHUNK * 5];
+        std::fs::write(&path, &bytes).unwrap();
+        *r.p.files.lock().unwrap() = vec![path.clone()];
+        r.c.send_clipboard(SUB);
+        finish_file_jobs(&mut r.c);
+        r.c.flush_transfer();
+        assert_eq!(r.c.links[SUB].bulk.load(Ordering::Acquire), 2);
+        r.c.send_clipboard(OTHER);
+        finish_file_jobs(&mut r.c);
+        assert_eq!(r.c.outgoing.as_ref().map(|(peer, _)| peer.as_str()), Some(SUB));
+        assert!(c.try_recv().is_err());
+        let mut b_done = false;
+        for (peer, rx) in [(SUB, b), (OTHER, c)] {
+            let mut incoming = None;
+            let mut done_id = None;
+            for _ in 0..20 {
+                r.c.flush_transfer();
+                for msg in rx.try_iter() {
+                    match msg {
+                        Msg::ClipStart { id, kind, files } => {
+                            assert!(peer == SUB || b_done);
+                            incoming = Some(crate::transfer::Incoming::start(id, kind, files,
+                                bytes.len() as u64, &r.dir.join(peer)).unwrap());
+                        }
+                        Msg::ClipChunk { file, data, .. } => {
+                            r.c.links[peer].bulk.fetch_sub(1, Ordering::AcqRel);
+                            incoming.as_mut().unwrap().chunk(file, &data).unwrap();
+                        }
+                        Msg::ClipDone { id } => { done_id = Some(id); }
+                        _ => panic!("unexpected transfer frame"),
+                    }
+                }
+                if done_id.is_some() { break; }
+            }
+            let id = done_id.expect("every target must receive ClipDone");
+            let received = incoming.unwrap().finish(&r.dir.join(peer).join("received")).unwrap();
+            let crate::transfer::Received::Files(paths) = received else { panic!("expected files") };
+            assert_eq!(std::fs::read(&paths[0]).unwrap(), bytes);
+            r.c.event(Event::ClipSent(peer.into(), 1, id));
+            assert_eq!(r.c.clip_sigs[peer], files_sig(std::slice::from_ref(&path)).unwrap());
+            b_done = true;
+        }
+        assert!(r.c.outgoing.is_none());
+        assert!(r.c.waiting_sends.is_empty());
+    }
+
+    #[test]
+    fn queued_sends_follow_clipboard_cancellation_and_peer_disconnects() {
+        use crate::transfer::{ClipKind, FileMeta, Outgoing};
+        for action in 0..6 {
+            let mut r = rig(Role::Master);
+            r.c.config.peers.extend([peer(SUB, Role::Sub), peer(OTHER, Role::Sub)]);
+            let b = link(&mut r.c, SUB, Role::Sub);
+            let c = link(&mut r.c, OTHER, Role::Sub);
+            for (id, peer) in [(10, SUB), (11, OTHER)] {
+                r.c.begin_send(peer, "image", Outgoing::bytes(id, ClipKind::Image,
+                    "image", vec![1; crate::transfer::CHUNK * 5]), vec![1]);
+            }
+            assert_eq!(r.c.outgoing.as_ref().unwrap().0, SUB);
+            assert_eq!(r.c.waiting_sends.len(), 1);
+            // A repeated request for the same peer does not grow the queue.
+            r.c.begin_send(OTHER, "image", Outgoing::bytes(12, ClipKind::Image,
+                "image", vec![1; crate::transfer::CHUNK * 5]), vec![1]);
+            assert_eq!(r.c.waiting_sends.len(), 1);
+            match action {
+                0 => message(&mut r.c, SUB, Msg::Clipboard { text: "new".into() }),
+                1 => r.c.clip_start(SUB, 70, ClipKind::Text,
+                    vec![FileMeta { name: "text".into(), size: 2 }]),
+                2 => r.c.begin_send(OTHER, "image", Outgoing::bytes(13, ClipKind::Image,
+                    "new-image", vec![2]), vec![2]),
+                3 => r.c.update(NetConfig { share_clipboard: false, ..r.c.config.clone() }),
+                4 => r.c.disconnect(OTHER, "waiting peer lost"),
+                5 => r.c.disconnect(SUB, "active peer lost"),
+                _ => unreachable!(),
+            }
+            assert_eq!(r.c.pending_clip.contains_key(SUB), action == 4);
+            assert_eq!(r.c.pending_clip.contains_key(OTHER), action == 2 || action == 5);
+            assert!(r.c.waiting_sends.iter().all(|(peer, _, _)| peer != SUB));
+            match action {
+                0 | 1 | 3 => {
+                    assert!(r.c.outgoing.is_none() && r.c.waiting_sends.is_empty());
+                    r.c.flush_transfer();
+                    assert!(b.try_recv().is_err() && c.try_recv().is_err());
+                }
+                2 => {
+                    assert!(r.c.waiting_sends.is_empty());
+                    assert_eq!(r.c.outgoing.as_ref().unwrap().1.id(), 13);
+                }
+                4 => {
+                    assert!(r.c.waiting_sends.is_empty());
+                    assert_eq!(r.c.outgoing.as_ref().unwrap().0, SUB);
+                }
+                5 => {
+                    assert!(r.c.outgoing.is_none());
+                    r.c.flush_transfer();
+                    assert_eq!(r.c.outgoing.as_ref().unwrap().0, OTHER);
+                    assert!(c.try_iter().any(|msg| matches!(msg, Msg::ClipStart { id: 11, .. })));
+                }
+                _ => unreachable!(),
+            }
+        }
     }
 
     #[test]

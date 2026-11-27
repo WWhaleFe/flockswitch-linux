@@ -38,7 +38,51 @@ pub fn capture() -> &'static Mutex<Capture> {
     CAPTURE.get_or_init(|| Mutex::new(Capture::default()))
 }
 pub fn disable() {
+    let mut session = SESSION.lock().unwrap();
+    session.generation += 1;
+    clear_capture();
+}
+
+#[derive(Default)]
+struct Session {
+    generation: u64,
+    /// A failed EIS session must be replaced by the supervisor.
+    failed: Option<String>,
+    /// A failure before opening is normally a cancelled or denied permission dialog.
+    opened: bool,
+    /// No create_session answer means retrying will not repeat a denied dialog.
+    no_answer: bool,
+}
+static SESSION: Mutex<Session> = Mutex::new(Session {
+    generation: 0, failed: None, opened: false, no_answer: false,
+});
+
+/// Reserve a generation before probing, so an off/on invalidates even a slow probe.
+pub fn begin_start() -> u64 {
+    let mut session = SESSION.lock().unwrap();
+    *session = Session { generation: session.generation + 1, ..Session::default() };
+    session.generation
+}
+
+pub fn current_start(generation: u64) -> bool {
+    SESSION.lock().unwrap().generation == generation
+}
+
+fn with_session<T>(generation: u64, apply: impl FnOnce(&mut Session) -> T) -> Option<T> {
+    let mut session = SESSION.lock().unwrap();
+    (session.generation == generation).then(|| apply(&mut session))
+}
+
+fn disable_session(generation: u64) {
+    with_session(generation, |session| {
+        session.generation += 1;
+        clear_capture();
+    });
+}
+
+fn clear_capture() {
     REMOTE.store(false, Ordering::Release);
+    *REMOTE_ENDED.lock().unwrap() = None;
     let mut c = capture().lock().unwrap();
     c.sides.clear();
     c.sink = None;
@@ -76,23 +120,14 @@ enum Command {
 /// releases sent after control ends do not). Wayland has no global cursor; the position
 /// this app set is only true while that control lasts.
 static REMOTE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-/// The EIS session ended with an error and nothing restarts it: the supervisor must
-/// drop this platform and start a new one.
-static EIS_FAILED: Mutex<Option<String>> = Mutex::new(None);
-/// The EIS connection was established at least once in this platform's life. A failure
-/// before that is the user cancelling or denying the portal dialog (or no portal): asking
-/// again by itself would only pop the dialog up forever.
-static EIS_OPENED: AtomicBool = AtomicBool::new(false);
-/// The portal never answered `create_session`: no dialog was shown, so trying again is safe.
-static EIS_NO_ANSWER: AtomicBool = AtomicBool::new(false);
 pub fn eis_opened() -> bool {
-    EIS_OPENED.load(Ordering::Acquire)
+    SESSION.lock().unwrap().opened
 }
 pub fn eis_no_answer() -> bool {
-    EIS_NO_ANSWER.load(Ordering::Acquire)
+    SESSION.lock().unwrap().no_answer
 }
 pub fn eis_failed() -> Option<String> {
-    EIS_FAILED.lock().unwrap().clone()
+    SESSION.lock().unwrap().failed.clone()
 }
 pub fn remote_controlled() -> bool {
     REMOTE.load(Ordering::Acquire)
@@ -107,6 +142,7 @@ pub fn remote_or_just_ended() -> bool {
     remote_controlled() || REMOTE_ENDED.lock().unwrap().is_some_and(|t| t.elapsed() < REMOTE_TAIL)
 }
 pub struct Wayland {
+    generation: u64,
     clipboard: crate::clipboard::Clipboard,
     commands: Sender<Command>,
     /// Wakes the EIS loop for a queued command; idle, it waits for the compositor only.
@@ -120,16 +156,17 @@ pub struct Wayland {
     cancelled: Arc<AtomicBool>,
 }
 impl Wayland {
-    pub fn new(shared: Arc<Shared>) -> anyhow::Result<Self> {
+    pub fn new(shared: Arc<Shared>, generation: u64) -> anyhow::Result<Self> {
         let support = crate::net::probe();
         anyhow::ensure!(support.receive, "{}", support.reason);
         anyhow::ensure!(
             !shared.stopped() && shared.config().network.on,
             "Network sharing was disabled"
         );
-        *EIS_FAILED.lock().unwrap() = None;
-        EIS_OPENED.store(false, Ordering::Release);
-        EIS_NO_ANSWER.store(false, Ordering::Release);
+        // Hold the generation lock through registration. A cancelled probe must not
+        // reset the new session's status or install a receiver after sharing restarts.
+        let session = SESSION.lock().unwrap();
+        anyhow::ensure!(session.generation == generation, "Network start was superseded");
         let (commands, rx) = mpsc::channel();
         let wake = Arc::new(eventfd(0, EventfdFlags::CLOEXEC | EventfdFlags::NONBLOCK)?);
         let worker_wake = wake.clone();
@@ -143,14 +180,15 @@ impl Wayland {
             .name("network-eis".into())
             .spawn(move || {
                 async_io::block_on(async {
-                    if let Err(e) = receive(shared, rx, worker_wake, worker_cancel_wake, state.clone(), cancel).await {
+                    if let Err(e) = receive(shared, rx, worker_wake, worker_cancel_wake, state.clone(), cancel, generation).await {
                         let text = format!("{e:#}");
                         state.lock().unwrap().error = Some(text.clone());
-                        *EIS_FAILED.lock().unwrap() = Some(text);
+                        with_session(generation, |session| session.failed = Some(text));
                     }
                 });
             })?;
         Ok(Self {
+            generation,
             clipboard: crate::clipboard::Clipboard::default(),
             commands,
             wake,
@@ -192,26 +230,36 @@ impl Platform for Wayland {
         if remote_controlled() { self.model.lock().unwrap().cursor } else { None }
     }
     fn warp(&self, x: f64, y: f64) {
-        if REMOTE.swap(false, Ordering::AcqRel) {
-            *REMOTE_ENDED.lock().unwrap() = Some(Instant::now());
-        }
+        with_session(self.generation, |_| {
+            if REMOTE.swap(false, Ordering::AcqRel) {
+                *REMOTE_ENDED.lock().unwrap() = Some(Instant::now());
+            }
+        });
         self.model.lock().unwrap().cursor = Some((x, y));
         self.command(Command::Warp(x, y));
     }
     fn arm_edges(&self, sides: &[Side]) {
-        capture().lock().unwrap().sides = if self.send { sides.to_vec() } else { vec![] };
+        with_session(self.generation, |_| {
+            capture().lock().unwrap().sides = if self.send { sides.to_vec() } else { vec![] };
+        });
     }
     fn control_down(&self) -> bool { capture().lock().unwrap().control }
     fn take_edge_hit(&self) -> Option<(Side, f64)> {
-        let mut c = capture().lock().unwrap();
-        if crate::net::network_edges_allowed() { c.hit.take() } else { c.hit = None; None }
+        with_session(self.generation, |_| {
+            let mut c = capture().lock().unwrap();
+            if crate::net::network_edges_allowed() { c.hit.take() } else { c.hit = None; None }
+        }).flatten()
     }
     fn place_on_return(&self, side: Side, pos: f64) {
-        let mut c = capture().lock().unwrap();
-        // The portal writes its zones separately from the receiver's device regions.
-        c.position = flock_net::geometry::edge_position(&capture_displays(), side, pos);
+        with_session(self.generation, |_| {
+            let mut c = capture().lock().unwrap();
+            // The portal writes its zones separately from the receiver's device regions.
+            c.position = flock_net::geometry::edge_position(&capture_displays(), side, pos);
+        });
     }
     fn start_capture(&self, sink: Sender<InputEvent>) -> anyhow::Result<()> {
+        let session = SESSION.lock().unwrap();
+        anyhow::ensure!(session.generation == self.generation, "Network session was superseded");
         let mut c = capture().lock().unwrap();
         anyhow::ensure!(crate::net::network_edges_allowed(), "Network edges are paused");
         anyhow::ensure!(self.send && c.active, "GNOME InputCapture is not active");
@@ -224,18 +272,20 @@ impl Platform for Wayland {
     }
     fn stop_capture(&self) {
         self.capturing.store(false, Ordering::Release);
-        let mut c = capture().lock().unwrap();
-        c.sink = None;
-        c.hit = None;
-        c.deferred = None;
-        c.pending.clear();
-        if c.active {
-            c.release = Some(Instant::now() + Duration::from_millis(20));
-        }
+        with_session(self.generation, |_| {
+            let mut c = capture().lock().unwrap();
+            c.sink = None;
+            c.hit = None;
+            c.deferred = None;
+            c.pending.clear();
+            if c.active {
+                c.release = Some(Instant::now() + Duration::from_millis(20));
+            }
+        });
     }
     fn inject(&self, event: &InputEvent) {
         if matches!(event, InputEvent::Motion { .. } | InputEvent::Scroll { .. } | InputEvent::Key { down: true, .. } | InputEvent::Button { down: true, .. }) {
-            REMOTE.store(true, Ordering::Release);
+            with_session(self.generation, |_| REMOTE.store(true, Ordering::Release));
         }
         self.command(Command::Input(event.clone()));
     }
@@ -255,7 +305,7 @@ impl Platform for Wayland {
 }
 impl Drop for Wayland {
     fn drop(&mut self) {
-        disable();
+        disable_session(self.generation);
         self.cancelled.store(true, Ordering::Release);
         let _ = rustix::io::write(&*self.cancel_wake, &1u64.to_ne_bytes());
         self.command(Command::Quit);
@@ -278,6 +328,7 @@ async fn receive(
     cancel_wake: Arc<OwnedFd>,
     model: Arc<Mutex<Model>>,
     cancel: Arc<AtomicBool>,
+    generation: u64,
 ) -> anyhow::Result<()> {
     use ashpd::desktop::{
         remote_desktop::{self as rd, DeviceType, RemoteDesktop},
@@ -292,7 +343,7 @@ async fn receive(
     })
     .await
     .ok_or_else(|| {
-        EIS_NO_ANSWER.store(true, Ordering::Release);
+        with_session(generation, |session| session.no_answer = true);
         anyhow::anyhow!("RemoteDesktop did not answer")
     })??;
     let result = async {
@@ -338,7 +389,7 @@ async fn receive(
         let (connection, events) = context
             .handshake_async_io("flockswitch", ei::handshake::ContextType::Sender)
             .await?;
-        EIS_OPENED.store(true, Ordering::Release);
+        anyhow::ensure!(with_session(generation, |session| session.opened = true).is_some(), "Network start was superseded");
         enum Ev {
             Ei(Result<EiEvent, reis::Error>),
             Gone,
@@ -380,7 +431,7 @@ async fn receive(
                 None => events.next().await,
             };
             let Some(event) = next else { break };
-            if shared.stopped() || !shared.config().network.on {
+            if shared.stopped() || !shared.config().network.on || !current_start(generation) {
                 break;
             }
             match event {

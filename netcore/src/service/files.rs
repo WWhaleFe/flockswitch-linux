@@ -235,6 +235,29 @@ mod tests {
     use std::time::{Duration, Instant};
 
     #[test]
+    fn send_jobs_keep_other_peers_in_order_and_cancel_together() {
+        let mut jobs = Jobs::default();
+        let release = jobs.hold_worker("disk");
+        for (peer, id) in [("b", 1), ("c", 2), ("c", 3)] {
+            jobs.submit(Job { peer: peer.into(), token: 1, revision: id.into(),
+                work: Work::Send { id, paths: vec![], limit: 100 } });
+        }
+        assert_eq!(jobs.sends.iter().map(|job| (job.peer.as_str(), job.revision))
+            .collect::<Vec<_>>(), [("b", 1), ("c", 3)]);
+        assert!(!jobs.running.as_ref().unwrap().cancel.load(Ordering::Acquire));
+        assert!(jobs.cancel_direction(0));
+        assert!(jobs.sends.is_empty());
+        assert!(jobs.running.as_ref().unwrap().cancel.load(Ordering::Acquire));
+        release.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while jobs.busy() {
+            assert!(jobs.poll().is_none());
+            assert!(Instant::now() < deadline);
+            thread::yield_now();
+        }
+    }
+
+    #[test]
     fn only_the_latest_job_waits_and_cancelled_workers_are_reaped() {
         let mut jobs = Jobs::default();
         let release = jobs.hold_worker("new");
