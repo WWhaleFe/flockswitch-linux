@@ -157,7 +157,7 @@ pub struct Wayland {
 }
 impl Wayland {
     pub fn new(shared: Arc<Shared>, generation: u64) -> anyhow::Result<Self> {
-        let support = crate::net::probe();
+        let support = crate::net::portal_probe();
         anyhow::ensure!(support.receive, "{}", support.reason);
         anyhow::ensure!(
             !shared.stopped() && shared.config().network.on,

@@ -103,12 +103,39 @@ fn gather(inputs: &Inputs) -> Facts {
                 .map(|(_, out)| logic::gsettings_list_contains(&out, logic::APPINDICATOR_UUID));
         }
     }
+    if wayland && gnome_shell {
+        f.helper = Some(helper_facts());
+    }
     let network = crate::net::probe();
     f.network_send = network.send;
     f.network_receive = network.receive;
     f.network_reason = network.reason;
     f.homebrew = homebrew(inputs.newer_version.clone());
     f
+}
+
+/// The GNOME helper extension: whether it is installed, switched on and answering, and
+/// where this program's copy of it is (the release folder, or Homebrew's `share`).
+fn helper_facts() -> logic::HelperFacts {
+    let data = dirs::data_dir().unwrap_or_else(|| PathBuf::from(".local/share"));
+    let dest = logic::helper_dest(&data);
+    let exe_dir = std::env::current_exe().ok().and_then(|e| std::fs::canonicalize(e).ok()).and_then(|e| e.parent().map(Path::to_path_buf));
+    let source = logic::helper_source_candidates(exe_dir.as_deref(), brew_prefix().as_deref()).into_iter().find(|d| has_helper_files(d));
+    let enabled_list = output(Command::new("gsettings").args(["get", "org.gnome.shell", "enabled-extensions"]), Duration::from_secs(5))
+        .filter(|(ok, _)| *ok)
+        .map(|(_, out)| out);
+    logic::HelperFacts {
+        source,
+        installed: has_helper_files(&dest),
+        enabled: enabled_list.as_deref().map(|l| logic::gsettings_list_contains(l, logic::HELPER_UUID)),
+        enabled_list,
+        answering: crate::gnome_ext::available_waiting(),
+        dest,
+    }
+}
+
+fn has_helper_files(dir: &Path) -> bool {
+    logic::HELPER_FILES.iter().all(|f| dir.join(f).is_file())
 }
 
 /// Whether `package` is installed, and its version, from the package database.
@@ -372,6 +399,7 @@ pub fn title(t: &Texts, item: &Item) -> String {
         ItemId::Network => if crate::i18n::is_korean() { "네트워크 공유" } else { "Network sharing" }.into(),
         ItemId::UdevRule => t.setup_udev.into(),
         ItemId::Portal => t.setup_portal.into(),
+        ItemId::GnomeHelper => t.setup_helper.into(),
         ItemId::KoreanFont => t.setup_font.into(),
         ItemId::TrayIcon => t.setup_tray.into(),
         ItemId::MenuEntry => t.setup_menu.into(),
@@ -398,6 +426,9 @@ pub fn why(t: &Texts, item: &Item) -> String {
         Why::PortalRelogin { .. } => t.setup_portal_relogin.into(),
         Why::PortalX11 { gnome } => t.setup_portal_x11.replace("{version}", &gnome.to_string()),
         Why::FontMissing => t.setup_font_missing.into(),
+        Why::HelperInstall => t.setup_helper_install.into(),
+        Why::HelperEnable => t.setup_helper_enable.into(),
+        Why::HelperRelogin => t.setup_helper_relogin.into(),
         Why::TrayInstall => t.setup_tray_install.into(),
         Why::TrayEnable => t.setup_tray_enable.into(),
         Why::TrayRelogin => t.setup_tray_relogin.into(),

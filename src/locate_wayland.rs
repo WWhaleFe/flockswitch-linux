@@ -59,6 +59,12 @@ fn watch(shared: Arc<Shared>) {
     let mut told_shake = false;
     while !shared.stopped() {
         let screen_generation = shared.screen_generation();
+        // With the GNOME helper the edge watcher (edge.rs) does all of this, and more
+        // (it can follow the cursor); doing it here too would show everything twice.
+        if crate::edge_wayland::helper_edges() {
+            shared.wait_screen(screen_generation, STATUS_POLL);
+            continue;
+        }
         if shared.version() != version {
             version = shared.version();
             cfg = shared.config();

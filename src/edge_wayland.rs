@@ -6,12 +6,15 @@
 //! (edge_layer.rs); one without it (GNOME) gets pointer barriers from the desktop
 //! portal's InputCapture (edge_portal.rs). The choice is logged ("edge backend: …") and
 //! written to the status file so the settings window can say what works and what does
-//! not. FLOCKSWITCH_EDGE_BACKEND=layer-shell|input-capture|x11|none forces one.
+//! not. FLOCKSWITCH_EDGE_BACKEND=layer-shell|input-capture|gnome-helper|x11|none forces one.
+//! GNOME with the helper extension (gnome_ext.rs) is chosen before any of these: the
+//! extension tells the cursor, so edge.rs watches it as in an X11 session and no portal
+//! session is opened.
 
 use crate::config::{Config, Edge, Edges, EDGES};
 use crate::device::waveform;
 use crate::edge::{rising_pulse, Rect, FINAL_PULSE, HAPTIC_TICK, STATUS_POLL};
-use crate::edge_logic::{self as logic, Choice, DwellConfig, Effect, Probe, Reason, Side, Situation};
+use crate::edge_logic::{self as logic, Choice, DwellConfig, Effect, Probe, Reason, Side, Situation, Zone};
 use crate::overlay;
 use crate::shared::Shared;
 use std::future::Future;
@@ -95,6 +98,27 @@ pub fn set_status(shared: &Shared, backend: &str, note: &str) {
     });
 }
 
+/// The backend the edge worker of this process chose (None: not chosen yet, or this
+/// process runs no edge worker, like the settings window).
+static CHOSEN: std::sync::Mutex<Option<Choice>> = std::sync::Mutex::new(None);
+
+fn choose_backend(choice: &Choice) {
+    *CHOSEN.lock().unwrap() = Some(choice.clone());
+}
+
+/// The edge worker is watching through the GNOME helper extension.
+pub fn helper_edges() -> bool {
+    *CHOSEN.lock().unwrap() == Some(Choice::GnomeHelper)
+}
+
+/// Whether the network side uses the GNOME helper extension (net_gnome.rs) instead of the
+/// RemoteDesktop and InputCapture portals; see `logic::net_uses_helper`.
+pub fn net_uses_helper() -> bool {
+    let chosen = CHOSEN.lock().unwrap().clone();
+    // Asked last: it may look for the extension, which the other answers can rule out.
+    logic::net_uses_helper(true, forced_backend().as_deref(), chosen.as_ref()) && crate::gnome_ext::available()
+}
+
 /// FLOCKSWITCH_EDGE_BACKEND, lower case.
 fn forced_backend() -> Option<String> {
     std::env::var("FLOCKSWITCH_EDGE_BACKEND").ok().map(|s| s.trim().to_lowercase()).filter(|s| !s.is_empty())
@@ -161,8 +185,13 @@ pub fn spawn(shared: Arc<Shared>) {
             log::info!("edge probe: looking again in {} s ({tries}/{PROBE_RETRIES})", PROBE_RETRY.as_secs());
             std::thread::sleep(PROBE_RETRY);
         };
+        choose_backend(&choice);
         match &choice {
             Choice::None(_) => {}
+            Choice::GnomeHelper => {
+                log::info!("edge backend: gnome-helper (the GNOME Shell extension reads the cursor; no portal is used)");
+                set_status(&shared, choice.name(), "");
+            }
             Choice::InputCapture => {
                 log::info!(
                     "edge backend: input-capture (xdg-desktop-portal InputCapture v{}{})",
@@ -182,6 +211,10 @@ pub fn spawn(shared: Arc<Shared>) {
         }
         match choice {
             Choice::X11 => crate::edge::spawn(shared),
+            Choice::GnomeHelper => {
+                helper_countdown();
+                crate::edge::spawn(shared);
+            }
             Choice::LayerShell => crate::edge_layer::run(shared),
             Choice::InputCapture => crate::edge_portal::run(shared, probe.input_capture.unwrap_or(1), probe.gnome),
             Choice::None(_) => {}
@@ -189,6 +222,24 @@ pub fn spawn(shared: Arc<Shared>) {
     });
     if let Err(e) = started {
         log::warn!("edge switching: cannot start its thread: {e}");
+    }
+}
+
+/// Where the countdown can be drawn with the helper: through XWayland, when its screens
+/// are the extension's monitors (or a multiple), as the portal backend decides it; else
+/// the wait goes without a drawing.
+fn helper_countdown() {
+    let zones: Vec<Zone> = crate::gnome_ext::displays()
+        .iter()
+        .map(|d| Zone { x: d.x as i32, y: d.y as i32, w: d.w as i32, h: d.h as i32 })
+        .collect();
+    let screens = crate::edge_portal::xwayland_screens();
+    match logic::xwayland_scale(&zones, &screens) {
+        Some(k) => {
+            overlay::use_gnome_helper(k);
+            log::info!("gnome helper: countdown through XWayland (its screens {screens:?} are the monitors {zones:?} × {k})");
+        }
+        None => log::info!("gnome helper: countdown not drawn (XWayland screens {screens:?} do not line up with the monitors {zones:?})"),
     }
 }
 
@@ -241,8 +292,15 @@ fn probe(forced: Option<String>, portal_limit: Duration) -> (Probe, String) {
             found.push("wlr-layer-shell: no".into());
         }
     }
-    let want_portal = p.layer_shell != Some(true) || p.forced.as_deref() == Some("input-capture");
     let gnome_desktop = desktop().to_ascii_lowercase().contains("gnome");
+    // The helper extension answers: no portal is asked (unless a way is forced).
+    if wayland && gnome_desktop && crate::gnome_ext::available_waiting() {
+        p.gnome_helper = true;
+        log::info!("edge probe: GNOME helper extension answers");
+        found.push("GNOME helper".into());
+    }
+    let helper = p.gnome_helper && p.forced.as_deref().is_none_or(|f| f == "gnome-helper");
+    let want_portal = !helper && (p.layer_shell != Some(true) || p.forced.as_deref() == Some("input-capture"));
     async_io::block_on(async {
         if gnome_desktop {
             p.gnome = within(Duration::from_secs(5), gnome_shell_version()).await.flatten();

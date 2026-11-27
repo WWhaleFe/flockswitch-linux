@@ -51,7 +51,16 @@ pub struct Support {
     pub receive: bool,
     pub reason: String,
 }
+/// What this session can do for sharing. With the GNOME helper extension in use (see
+/// `edge_wayland::net_uses_helper`) that is everything, and no portal is asked.
 pub fn probe() -> Support {
+    if crate::edge_wayland::session_is_wayland() && crate::edge_wayland::net_uses_helper() {
+        return Support { send: true, receive: true, reason: "GNOME helper extension".into() };
+    }
+    portal_probe()
+}
+/// `probe` through the desktop portals (Wayland) or XTest (X11).
+pub fn portal_probe() -> Support {
     if !crate::edge_wayland::session_is_wayland() {
         return match crate::net_x11::probe() {
             Ok(()) => Support {
@@ -167,8 +176,8 @@ pub fn live_status() -> Option<flock_net::Status> {
 
 /// The network config the service runs with: sharing only after consent, the master's
 /// effect settings attached, and the app driving the edges when there is a wait.
-fn runtime_config(full: &Config) -> NetConfig {
-    crate::net_logic::runtime_config(full, crate::edge_wayland::session_is_wayland(), config_dir())
+fn runtime_config(full: &Config, helper: bool) -> NetConfig {
+    crate::net_logic::runtime_config(full, crate::net_logic::portal_edges(crate::edge_wayland::session_is_wayland(), helper), config_dir())
 }
 
 fn publish_error(config: &NetConfig, error: String) {
@@ -219,17 +228,27 @@ pub fn spawn(shared: Arc<Shared>) -> JoinHandle<()> {
             // The user cancelled or denied the portal dialog: only a settings change (or
             // turning sharing off and on) asks again.
             let mut platform_blocked = false;
+            // Whether the GNOME helper extension is what this service runs on (net_gnome.rs).
+            // Decided while there is no platform; kept while one is made or running, so
+            // the settings (`app_drives_edges`) and the platform always agree.
+            let mut helper = false;
             let mut starting: Option<(u64, std::sync::mpsc::Receiver<anyhow::Result<Arc<dyn Platform>>>)> = None;
             let mut retry = Instant::now() - Duration::from_secs(5);
             let mut key_retry = Instant::now() - Duration::from_secs(2);
             while !shared.stopped() {
                 shared.reload_if_edited();
-                if version != Some(shared.version()) {
+                let helper_now = if platform.is_some() || starting.is_some() {
+                    helper
+                } else {
+                    crate::edge_wayland::session_is_wayland() && crate::edge_wayland::net_uses_helper()
+                };
+                if version != Some(shared.version()) || helper_now != helper {
+                    helper = helper_now;
                     // Serializing the master's effect settings and copying peers is
                     // needed only when settings change, not every supervisor tick.
                     shared.read_config(|full| {
                         version = Some(shared.version());
-                        let config = runtime_config(full);
+                        let config = runtime_config(full, helper);
                         edges_allowed = full.network_edges_allowed() && config.on;
                         cached = Some(config);
                     });
@@ -327,9 +346,12 @@ pub fn spawn(shared: Arc<Shared>) -> JoinHandle<()> {
                         let generation = crate::net_wayland::begin_start();
                         let (tx, rx) = std::sync::mpsc::channel();
                         let wayland_shared = shared.clone();
+                        let use_helper = helper;
                         let spawned = thread::Builder::new().name("network-platform".into()).spawn(move || {
                             let result: anyhow::Result<Arc<dyn Platform>> =
-                                if crate::edge_wayland::session_is_wayland() {
+                                if use_helper {
+                                    crate::net_gnome::Gnome::new().map(|p| Arc::new(p) as Arc<dyn Platform>)
+                                } else if crate::edge_wayland::session_is_wayland() {
                                     crate::net_wayland::Wayland::new(wayland_shared, generation)
                                         .map(|p| Arc::new(p) as Arc<dyn Platform>)
                                 } else {

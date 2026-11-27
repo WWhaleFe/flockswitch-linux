@@ -25,7 +25,7 @@ use crate::edge::Rect;
 use crate::locate_logic::{LocatePath, CATCH_MAX, CATCH_WAIT};
 use crate::overlay_render as render;
 use crate::overlay_wayland as wayland;
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::mpsc::{channel, Receiver, RecvTimeoutError, Sender};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
@@ -64,6 +64,29 @@ static OUTSIDE_X11: AtomicU8 = AtomicU8::new(OUTSIDE_X11_NOTHING);
 /// to line up). Takes effect for the first effect drawn.
 pub fn use_xwayland() {
     OUTSIDE_X11.store(OUTSIDE_X11_XWAYLAND, Ordering::Relaxed);
+}
+
+/// GNOME Wayland with the helper extension: draw through XWayland, whose screens are
+/// the extension's monitors times `scale`. The edge watcher gives monitors in the
+/// extension's coordinates; they are multiplied by `scale` here, and the cursor is
+/// asked from the extension (XWayland cannot see it).
+pub fn use_gnome_helper(scale: f64) {
+    HELPER_SCALE.store(scale.to_bits(), Ordering::Relaxed);
+    use_xwayland();
+}
+
+/// `use_gnome_helper`'s scale as f64 bits; 0.0 when the helper is not the cursor's source.
+static HELPER_SCALE: AtomicU64 = AtomicU64::new(0);
+
+/// The helper's scale, when the helper tells the cursor.
+fn helper_scale() -> Option<f64> {
+    let k = f64::from_bits(HELPER_SCALE.load(Ordering::Relaxed));
+    (k > 0.0).then_some(k)
+}
+
+/// A display of the extension's coordinates in XWayland's.
+fn scaled(display: Rect, k: f64) -> Rect {
+    Rect { x: display.x * k, y: display.y * k, w: display.w * k, h: display.h * k }
 }
 
 /// In a Wayland session, draw on layer-shell surfaces.
@@ -215,7 +238,7 @@ impl Effects {
             return;
         }
         self.tried = Some(target);
-        if !crate::edge::available() && target == OUTSIDE_X11_LAYER_SHELL {
+        if !crate::edge::platform::x11_available() && target == OUTSIDE_X11_LAYER_SHELL {
             if self.wl.is_none() {
                 self.wl = wayland::Painter::open();
             }
@@ -242,6 +265,12 @@ impl Effects {
                     return;
                 }
                 self.open();
+                // With the helper: the monitor in XWayland's coordinates, the cursor asked
+                // from the extension as the countdown runs (see `use_gnome_helper`).
+                let display = match (display, helper_scale().filter(|_| self.wl.is_none())) {
+                    (Some(d), Some(k)) => Some(scaled(d, k)),
+                    (d, _) => d,
+                };
                 let look = wayland::Look { edge, style, direction, shrink, preview, color, size };
                 if let Some(wl) = self.wl.as_mut() {
                     self.wl_edge = wl.begin_edge(display, cursor, look, elapsed, duration);
@@ -273,7 +302,7 @@ impl Effects {
                 if !render::locate_exists(style) {
                     return;
                 }
-                if crate::edge::available() {
+                if crate::edge::platform::x11_available() {
                     // An X11 session, as always.
                     self.locate = self.connection().and_then(|x| begin_locate(x, style, color, size, None, None));
                 } else {
@@ -437,8 +466,15 @@ fn begin_edge(
     let layer = x.layer(sx, sy, w, h)?;
     let started = Instant::now().checked_sub(elapsed).unwrap_or_else(Instant::now);
     // A preview where the cursor is unknown (Wayland): the middle of the edge.
-    let cursor = cursor.or_else(|| (!crate::edge::available()).then(|| (display.x + display.w / 2.0, display.y + display.h / 2.0)));
+    let cursor = cursor.or_else(|| (!crate::edge::platform::x11_available() && helper_scale().is_none()).then(|| (display.x + display.w / 2.0, display.y + display.h / 2.0)));
     Some(EdgeEffect { layer, cursor, edge, style, direction, shrink, preview, started, duration: duration.as_secs_f64().max(0.05), color, size })
+}
+
+/// The cursor from the helper extension, in XWayland's coordinates.
+fn helper_cursor() -> Option<(i32, i32)> {
+    let k = helper_scale()?;
+    let (x, y, _) = crate::gnome_ext::pointer()?;
+    Some(((x * k).round() as i32, (y * k).round() as i32))
 }
 
 /// Draws the next frame of the countdown. False when it has finished.
@@ -450,7 +486,7 @@ fn draw_edge(x: &platform::Connection, effect: &mut EdgeEffect) -> bool {
     let (lx, ly) = effect.layer.position();
     let (mx, my) = match effect.cursor {
         Some((cx, cy)) => (cx.round() as i32, cy.round() as i32),
-        None => x.cursor().unwrap_or((lx, ly)),
+        None => helper_cursor().or_else(|| x.cursor()).unwrap_or((lx, ly)),
     };
     let draw = render::EdgeDraw {
         edge: effect.edge,
@@ -595,7 +631,7 @@ mod platform {
     impl Connection {
         /// Connects, or logs once why nothing can be drawn.
         pub fn open() -> Option<Connection> {
-            if !crate::edge::available() && !super::xwayland_allowed() {
+            if !crate::edge::platform::x11_available() && !super::xwayland_allowed() {
                 if once() {
                     log::info!("overlay: no way to draw found in this Wayland session yet (layer shell, or XWayland lined up with the outputs)");
                 }

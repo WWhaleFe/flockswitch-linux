@@ -18,7 +18,7 @@
 curl -fsSL https://github.com/WWhaleFe/flockswitch-linux/releases/latest/download/get.sh | sh
 ```
 
-이 컴퓨터에 맞는 파일(x86_64 또는 arm64)을 받아 아래 SHA256SUMS.txt와 비교하고, 프로그램을 `~/.local/bin`에, 앱 메뉴에 flockswitch를 넣습니다. 이어서 `flockswitch setup`이 이 컴퓨터에 더 필요한 것과 이유(udev 규칙, 그리고 해당하면 한글 글꼴·GNOME 트레이 아이콘 확장·데스크톱 포털)를 목록으로 보여 주고, 실행할 명령을 보여 준 뒤 한 번 묻습니다. 관리자 권한이 필요한 것은 모두 `sudo` 한 번으로 실행하므로 비밀번호도 한 번만 입력합니다. 끝으로 남은 일("로그아웃 후 다시 로그인" 등)을 알려 주고 flockswitch를 실행합니다. 묻지 않고 설치하려면 `… | sh -s -- --yes`. sudo를 붙이지 말고 내 계정으로 실행하세요. 그 뒤 업데이트는 flockswitch가 스스로 합니다.
+이 컴퓨터에 맞는 파일(x86_64 또는 arm64)을 받아 아래 SHA256SUMS.txt와 비교하고, 프로그램을 `~/.local/bin`에, 앱 메뉴에 flockswitch를 넣습니다. 이어서 `flockswitch setup`이 이 컴퓨터에 더 필요한 것과 이유(udev 규칙, 그리고 해당하면 한글 글꼴·GNOME 트레이 아이콘 확장·GNOME 도우미 확장·데스크톱 포털)를 목록으로 보여 주고, 실행할 명령을 보여 준 뒤 한 번 묻습니다. 관리자 권한이 필요한 것은 모두 `sudo` 한 번으로 실행하므로 비밀번호도 한 번만 입력합니다. 끝으로 남은 일("로그아웃 후 다시 로그인" 등)을 알려 주고 flockswitch를 실행합니다. 묻지 않고 설치하려면 `… | sh -s -- --yes`. sudo를 붙이지 말고 내 계정으로 실행하세요. 그 뒤 업데이트는 flockswitch가 스스로 합니다.
 
 ### Homebrew
 
@@ -41,6 +41,7 @@ flockswitch uninstall && brew uninstall --formula wwhalefe/tap/flockswitch
 flockswitch quit; flockswitch uninstall     # 설정·짝 맺기 정보·로그인 시 실행 해제
 rm -f ~/.local/bin/flockswitch ~/.local/share/applications/flockswitch.desktop
 rm -rf ~/.local/share/flockswitch
+gnome-extensions disable flockswitch@wwhalefe.github.io; rm -rf ~/.local/share/gnome-shell/extensions/flockswitch@wwhalefe.github.io   # GNOME 도우미 확장
 sudo rm -f /etc/udev/rules.d/70-flockswitch.rules   # 장치 권한 규칙 (선택)
 ```
 
@@ -64,11 +65,12 @@ cd flockswitch-linux-x86_64-@VERSION@
 | udev 규칙 | 항상 (장치를 열 권한). 끝나면 수신기를 뺐다 꽂기 | `sudo install -m 644 70-flockswitch.rules /etc/udev/rules.d/` (Homebrew: `"$(brew --prefix)/opt/flockswitch/share/flockswitch/70-flockswitch.rules"`), `sudo udevadm control --reload-rules`, `sudo udevadm trigger --subsystem-match=hidraw` |
 | 한글 글꼴 | 설정 창의 한글 표시 | `sudo apt-get install -y fonts-noto-cjk` (Fedora: `google-noto-sans-cjk-fonts`) |
 | 트레이 아이콘 | Fedora·Debian의 기본 GNOME (Ubuntu·KDE는 필요 없음). 끝나면 로그아웃 후 다시 로그인 | `sudo dnf install -y gnome-shell-extension-appindicator` (Debian: `apt-get`), `gnome-extensions enable appindicatorsupport@rgcjonas.gmail.com` |
+| GNOME 도우미 확장 | Wayland의 GNOME (시스템 권한 질문이 사라짐). 끝나면 한 번 로그아웃 후 다시 로그인 | `mkdir -p ~/.local/share/gnome-shell/extensions/flockswitch@wwhalefe.github.io && cp gnome-extension/flockswitch@wwhalefe.github.io/* ~/.local/share/gnome-shell/extensions/flockswitch@wwhalefe.github.io/` (Homebrew: `"$(brew --prefix)/opt/flockswitch/share/flockswitch/gnome-extension"`에서), `gnome-extensions enable flockswitch@wwhalefe.github.io` |
 | 데스크톱 포털 | Wayland의 GNOME 45 이상에서 입력 캡처가 없을 때 화면 모서리 전환. 끝나면 로그아웃 후 다시 로그인 | `sudo apt-get install -y xdg-desktop-portal xdg-desktop-portal-gnome` (Fedora: `dnf`) |
 | 앱 메뉴 항목 | Homebrew만 | `mkdir -p ~/.local/share/applications && ln -sf "$(brew --prefix)/opt/flockswitch/share/applications/flockswitch.desktop" ~/.local/share/applications/` |
 | 창 라이브러리 | 최소 설치 환경에서 설정 창이 열리지 않을 때 | `sudo apt-get install -y libxkbcommon0 libgl1 libegl1` (Fedora: `libxkbcommon mesa-libGL mesa-libEGL`) |
 
-Wayland에서 화면 모서리 전환: KDE Plasma·sway·Hyprland는 할 일 없음. GNOME 45 이상은 처음 켤 때(GNOME 45~50은 켤 때마다) "입력 캡처" 허용 창에서 **허용**. GNOME 44 이하(Ubuntu 22.04, Debian 12)는 입력 캡처가 없으니 로그아웃 → 로그인 화면 오른쪽 아래 ⚙에서 "Ubuntu on Xorg" 또는 "GNOME on Xorg"를 고르고 로그인.
+Wayland에서 화면 모서리 전환: KDE Plasma·sway·Hyprland는 할 일 없음. GNOME은 **GNOME 도우미 확장**을 설치하면(`install.sh`와 `get.sh`가 설치, 한 번 로그아웃 후 다시 로그인) 시스템이 묻지 않으며, 확장은 이름이 `flockswitch`인 프로그램에만 답합니다. 확장이 없으면 GNOME 45 이상은 처음 켤 때(GNOME 45~50은 켤 때마다) "입력 캡처" 허용 창에서 **허용**. GNOME 44 이하(Ubuntu 22.04, Debian 12)는 입력 캡처가 없으니 로그아웃 → 로그인 화면 오른쪽 아래 ⚙에서 "Ubuntu on Xorg" 또는 "GNOME on Xorg"를 고르고 로그인.
 
 </details>
 

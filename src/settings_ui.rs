@@ -1177,7 +1177,7 @@ impl SettingsApp {
             self.apply(|c| c.edges.anim_style = style);
         }
         if preview {
-            if crate::edge::available() {
+            if crate::edge::platform::x11_available() {
                 crate::edge::preview(&self.cfg.edges, self.cfg.network.cross_delay_ms);
             } else {
                 crate::edge_wayland::preview(&self.cfg.edges, self.cfg.network.cross_delay_ms);
@@ -1452,7 +1452,7 @@ impl SettingsApp {
 
     fn locate_rows(&mut self, ui: &mut Ui, t: &Texts, p: Palette) {
         // Wayland: what brings the highlight up here, and whether it can be drawn.
-        let wayland = !crate::edge::available();
+        let wayland = !crate::edge::platform::x11_available();
         if wayland {
             ui.add_space(8.0);
             let exe = crate::tray::launch_path().map(|p| p.display().to_string()).unwrap_or_else(|| "flockswitch".into());
@@ -2209,6 +2209,7 @@ fn edge_backend_text(t: &Texts, backend: &str, note: &str, require_control: bool
             "error" => (t.edges_capture_error.to_string(), true),
             _ => (sub(t.edges_capture_off), false),
         },
+        "gnome-helper" => (t.edges_helper_ready.to_string(), false),
         "layer-shell" => {
             let mut text = sub(t.edges_layer_ready);
             if require_control {

@@ -118,13 +118,22 @@ impl SettingsApp {
 
         // GNOME Wayland: why the system's permission question may come back.
         if net.on && !super::shots::active() && crate::edge_wayland::session_is_wayland() {
-            if crate::settings_logic::input_capture_forgets(&self.status.edge_backend, &self.status.edge_note) {
+            let gnome = std::env::var("XDG_CURRENT_DESKTOP").is_ok_and(|d| d.to_ascii_lowercase().contains("gnome"));
+            let notes = crate::settings_logic::portal_notes(&self.status.edge_backend, &self.status.edge_note, &self.status.remote_desktop, gnome);
+            let with_hint = |text: &str| if notes.install_hint { format!("{text}\n{}", t.net_helper_hint) } else { text.to_string() };
+            if notes.helper {
                 gap(ui);
-                note_box(ui, p, NoteKind::Info, t.net_portal_every, None);
+                note_box(ui, p, NoteKind::Info, t.net_helper_running, None);
             }
-            if self.status.remote_desktop == "not-remembered" {
+            if notes.every {
                 gap(ui);
-                note_box(ui, p, NoteKind::Warn, t.net_portal_not_remembered, None);
+                note_box(ui, p, NoteKind::Info, &with_hint(t.net_portal_every), None);
+            }
+            if notes.not_remembered {
+                gap(ui);
+                // The hint goes once: under the first note shown.
+                let text = if notes.every { t.net_portal_not_remembered.to_string() } else { with_hint(t.net_portal_not_remembered) };
+                note_box(ui, p, NoteKind::Warn, &text, None);
             }
         }
 

@@ -257,6 +257,7 @@ pub fn install(release: &Release, exe: &Path, phase: &dyn Fn(Phase)) -> Result<(
     if let Some(data) = dirs::data_dir() {
         update_menu_entry(&files, exe, &data);
     }
+    update_helper_extension(&files, dirs::data_dir().as_deref());
     check_udev_rule(&files);
     Ok(())
 }
@@ -413,6 +414,30 @@ fn update_menu_entry(files: &Path, exe: &Path, data: &Path) {
             log::info!("update: refreshed {} and {}", desktop.display(), icon.display());
         }
         Err(e) => log::warn!("update: menu entry not refreshed: {e:#}"),
+    }
+}
+
+/// The GNOME helper extension the release brings (`gnome-extension/<uuid>` beside the
+/// program, as install.sh copies it): its files replace those of an installed copy where
+/// they differ. GNOME loads the new code at the next login. An extension that was never
+/// installed is not installed here (the setup check offers that); a release without the
+/// folder, or a failure, leaves everything as it was and does not undo the update.
+fn update_helper_extension(files: &Path, data: Option<&Path>) {
+    let Some(data) = data else { return };
+    let dest = crate::setup_logic::helper_dest(data);
+    if !dest.is_dir() {
+        log::info!("update: the GNOME helper extension is not installed at {}; left alone", dest.display());
+        return;
+    }
+    let source = files.join("gnome-extension").join(crate::setup_logic::HELPER_UUID);
+    if !source.is_dir() {
+        log::info!("update: the release has no GNOME helper extension");
+        return;
+    }
+    match crate::setup_logic::sync_helper_files(&source, &dest) {
+        Ok(changed) if changed.is_empty() => log::info!("update: the GNOME helper extension is current"),
+        Ok(changed) => log::info!("update: GNOME helper extension files replaced ({}); GNOME loads them at the next login", changed.join(", ")),
+        Err(e) => log::warn!("update: the GNOME helper extension was not updated: {e}"),
     }
 }
 

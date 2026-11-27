@@ -2,7 +2,8 @@
 # Installs flockswitch for you: the program in ~/.local/bin and an entry in the app menu,
 # then `flockswitch setup`: the udev rule that lets you reach Logitech devices and what
 # this desktop still needs (Korean font, tray icon extension, desktop portal), together
-# with one password; then starts flockswitch. `./install.sh --yes` installs without asking.
+# with one password; then starts flockswitch. On GNOME it also installs the helper
+# extension, so the screen edges and sharing work on Wayland without the system's questions. `./install.sh --yes` installs without asking.
 # flockswitch를 현재 사용자에게 설치합니다: ~/.local/bin의 프로그램과 앱 메뉴 항목, 이어서
 # `flockswitch setup`으로 Logitech 장치 접근용 udev 규칙과 이 데스크톱에 더 필요한 것
 # (한글 글꼴, 트레이 아이콘 확장, 데스크톱 포털)을 비밀번호 한 번으로 함께 설치한 뒤
@@ -36,8 +37,35 @@ sed -e "s|@BIN@|$bin/flockswitch|" -e "s|@ICON@|$data/flockswitch/flockswitch.pn
     "$here/flockswitch.desktop" > "$data/applications/flockswitch.desktop"
 update-desktop-database "$data/applications" >/dev/null 2>&1 || true
 
+# The GNOME helper extension: the same files `flockswitch setup` and the updater copy.
+ext=flockswitch@wwhalefe.github.io
+ext_dir="$data/gnome-shell/extensions/$ext"
+# Switches the extension on. A Shell that has not seen the new files yet (Wayland, before
+# the next login) refuses `gnome-extensions enable`; the setting is then written directly.
+enable_extension() {
+    gnome-extensions enable "$ext" >/dev/null 2>&1 && return 0
+    command -v gsettings >/dev/null 2>&1 || return 0
+    list=$(gsettings get org.gnome.shell enabled-extensions 2>/dev/null) || return 0
+    case $list in
+        *"'$ext'"*) ;;
+        "@as []" | "[]") gsettings set org.gnome.shell enabled-extensions "['$ext']" || true ;;
+        *"]") gsettings set org.gnome.shell enabled-extensions "${list%]}, '$ext']" || true ;;
+    esac
+}
+if [ -d "$here/gnome-extension/$ext" ]; then
+    mkdir -p "$ext_dir"
+    cp -f "$here/gnome-extension/$ext/extension.js" "$here/gnome-extension/$ext/metadata.json" "$ext_dir/"
+    if command -v gnome-extensions >/dev/null 2>&1; then
+        enable_extension || true
+    fi
+fi
+
 echo "Installed: $bin/flockswitch"
 echo "설치했습니다: $bin/flockswitch"
+if [ -d "$ext_dir" ]; then
+    echo "GNOME helper extension installed. On GNOME with Wayland, log out and in once so GNOME finds it."
+    echo "GNOME 도우미 확장을 설치했습니다. Wayland의 GNOME에서는 한 번 로그아웃했다 다시 로그인해야 GNOME이 찾습니다."
+fi
 echo
 
 # The udev rule and what this desktop still needs: one list, one question, one password.

@@ -51,6 +51,8 @@ jobs:
           cp target/release/flockswitch packaging/linux/install.sh packaging/linux/uninstall.sh \
              packaging/linux/70-flockswitch.rules packaging/linux/flockswitch.desktop \
              packaging/icon/flockswitch.png README.md README.ko.md PRIVACY.md LICENSE "$dir/"
+          # The GNOME helper extension (install.sh, `flockswitch setup` and the updater copy it).
+          cp -r packaging/linux/gnome-extension "$dir/"
           tar -czf "$dir.tar.gz" "$dir"
           readelf -d "$dir/flockswitch" | grep NEEDED
       - uses: actions/upload-artifact@v4

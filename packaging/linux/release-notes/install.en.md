@@ -18,7 +18,7 @@
 curl -fsSL https://github.com/WWhaleFe/flockswitch-linux/releases/latest/download/get.sh | sh
 ```
 
-Downloads the file for this computer (x86_64 or arm64), checks it against SHA256SUMS.txt below, puts the program in `~/.local/bin` and flockswitch in the app menu, then `flockswitch setup` lists what this computer still needs and why (the udev rule, and where they apply the Korean font, the GNOME tray icon extension and the desktop portal), shows the commands and asks once; everything that needs administrator rights runs in one `sudo`, so you type your password once. Finally it says what is left (such as "log out and in once") and starts flockswitch. `… | sh -s -- --yes` installs without asking. Run it as yourself, not with sudo. From then on flockswitch updates itself.
+Downloads the file for this computer (x86_64 or arm64), checks it against SHA256SUMS.txt below, puts the program in `~/.local/bin` and flockswitch in the app menu, then `flockswitch setup` lists what this computer still needs and why (the udev rule, and where they apply the Korean font, the GNOME tray icon extension, the GNOME helper extension and the desktop portal), shows the commands and asks once; everything that needs administrator rights runs in one `sudo`, so you type your password once. Finally it says what is left (such as "log out and in once") and starts flockswitch. `… | sh -s -- --yes` installs without asking. Run it as yourself, not with sudo. From then on flockswitch updates itself.
 
 ### Homebrew
 
@@ -41,6 +41,7 @@ flockswitch uninstall && brew uninstall --formula wwhalefe/tap/flockswitch
 flockswitch quit; flockswitch uninstall     # settings, pairings, start at login
 rm -f ~/.local/bin/flockswitch ~/.local/share/applications/flockswitch.desktop
 rm -rf ~/.local/share/flockswitch
+gnome-extensions disable flockswitch@wwhalefe.github.io; rm -rf ~/.local/share/gnome-shell/extensions/flockswitch@wwhalefe.github.io   # GNOME helper extension
 sudo rm -f /etc/udev/rules.d/70-flockswitch.rules   # device permission rule (optional)
 ```
 
@@ -64,11 +65,12 @@ cd flockswitch-linux-x86_64-@VERSION@
 | udev rule | Always (permission to open the devices); then replug the receiver | `sudo install -m 644 70-flockswitch.rules /etc/udev/rules.d/` (Homebrew: `"$(brew --prefix)/opt/flockswitch/share/flockswitch/70-flockswitch.rules"`), `sudo udevadm control --reload-rules`, `sudo udevadm trigger --subsystem-match=hidraw` |
 | Korean font | The window in Korean | `sudo apt-get install -y fonts-noto-cjk` (Fedora: `google-noto-sans-cjk-fonts`) |
 | Tray icon | Stock GNOME on Fedora or Debian (not Ubuntu or KDE); then log out and in | `sudo dnf install -y gnome-shell-extension-appindicator` (Debian: `apt-get`), `gnome-extensions enable appindicatorsupport@rgcjonas.gmail.com` |
+| GNOME helper extension | GNOME on Wayland (no system permission questions); then log out and in once | `mkdir -p ~/.local/share/gnome-shell/extensions/flockswitch@wwhalefe.github.io && cp gnome-extension/flockswitch@wwhalefe.github.io/* ~/.local/share/gnome-shell/extensions/flockswitch@wwhalefe.github.io/` (Homebrew: from `"$(brew --prefix)/opt/flockswitch/share/flockswitch/gnome-extension"`), `gnome-extensions enable flockswitch@wwhalefe.github.io` |
 | Desktop portal | Screen edges on GNOME 45+ Wayland without input capture; then log out and in | `sudo apt-get install -y xdg-desktop-portal xdg-desktop-portal-gnome` (Fedora: `dnf`) |
 | App menu entry | Homebrew only | `mkdir -p ~/.local/share/applications && ln -sf "$(brew --prefix)/opt/flockswitch/share/applications/flockswitch.desktop" ~/.local/share/applications/` |
 | Window libraries | Minimal installs where the settings window doesn't open | `sudo apt-get install -y libxkbcommon0 libgl1 libegl1` (Fedora: `libxkbcommon mesa-libGL mesa-libEGL`) |
 
-Screen-edge switching on Wayland: nothing to do on KDE Plasma, sway or Hyprland; on GNOME 45 or newer click **Allow** when the system asks about input capture (GNOME 45–50 ask each time flockswitch starts); GNOME 44 or older (Ubuntu 22.04, Debian 12) has no input capture, so pick "Ubuntu on Xorg" or "GNOME on Xorg" from ⚙ at the bottom right of the login screen.
+Screen-edge switching on Wayland: nothing to do on KDE Plasma, sway or Hyprland. On GNOME, install the **GNOME helper extension** (`install.sh` and `get.sh` do; log out and in once) and the system asks nothing: it answers only a program named `flockswitch`. Without it, on GNOME 45 or newer click **Allow** when the system asks about input capture (GNOME 45–50 ask each time flockswitch starts); GNOME 44 or older (Ubuntu 22.04, Debian 12) has no input capture, so pick "Ubuntu on Xorg" or "GNOME on Xorg" from ⚙ at the bottom right of the login screen.
 
 </details>
 

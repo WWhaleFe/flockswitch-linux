@@ -1,5 +1,12 @@
 # Changelog
 
+## 2.2.0 - 2026-11-27
+
+- New GNOME helper extension (`flockswitch@wwhalefe.github.io`): on GNOME Wayland it reads the pointer, notices the screen edges and takes and injects this computer's mouse and keyboard from inside the compositor, so after one install and one log out and in the system no longer asks for input capture or remote control at all. Edge switching and network sharing use it automatically when it is on; without it (not installed, off, another desktop) everything works through the portals exactly as before. The extension answers only the installed flockswitch program (`~/.local/bin` or Homebrew). While this computer's input is on another computer, Ctrl+Alt+Shift+Escape here makes the extension give it back at once (emergency exit).
+- The extension is installed by `install.sh` and `get.sh` (it is in the release file), offered by `flockswitch setup` ("GNOME helper extension": installed and on, installed but needs a log out and in, or missing; also for Homebrew installs) and kept current by the app's own update. GNOME loads new extension code at the next login. `uninstall.sh` removes it. `FLOCKSWITCH_GNOME_HELPER=0` turns it off, and `FLOCKSWITCH_EDGE_BACKEND=gnome-helper` asks for it.
+- The settings window says "Running through the GNOME helper extension; the system does not ask for permission." instead of the notes about the system's questions, and on GNOME Wayland without the extension those notes now end with how to install it.
+- With the extension, shaking the mouse to find the cursor works on GNOME Wayland as on X11.
+
 ## 2.1.1 - 2026-11-27
 
 - When crossing cannot start, it no longer retries constantly: it waits 2 s, up to 30 s, before trying again, and shows the reason.
