@@ -9,6 +9,7 @@
 - Korean/English from the other computer: Shift+Space is also a Korean/English key on every sender (added once to saved key rules, and not added back if you turn it off). A Linux receiver gets one press of the Hangul key (KEY_HANGEUL, X11 keycode 130) on X11, Wayland (EIS) and through the GNOME helper, so the Hangul key must be a toggle key in the input method: ibus-hangul has it by default, and fcitx5-hangul needs Hangul in its trigger keys.
 - Reconnecting to a Mac and other computers on the same network is more reliable (IPv6 link-local addresses keep their scope, IPv4 is tried first, shorter retry waits for computers that are found, dialing at once when a computer appears again, and the listener is recreated).
 - Updated network core (shared with macOS, Windows and Android 2.2): the new monitor and pause messages are only sent to computers that support them, so older versions keep working.
+- Keyboard page: one switch, "Switch Korean/English with Shift+Space", turns Shift+Space on or off as a Korean/English key for every direction leaving this computer. Off, Space with Shift held types a space.
 
 ## 2.2.0 - 2026-11-27
 

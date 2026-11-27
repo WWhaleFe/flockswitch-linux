@@ -381,6 +381,46 @@ impl NetConfig {
         true
     }
 }
+impl NetConfig {
+    /// Whether Shift+Space is a Korean/English key for every direction the Keyboard page
+    /// shows for a `src` computer (every other OS it can send to), saved rule or default.
+    pub fn shift_space_on(&self, src: Os) -> bool {
+        let mut any = false;
+        for (s, d) in keymap::all_pairs() {
+            if s != src {
+                continue;
+            }
+            any = true;
+            if !self.rules_for(s, d).is_some_and(|r| r.hangul_src.contains(&HangulKey::ShiftSpace)) {
+                return false;
+            }
+        }
+        any
+    }
+    /// Adds (`on`) or removes Shift+Space from the Korean/English keys of every direction
+    /// leaving `src`, writing each effective rule into `keys` and changing nothing else.
+    /// Removing the only key of a pair leaves its list empty, which means no toggle key
+    /// for that pair, the same as the user clearing it in the table. The choice is the
+    /// user's, so the one-time default migration is marked as done and never re-adds it.
+    pub fn set_shift_space(&mut self, src: Os, on: bool) {
+        if self.keys.is_empty() {
+            // The 2.0 fields stand for the untouched pairs; write them all down first.
+            self.migrate_keys();
+        }
+        for (s, d) in keymap::all_pairs() {
+            if s != src {
+                continue;
+            }
+            let Some(mut rules) = self.rules_for(s, d) else { continue };
+            rules.hangul_src.retain(|k| *k != HangulKey::ShiftSpace);
+            if on {
+                rules.hangul_src.push(HangulKey::ShiftSpace);
+            }
+            self.keys.insert(keymap::pair_key(s, d), rules);
+        }
+        self.hangul_defaults = self.hangul_defaults.max(HANGUL_DEFAULTS);
+    }
+}
 /// The version of the one-time default-key migration `apply_hangul_defaults` stands for.
 pub const HANGUL_DEFAULTS: u32 = 1;
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -825,6 +865,39 @@ mod v2_1_tests {
         // ... except where the 2.0 setting switched Hangul off for a Mac receiver.
         let off = NetConfig { lang1_on_mac: "off".into(), ..NetConfig::default() };
         assert!(off.rules_for(Os::Windows, Os::Mac).unwrap().hangul_src.is_empty());
+    }
+    #[test]
+    fn shift_space_switch_sets_every_pair_of_a_sender() {
+        let mut cfg = NetConfig::default();
+        assert!(cfg.shift_space_on(Os::Mac) && cfg.shift_space_on(Os::Windows) && cfg.shift_space_on(Os::Linux));
+        let before = cfg.all_rules();
+        cfg.set_shift_space(Os::Windows, false);
+        assert!(!cfg.shift_space_on(Os::Windows) && cfg.shift_space_on(Os::Mac) && cfg.shift_space_on(Os::Linux));
+        for (pair, rules) in cfg.all_rules() {
+            if pair.starts_with("windows>") {
+                assert_eq!(rules.hangul_src, vec![HangulKey::Lang1], "{pair}");
+                assert_eq!(DirRules { hangul_src: before[&pair].hangul_src.clone(), ..rules.clone() }, before[&pair], "{pair}");
+            } else {
+                assert_eq!(rules, before[&pair], "{pair}");
+            }
+        }
+        // One pair turned it back on by hand: the switch reads off until all have it.
+        cfg.keys.get_mut("windows>mac").unwrap().hangul_src.push(HangulKey::ShiftSpace);
+        assert!(!cfg.shift_space_on(Os::Windows));
+        cfg.set_shift_space(Os::Windows, true);
+        assert!(cfg.shift_space_on(Os::Windows));
+        assert_eq!(cfg.all_rules(), before);
+        // A pair listing only Shift+Space ends empty (no toggle key), as if the user cleared it.
+        cfg.keys.get_mut("linux>mac").unwrap().hangul_src = vec![HangulKey::ShiftSpace];
+        cfg.set_shift_space(Os::Linux, false);
+        assert!(cfg.keys["linux>mac"].hangul_src.is_empty());
+        // The one-time migration never puts it back after the switch turned it off,
+        // even when the switch ran before the migration did.
+        let mut cfg = NetConfig::default();
+        cfg.set_shift_space(Os::Linux, false);
+        cfg.set_shift_space(Os::Windows, false);
+        assert!(!cfg.apply_hangul_defaults());
+        assert!(!cfg.shift_space_on(Os::Linux) && !cfg.shift_space_on(Os::Windows));
     }
     #[test]
     fn status_from_2_0_still_reads() {
