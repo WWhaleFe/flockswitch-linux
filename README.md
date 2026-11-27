@@ -274,6 +274,10 @@ cargo build --release                      # target/release/flockswitch
 
 Everything else (Wayland, X11, OpenGL, D-Bus, libei) is loaded at run time or talked to in pure Rust, so no other development packages are needed.
 
+## Before you push
+
+The pre-push hook (`.git/hooks/pre-push`, which calls `scripts/pre-push.sh`) mirrors CI as far as a Mac can: the Cargo.lock check, `scripts/check-linux.sh --all-targets` (cargo check for Linux in a scratch copy under `target/`, recreated when missing), `scripts/test-host.py` (the logic modules' tests on the host) and the netcore tests. Pushing tags only runs the lock check. In an emergency, `FLOCKSWITCH_SKIP_PREPUSH=1 git push`.
+
 ## License
 
 MIT
