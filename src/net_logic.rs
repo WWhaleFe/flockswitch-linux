@@ -67,11 +67,19 @@ pub fn whole_pixels(rest: &mut f64, delta: f64) -> f64 {
     whole
 }
 
-pub fn runtime_config(full: &Config, wayland: bool, config_dir: PathBuf) -> NetConfig {
+/// Whether the desktop portals (InputCapture barriers) drive the edges: a Wayland session
+/// that does not use the GNOME helper extension. With the helper, the app's own edge
+/// watcher drives crossing, as on X11.
+pub fn portal_edges(wayland: bool, helper: bool) -> bool {
+    wayland && !helper
+}
+
+/// `portal_edges`: whether the portals, not the app's edge watcher, drive the edges.
+pub fn runtime_config(full: &Config, portal_edges: bool, config_dir: PathBuf) -> NetConfig {
     let mut config = full.network.clone();
     config.config_dir = config_dir;
     config.on &= config.notice_accepted;
-    config.app_drives_edges = !wayland;
+    config.app_drives_edges = !portal_edges;
     config.clipboard_limit_mb = 100;
     if config.role == Role::Master {
         config.app_settings = app_settings(full);
@@ -384,6 +392,23 @@ mod runtime_tests {
             assert!(net.app_settings.get("buttons").is_some());
         }
     }
+    #[test]
+    fn the_app_drives_the_edges_unless_the_portals_do() {
+        // X11, and Wayland with the GNOME helper: the app's edge watcher crosses.
+        assert!(!portal_edges(false, false));
+        assert!(!portal_edges(false, true));
+        assert!(!portal_edges(true, true));
+        // Wayland through the portals: the barriers do.
+        assert!(portal_edges(true, false));
+        let mut c = Config::default();
+        c.network.on = true;
+        c.network.notice_accepted = true;
+        for (wayland, helper, drives) in [(false, false, true), (true, false, false), (true, true, true)] {
+            let net = runtime_config(&c, portal_edges(wayland, helper), PathBuf::new());
+            assert_eq!(net.app_drives_edges, drives, "wayland {wayland}, helper {helper}");
+        }
+    }
+
     #[test]
     fn linux_preferences_and_edge_owner_stay_local() {
         let mut sub = Config::default();

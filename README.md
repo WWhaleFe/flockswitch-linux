@@ -51,7 +51,10 @@ system** for a reference table.
 | KDE / other Wayland | Unavailable, receive only | RemoteDesktop ConnectToEIS when the compositor supports it | Native data-control when offered, otherwise XWayland | Layer-shell countdown for Logitech edges; no network sender/countdown | Never tested on real hardware |
 
 GNOME Wayland asks for **two permissions** when sharing starts: input capture and
-remote desktop. Logitech and network edges share one InputCapture session, releasing
+remote desktop. The **GNOME helper extension** (below) removes both questions: after one
+install and one log out and in, the system asks nothing, whatever the GNOME version, and it
+answers only a program named `flockswitch`. Without it everything works as described here.
+ Logitech and network edges share one InputCapture session, releasing
 capture and disabling old barriers before rearming for a new owner. The Network tab's
 **This computer** page shows the probe result; a problem card explains unavailable
 sending or receiving. Native clipboard access on Wayland depends on the compositor;
@@ -86,6 +89,7 @@ Install flockswitch on **every** computer you switch between, and pair each devi
 - **Korean text** in the window: a font with Hangul, e.g. `fonts-noto-cjk` (Debian/Ubuntu) or `google-noto-sans-cjk-fonts` (Fedora)
 - **Keyboard shortcuts on Wayland**: a desktop portal with GlobalShortcuts (GNOME 48 or newer and KDE Plasma have one; sway's portal does not) and flockswitch in the app menu (`flockswitch.desktop`: install.sh adds it, the setup check does for Homebrew). Check: `busctl --user get-property org.freedesktop.portal.Desktop /org/freedesktop/portal/desktop org.freedesktop.portal.GlobalShortcuts version` prints a number. Without it, custom desktop shortcuts run `flockswitch switch N` and `flockswitch locate`
 - **Screen-edge switching on Wayland**: nothing extra on KDE Plasma, sway or Hyprland. GNOME needs version 45 or newer and a desktop portal with input capture (`xdg-desktop-portal` 1.17+, `xdg-desktop-portal-gnome` 45+, usually already installed). Check: `busctl --user get-property org.freedesktop.portal.Desktop /org/freedesktop/portal/desktop org.freedesktop.portal.InputCapture version` prints a number. On GNOME 44 or older use an X11 (Xorg) session
+- **GNOME helper extension** (GNOME on Wayland, recommended): a small GNOME Shell extension (`flockswitch@wwhalefe.github.io`) that reads the pointer and takes and injects the mouse and keyboard from inside the compositor, so the system never asks for input capture or remote control (GNOME 50 and older cannot remember the first; the second is asked again unless you tick Remember). `install.sh` and `get.sh` install it, `flockswitch setup` offers it (also for Homebrew), and the app's update keeps its files current. **Log out and in once** after installing: on Wayland GNOME only finds a new extension at login. The extension answers only a program named `flockswitch`; it is not used on X11 or other desktops, and `FLOCKSWITCH_GNOME_HELPER=0` turns it off. With it, edge switching and sharing work as on X11 (the app reads the cursor), and shaking the mouse to find the cursor works too
 - The commands for each of these are under [Setting up by hand](#setting-up-by-hand); `flockswitch setup` runs them for you
 
 flockswitch looks for these itself: in a terminal with `flockswitch setup` (see [Install](#install)), and in the app. When something is missing it sends one notification after it starts (useful on stock GNOME, where the tray icon may be what's missing; on the very first start the settings window opens on the setup check instead, once), the tray menu shows **Setup needed: N…**, and Settings → General starts with a **Setup check** card: one row per missing item with why it's needed, **Install** and **Later**, and with two or more of them **Install all**, which runs every administrator step together so your password is asked once. Install first shows exactly the commands that will run; nothing runs until you press **Run**. Commands that need administrator rights run through `pkexec`, so your desktop asks for your password; if that isn't possible (no pkexec, or you cancelled), the card shows the same commands with `sudo` and a **Copy commands** button for a terminal. What it can do:
@@ -93,6 +97,7 @@ flockswitch looks for these itself: in a terminal with `flockswitch setup` (see 
 | Item | When it's offered | What runs |
 |---|---|---|
 | udev rule | `/etc/udev/rules.d/70-flockswitch.rules` is missing or differs from this version's, or a device couldn't be opened | writes the rule, `udevadm control --reload-rules`, `udevadm trigger --subsystem-match=hidraw` (password); then replug the receiver or reconnect Bluetooth |
+| GNOME helper extension | GNOME on Wayland, extension missing, off, or installed but not loaded yet | copies the extension into `~/.local/share/gnome-shell/extensions/` and runs `gnome-extensions enable flockswitch@wwhalefe.github.io` (no password); then log out and in once |
 | Desktop portal | GNOME 45+ on Wayland without input capture, `xdg-desktop-portal` / `xdg-desktop-portal-gnome` missing or too old | `apt-get` / `dnf` / `zypper` / `pacman` installs them (password); then log out and in. GNOME 44 or older is told to use an X11 session instead |
 | Korean font | the window is in Korean and no font has Hangul (`fc-list :lang=ko`) | `fonts-noto-cjk` / `google-noto-sans-cjk-fonts` / `noto-sans-cjk-fonts` / `noto-fonts-cjk` (password); the window uses it at once. Until then this card is in English |
 | Tray icon | GNOME without a StatusNotifierItem host (not Ubuntu, which has one) | `gnome-shell-extension-appindicator` (password), then `gnome-extensions enable appindicatorsupport@rgcjonas.gmail.com`; log out and in |
@@ -151,6 +156,12 @@ sudo apt-get install -y fonts-noto-cjk
 sudo dnf install -y gnome-shell-extension-appindicator      # Debian: sudo apt-get install -y …
 gnome-extensions enable appindicatorsupport@rgcjonas.gmail.com
 
+# GNOME helper extension (GNOME on Wayland): no permission questions; then log out and in once.
+# From the unpacked release folder (Homebrew: "$(brew --prefix)/opt/flockswitch/share/flockswitch/gnome-extension").
+mkdir -p ~/.local/share/gnome-shell/extensions/flockswitch@wwhalefe.github.io
+cp gnome-extension/flockswitch@wwhalefe.github.io/* ~/.local/share/gnome-shell/extensions/flockswitch@wwhalefe.github.io/
+gnome-extensions enable flockswitch@wwhalefe.github.io
+
 # Screen edges on GNOME 45+ (Wayland) without input capture, then log out and in.
 # GNOME 44 or older: choose "GNOME on Xorg" (or "Ubuntu on Xorg") on the login screen instead.
 sudo apt-get install -y xdg-desktop-portal xdg-desktop-portal-gnome   # Fedora: sudo dnf install -y …
@@ -194,10 +205,11 @@ No app may read the cursor on Wayland, so flockswitch picks what the desktop off
 |---|---|---|
 | X11 (Xorg), any desktop | reads the cursor, as before | nothing |
 | KDE Plasma, sway, Hyprland and other wlroots desktops (Wayland) | a transparent strip one pixel wide along each edge that has a channel (wlr-layer-shell) | nothing |
+| GNOME (Wayland) with the [helper extension](#requirements) | the extension reads the cursor, as on X11; no system question | install it once and log out and in |
 | GNOME 45 or newer (Wayland) | the desktop portal's input capture: a barrier on each edge that has a channel; when the cursor pushes against it the system hands the cursor to flockswitch until it switches or you move back in | allow input capture when the system asks. GNOME 51 remembers the answer; GNOME 45 to 50 ask each time flockswitch starts (45 to 48 also when the edges with a channel or the displays change) |
 | GNOME 44 or older, or a compositor with neither (e.g. Weston) | not available: the edges page says why | choose an X11 session on the login screen |
 
-On Wayland the cursor is not put back at the edge it left by (no app may move it). The countdown is drawn on KDE, sway and Hyprland, and on GNOME through XWayland when its screen layout matches the desktop's (otherwise the wait runs without it; the haptic pulses work everywhere). The strips take the clicks on the outermost row of pixels of those edges. With "only while Ctrl is held": on GNOME press Ctrl once the cursor is at the edge (the system does not report keys pressed before); on the layer-shell desktops a strip briefly takes the keyboard while the cursor rests on it to see Ctrl (for at most 1.5 s without Ctrl, and never while you type). `FLOCKSWITCH_EDGE_BACKEND=layer-shell`, `input-capture` or `none` forces a way, for testing.
+On Wayland the cursor is not put back at the edge it left by (no app may move it). The countdown is drawn on KDE, sway and Hyprland, and on GNOME through XWayland when its screen layout matches the desktop's (otherwise the wait runs without it; the haptic pulses work everywhere). The strips take the clicks on the outermost row of pixels of those edges. With "only while Ctrl is held": on GNOME press Ctrl once the cursor is at the edge (the system does not report keys pressed before); on the layer-shell desktops a strip briefly takes the keyboard while the cursor rests on it to see Ctrl (for at most 1.5 s without Ctrl, and never while you type). `FLOCKSWITCH_EDGE_BACKEND=layer-shell`, `input-capture`, `gnome-helper` or `none` forces a way, for testing. With the helper extension the cursor is put back at the edge it left by, as on X11.
 
 ### Find the cursor and shortcuts on Wayland
 
@@ -215,7 +227,7 @@ The keyboard shortcuts (the channels' and the find-the-cursor one) go through th
 
 ## Uninstall
 
-Run `./uninstall.sh` from the downloaded folder. It puts the buttons back to normal, removes start-at-login and the settings, then the program, the app menu entry and the udev rule.
+Run `./uninstall.sh` from the downloaded folder. It puts the buttons back to normal, removes start-at-login and the settings, then the program, the app menu entry, the GNOME helper extension and the udev rule.
 
 Installed with Homebrew: run `flockswitch uninstall`, then `brew uninstall --formula wwhalefe/tap/flockswitch`, and remove the udev rule and menu entry as `brew info --formula wwhalefe/tap/flockswitch` shows.
 
@@ -245,6 +257,7 @@ Tried on real hardware: Ubuntu 26.04, GNOME 50, Wayland session.
 | Keyboard shortcuts on GNOME Wayland (GlobalShortcuts portal) | works |
 | Setup check | works |
 | Updating a Homebrew install | works |
+| GNOME helper extension (edges, sharing and find the cursor without permission questions) | implemented, not tried on real hardware yet |
 | Screen edges and find the cursor on KDE Plasma, sway, Hyprland (layer shell) | implemented, not tried yet |
 | X11 (Xorg) session: edges, find the cursor, shortcuts | implemented, not tried yet |
 

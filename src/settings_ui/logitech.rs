@@ -194,7 +194,7 @@ impl SettingsApp {
             note_box(ui, p, NoteKind::Info, t.edges_network_hint, None);
         }
         self.follow_note(ui, t, p);
-        if !crate::edge::available() {
+        if !crate::edge::platform::x11_available() {
             // Wayland: what the running flockswitch found it can use here.
             gap(ui);
             let (text, problem) = edge_backend_text(t, &self.status.edge_backend, &self.status.edge_note, self.cfg.edges.require_control);
@@ -275,7 +275,7 @@ impl SettingsApp {
         }
         divider(ui, p);
         let mut place = self.cfg.edges.place_cursor;
-        let place_help = if crate::edge::available() {
+        let place_help = if crate::edge::platform::x11_available() || self.status.edge_backend == "gnome-helper" {
             t.edges_corner_hint.to_string()
         } else {
             format!("{}\n{}", t.edge_place_wayland_help, t.edges_corner_hint)

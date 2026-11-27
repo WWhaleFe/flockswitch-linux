@@ -48,6 +48,9 @@ flockswitch는 MX Master 마우스의 **휠 모드 전환 버튼, 제스처 버�
 | KDE / 기타 Wayland | 불가, 받기 전용 | 컴포지터가 RemoteDesktop ConnectToEIS를 제공할 때 지원 | 제공 시 네이티브 data-control, 아니면 XWayland | 로지텍 모서리는 layer-shell 표시, 네트워크 송신·카운트다운 없음 | 실기기 시험 이력 없음 |
 
 GNOME Wayland는 공유를 시작할 때 **입력 캡처와 원격 데스크톱 두 권한**을 요청합니다.
+**GNOME 도우미 확장**(아래)을 설치하면 두 질문이 모두 사라집니다. 한 번 설치하고 한 번
+로그아웃했다 다시 로그인하면 GNOME 버전과 관계없이 시스템이 묻지 않으며, 확장은 이름이
+`flockswitch`인 프로그램에만 답합니다. 확장이 없으면 여기 적은 대로 포털로 동작합니다.
 로지텍과 네트워크 모서리는 하나의 InputCapture 세션을 공유하며, 담당을 바꿀 때 이전
 캡처와 장벽을 해제한 뒤 새 장벽을 설정합니다. **네트워크 → 이 컴퓨터**에는 지원 검사
 결과가 나오고, 보내기·받기를 사용할 수 없으면 문제 카드가 표시됩니다. Wayland 네이티브
@@ -78,6 +81,7 @@ flockswitch는 **MX Master 3**와 **MX Master 4**를 바탕으로 만들고 시�
 - 창의 **한글 표시**: 한글 글꼴. 예: `fonts-noto-cjk`(Debian/Ubuntu), `google-noto-sans-cjk-fonts`(Fedora)
 - **Wayland에서 키보드 단축키**: GlobalShortcuts를 제공하는 데스크톱 포털(GNOME 48 이상과 KDE Plasma에는 있고, sway의 포털에는 없음)과 앱 메뉴의 flockswitch 항목(`flockswitch.desktop`: install.sh가 추가하고, Homebrew 설치는 설치·설정 점검이 추가)이 필요합니다. 확인: `busctl --user get-property org.freedesktop.portal.Desktop /org/freedesktop/portal/desktop org.freedesktop.portal.GlobalShortcuts version`에 숫자가 나오면 됩니다. 없으면 데스크톱의 사용자 단축키에 `flockswitch switch N`과 `flockswitch locate`를 지정해 씁니다
 - **Wayland에서 화면 모서리 전환**: KDE Plasma·sway·Hyprland는 따로 필요한 것이 없습니다. GNOME은 45 이상과 입력 캡처를 지원하는 데스크톱 포털(`xdg-desktop-portal` 1.17 이상, `xdg-desktop-portal-gnome` 45 이상, 보통 이미 설치됨)이 필요합니다. 확인: `busctl --user get-property org.freedesktop.portal.Desktop /org/freedesktop/portal/desktop org.freedesktop.portal.InputCapture version`에 숫자가 나오면 됩니다. GNOME 44 이하는 X11(Xorg) 세션에서 쓰세요
+- **GNOME 도우미 확장**(Wayland의 GNOME, 권장): 컴포지터 안에서 포인터를 읽고 마우스·키보드를 가져가거나 넣어 주는 작은 GNOME Shell 확장(`flockswitch@wwhalefe.github.io`)입니다. 시스템이 입력 캡처나 원격 조작 허용을 묻지 않게 됩니다(앞의 것은 GNOME 50 이하가 기억하지 못하고, 뒤의 것은 기억(Remember)을 켜지 않으면 다시 묻습니다). `install.sh`와 `get.sh`가 설치하고, `flockswitch setup`이 권하며(Homebrew 설치도), 앱 업데이트가 파일을 새것으로 유지합니다. 설치한 뒤 **한 번 로그아웃했다 다시 로그인**하세요. Wayland의 GNOME은 로그인할 때만 새 확장을 찾습니다. 확장은 이름이 `flockswitch`인 프로그램에만 답하고, X11이나 다른 데스크톱에서는 쓰지 않으며, `FLOCKSWITCH_GNOME_HELPER=0`으로 끌 수 있습니다. 확장이 있으면 모서리 전환과 공유가 X11처럼(앱이 커서를 읽어) 동작하고, 마우스를 흔들어 커서 찾기도 됩니다
 - 항목별 명령은 아래 [직접 설정하기](#직접-설정하기)에 있고, `flockswitch setup`이 대신 실행해 줍니다
 
 이 항목들은 flockswitch가 직접 확인합니다. 터미널에서는 `flockswitch setup`([설치](#설치) 참고), 앱에서는 다음과 같습니다. 빠진 것이 있으면 시작한 뒤 알림을 한 번 보내고(트레이 아이콘이 빠진 기본 GNOME에서 유용. 맨 처음 실행할 때는 알림 대신 설정 창이 설치·설정 점검을 연 채로 한 번 뜹니다), 트레이 메뉴에 **설정 필요 항목 N개…**가 생기며, 설정 → 일반 맨 위에 **설치·설정 점검** 카드가 나옵니다. 빠진 항목마다 필요한 이유와 **설치**·**나중에** 버튼이 있고, 두 개 이상이면 **모두 설치**가 관리자 권한 명령을 한데 모아 실행해 비밀번호를 한 번만 묻습니다. 설치를 누르면 실행할 명령을 그대로 먼저 보여 주고, **실행**을 눌러야 시작합니다. 관리자 권한이 필요한 명령은 `pkexec`로 실행해 데스크톱이 비밀번호를 묻습니다. 그렇게 할 수 없으면(pkexec가 없거나 취소함) 같은 명령을 `sudo`를 붙여 보여 주고 **명령 복사** 버튼으로 터미널에 붙여 넣을 수 있게 합니다. 할 수 있는 일:
@@ -85,6 +89,7 @@ flockswitch는 **MX Master 3**와 **MX Master 4**를 바탕으로 만들고 시�
 | 항목 | 알려 주는 경우 | 실행하는 것 |
 |---|---|---|
 | udev 규칙 | `/etc/udev/rules.d/70-flockswitch.rules`가 없거나 이 버전의 규칙과 다를 때, 또는 장치를 열 권한이 없을 때 | 규칙 쓰기, `udevadm control --reload-rules`, `udevadm trigger --subsystem-match=hidraw` (비밀번호). 그다음 수신기를 뺐다 꽂거나 블루투스를 다시 연결 |
+| GNOME 도우미 확장 | Wayland의 GNOME에서 확장이 없거나, 꺼져 있거나, 설치했지만 아직 불러오지 않았을 때 | 확장을 `~/.local/share/gnome-shell/extensions/`에 복사하고 `gnome-extensions enable flockswitch@wwhalefe.github.io` 실행 (비밀번호 없음). 그다음 한 번 로그아웃 후 다시 로그인 |
 | 데스크톱 포털 | Wayland의 GNOME 45 이상에서 입력 캡처가 없고 `xdg-desktop-portal`·`xdg-desktop-portal-gnome`이 없거나 오래되었을 때 | `apt-get`·`dnf`·`zypper`·`pacman`으로 설치 (비밀번호). 그다음 로그아웃 후 다시 로그인. GNOME 44 이하는 설치 대신 X11 세션을 안내 |
 | 한글 글꼴 | 창이 한국어이고 한글 글꼴이 없을 때(`fc-list :lang=ko`) | `fonts-noto-cjk`·`google-noto-sans-cjk-fonts`·`noto-sans-cjk-fonts`·`noto-fonts-cjk` (비밀번호). 설치하면 창이 바로 그 글꼴을 씀. 그 전까지 이 카드는 영어로 표시 |
 | 트레이 아이콘 | StatusNotifierItem을 보여 줄 곳이 없는 GNOME (이미 있는 Ubuntu는 제외) | `gnome-shell-extension-appindicator` (비밀번호), 이어서 `gnome-extensions enable appindicatorsupport@rgcjonas.gmail.com`. 그다음 로그아웃 후 다시 로그인 |
@@ -143,6 +148,12 @@ sudo apt-get install -y fonts-noto-cjk
 sudo dnf install -y gnome-shell-extension-appindicator      # Debian: sudo apt-get install -y …
 gnome-extensions enable appindicatorsupport@rgcjonas.gmail.com
 
+# GNOME 도우미 확장(Wayland의 GNOME): 권한 질문이 사라집니다. 끝나면 한 번 로그아웃 후 다시 로그인.
+# 압축을 푼 릴리스 폴더에서 (Homebrew: "$(brew --prefix)/opt/flockswitch/share/flockswitch/gnome-extension").
+mkdir -p ~/.local/share/gnome-shell/extensions/flockswitch@wwhalefe.github.io
+cp gnome-extension/flockswitch@wwhalefe.github.io/* ~/.local/share/gnome-shell/extensions/flockswitch@wwhalefe.github.io/
+gnome-extensions enable flockswitch@wwhalefe.github.io
+
 # GNOME 45 이상(Wayland)에서 입력 캡처가 없을 때 화면 모서리 전환용. 끝나면 로그아웃 후 다시 로그인.
 # GNOME 44 이하는 설치 대신 로그인 화면에서 "GNOME on Xorg"(또는 "Ubuntu on Xorg") 선택
 sudo apt-get install -y xdg-desktop-portal xdg-desktop-portal-gnome   # Fedora: sudo dnf install -y …
@@ -188,10 +199,11 @@ Wayland에서는 앱이 커서 위치를 읽을 수 없어서, flockswitch가 �
 |---|---|---|
 | X11(Xorg), 모든 데스크톱 | 지금처럼 커서 위치를 읽음 | 없음 |
 | KDE Plasma, sway, Hyprland 등 wlroots 계열 (Wayland) | 채널을 정한 가장자리를 따라 1픽셀 너비의 투명한 띠(wlr-layer-shell) | 없음 |
+| GNOME (Wayland)과 [도우미 확장](#필요한-환경) | 확장이 X11처럼 커서를 읽음. 시스템이 묻지 않음 | 한 번 설치하고 로그아웃 후 다시 로그인 |
 | GNOME 45 이상 (Wayland) | 데스크톱 포털의 입력 캡처: 채널을 정한 가장자리마다 감지선을 두고, 커서가 거기 닿으면 전환하거나 안쪽으로 움직일 때까지 시스템이 커서를 flockswitch에 넘김 | 시스템이 입력 캡처를 허락할지 물으면 허용. GNOME 51은 답을 기억하고, GNOME 45~50은 flockswitch를 시작할 때마다 묻습니다(45~48은 채널을 정한 가장자리나 모니터 구성이 바뀔 때도) |
 | GNOME 44 이하, 또는 둘 다 없는 컴포지터(예: Weston) | 쓸 수 없음: 모서리 페이지에 이유를 표시 | 로그인 화면에서 X11 세션 선택 |
 
-Wayland에서는 마우스가 돌아와도 커서를 보냈던 쪽 가장자리로 옮기지 못합니다(앱이 커서를 옮길 수 없음). 대기 효과는 KDE·sway·Hyprland에서 그려지고, GNOME에서는 XWayland의 화면 배치가 데스크톱과 같을 때 XWayland로 그립니다(아니면 효과 없이 기다리며, 진동은 어디서나 동작). 띠는 그 가장자리 맨 바깥 한 줄의 클릭을 받습니다. 'Ctrl 키를 누른 동안에만 전환': GNOME에서는 커서가 가장자리에 닿은 뒤에 Ctrl을 누르세요(그 전에 누른 키는 시스템이 알려 주지 않음). layer-shell 데스크톱에서는 커서가 띠 위에 있는 동안 Ctrl을 확인하려고 키보드를 잠시 넘겨받습니다(Ctrl 없이 최대 1.5초, 다른 키를 누르면 바로 돌려줌). 시험용으로 `FLOCKSWITCH_EDGE_BACKEND=layer-shell`, `input-capture`, `none`으로 방법을 정할 수 있습니다.
+Wayland에서는 마우스가 돌아와도 커서를 보냈던 쪽 가장자리로 옮기지 못합니다(앱이 커서를 옮길 수 없음). 대기 효과는 KDE·sway·Hyprland에서 그려지고, GNOME에서는 XWayland의 화면 배치가 데스크톱과 같을 때 XWayland로 그립니다(아니면 효과 없이 기다리며, 진동은 어디서나 동작). 띠는 그 가장자리 맨 바깥 한 줄의 클릭을 받습니다. 'Ctrl 키를 누른 동안에만 전환': GNOME에서는 커서가 가장자리에 닿은 뒤에 Ctrl을 누르세요(그 전에 누른 키는 시스템이 알려 주지 않음). layer-shell 데스크톱에서는 커서가 띠 위에 있는 동안 Ctrl을 확인하려고 키보드를 잠시 넘겨받습니다(Ctrl 없이 최대 1.5초, 다른 키를 누르면 바로 돌려줌). 시험용으로 `FLOCKSWITCH_EDGE_BACKEND=layer-shell`, `input-capture`, `gnome-helper`, `none`으로 방법을 정할 수 있습니다. 도우미 확장을 쓰면 X11처럼 마우스가 돌아올 때 커서를 보냈던 쪽 가장자리에 놓습니다.
 
 ### Wayland에서 마우스 찾기와 단축키
 
@@ -209,7 +221,7 @@ Wayland에서는 앱이 커서를 계속 따라갈 수 없지만, 커서가 자�
 
 ## 제거
 
-받은 폴더에서 `./uninstall.sh`를 실행합니다. 버튼을 원래대로 돌려놓고, 자동 실행과 설정을 지운 뒤, 프로그램과 앱 메뉴 항목, udev 규칙을 지웁니다.
+받은 폴더에서 `./uninstall.sh`를 실행합니다. 버튼을 원래대로 돌려놓고, 자동 실행과 설정을 지운 뒤, 프로그램과 앱 메뉴 항목, GNOME 도우미 확장, udev 규칙을 지웁니다.
 
 Homebrew로 설치했다면 `flockswitch uninstall`을 실행한 다음 `brew uninstall --formula wwhalefe/tap/flockswitch`를 실행하고, udev 규칙과 메뉴 항목은 `brew info --formula wwhalefe/tap/flockswitch`에 나오는 대로 지웁니다.
 
@@ -239,6 +251,7 @@ flockswitch는 이 PC에 연결된 Logitech 장치와 통신합니다. 인터넷
 | GNOME Wayland에서 키보드 단축키 (GlobalShortcuts 포털) | 동작 확인 |
 | 설치·설정 점검 | 동작 확인 |
 | Homebrew 설치본 업데이트 | 동작 확인 |
+| GNOME 도우미 확장 (권한 질문 없이 모서리 전환, 공유, 마우스 찾기) | 구현, 실기기 미확인 |
 | KDE Plasma·sway·Hyprland에서 화면 모서리와 마우스 찾기 (layer shell) | 구현, 미확인 |
 | X11(Xorg) 세션: 화면 모서리, 마우스 찾기, 단축키 | 구현, 미확인 |
 

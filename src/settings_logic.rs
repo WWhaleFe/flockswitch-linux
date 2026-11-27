@@ -382,9 +382,54 @@ pub fn input_capture_forgets(backend: &str, note: &str) -> bool {
         && note.split_once(':').is_some_and(|(code, version)| matches!(code, "ready" | "asking" | "off") && version.trim() == "1")
 }
 
+/// Which notes about the system's permission questions the Connect page shows on a
+/// Wayland session.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PortalNotes {
+    /// The GNOME helper extension is in use: one line saying so, and no other note.
+    pub helper: bool,
+    /// GNOME 50 and older ask for input capture at every start.
+    pub every: bool,
+    /// The remote control answer was given without Remember.
+    pub not_remembered: bool,
+    /// Where a note above shows, a sentence about installing the helper extension.
+    pub install_hint: bool,
+}
+
+/// The notes for the running flockswitch's edge backend and note, the remote control
+/// status ("not-remembered"), and whether this is GNOME.
+pub fn portal_notes(backend: &str, note: &str, remote_desktop: &str, gnome: bool) -> PortalNotes {
+    if backend == "gnome-helper" {
+        return PortalNotes { helper: true, ..PortalNotes::default() };
+    }
+    let every = input_capture_forgets(backend, note);
+    let not_remembered = remote_desktop == "not-remembered";
+    PortalNotes { helper: false, every, not_remembered, install_hint: gnome && (every || not_remembered) }
+}
+
 #[cfg(test)]
 mod portal_note_tests {
-    use super::input_capture_forgets;
+    use super::{input_capture_forgets, portal_notes, PortalNotes};
+
+    #[test]
+    fn the_helper_replaces_the_portal_notes() {
+        let n = portal_notes("gnome-helper", "", "not-remembered", true);
+        assert_eq!(n, PortalNotes { helper: true, ..PortalNotes::default() });
+        // Even if a stale status still says something about the portals.
+        assert!(!portal_notes("gnome-helper", "ready:1", "not-remembered", true).every);
+    }
+
+    #[test]
+    fn without_the_helper_the_notes_stay_and_gnome_gets_the_hint() {
+        let n = portal_notes("input-capture", "ready:1", "", true);
+        assert_eq!(n, PortalNotes { helper: false, every: true, not_remembered: false, install_hint: true });
+        let n = portal_notes("input-capture", "ready:2", "not-remembered", true);
+        assert_eq!(n, PortalNotes { helper: false, every: false, not_remembered: true, install_hint: true });
+        // Nothing to say: no hint either. Not GNOME: the notes, but no hint.
+        assert_eq!(portal_notes("input-capture", "ready:2", "", true), PortalNotes::default());
+        assert!(!portal_notes("input-capture", "ready:1", "", false).install_hint);
+        assert!(portal_notes("input-capture", "ready:1", "", false).every);
+    }
 
     #[test]
     fn only_version_one_input_capture_forgets() {

@@ -512,7 +512,8 @@ fn watch(shared: Arc<Shared>) {
 
 /// The cursor and the displays, from the X server (root-window coordinates, y down),
 /// through Xlib and Xinerama loaded at run time. Wayland lets no app read the cursor
-/// position, so there this is not available (XWayland sees it only over X11 windows).
+/// position (XWayland sees it only over X11 windows), so there this is available only
+/// through the GNOME helper extension (gnome_ext.rs: logical coordinates, y down).
 pub(crate) mod platform {
     use super::Rect;
     use crate::config::ShakeKey;
@@ -533,14 +534,20 @@ pub(crate) mod platform {
     static ACCESS: std::sync::Mutex<()> = std::sync::Mutex::new(());
     static X11: OnceLock<Option<X>> = OnceLock::new();
 
-    /// An X11 session: cursor and displays can be read.
-    pub fn available() -> bool {
+    /// An X11 session: cursor and displays can be read from the X server.
+    pub fn x11_available() -> bool {
         !crate::edge_wayland::session_is_wayland() && std::env::var_os("DISPLAY").is_some()
+    }
+
+    /// Cursor and displays can be read: an X11 session, or GNOME Wayland with the helper
+    /// extension.
+    pub fn available() -> bool {
+        x11_available() || crate::gnome_ext::available()
     }
 
     fn x() -> Option<&'static X> {
         X11.get_or_init(|| {
-            if !available() {
+            if !x11_available() {
                 return None;
             }
             let xlib = Xlib::open().ok()?;
@@ -557,6 +564,9 @@ pub(crate) mod platform {
 
     /// The cursor position and the modifier keys, as of now.
     pub fn pointer() -> Option<(f64, f64, u32)> {
+        if !x11_available() {
+            return crate::gnome_ext::pointer();
+        }
         let _access = ACCESS.lock().unwrap();
         let x = x()?;
         let (mut root, mut child) = (0u64, 0u64);
@@ -575,7 +585,8 @@ pub(crate) mod platform {
 
     /// Whether a Control key is held right now.
     pub fn control_down() -> bool {
-        pointer().is_some_and(|(_, _, mask)| mask & ControlMask != 0)
+        // The extension's modifier bits are X11's (gnome_ext::control_held).
+        pointer().is_some_and(|(_, _, mask)| crate::gnome_ext::control_held(mask))
     }
 
     /// Whether `key` is down in a modifier `mask` from `pointer` (Alt is Mod1 on every
@@ -590,6 +601,9 @@ pub(crate) mod platform {
     }
 
     pub fn displays() -> Vec<Rect> {
+        if !x11_available() {
+            return crate::gnome_ext::displays();
+        }
         let _access = ACCESS.lock().unwrap();
         let Some(x) = x() else { return Vec::new() };
         if let Some(xin) = &x.xinerama {
@@ -615,6 +629,10 @@ pub(crate) mod platform {
 
     /// Moves the cursor there.
     pub fn place(px: f64, py: f64) {
+        if !x11_available() {
+            crate::gnome_ext::warp(px, py);
+            return;
+        }
         let _access = ACCESS.lock().unwrap();
         let Some(x) = x() else { return };
         unsafe {

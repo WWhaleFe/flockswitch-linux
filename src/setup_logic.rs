@@ -26,6 +26,12 @@ pub const OTHER_UDEV_RULES: [&str; 3] = [
 /// The GNOME Shell extension that shows tray icons (StatusNotifierItem).
 pub const APPINDICATOR_UUID: &str = "appindicatorsupport@rgcjonas.gmail.com";
 pub const APPINDICATOR_PACKAGE: &str = "gnome-shell-extension-appindicator";
+/// The GNOME Shell extension that lets flockswitch read the pointer and take input on
+/// Wayland without the desktop portals (packaging/linux/gnome-extension/; gnome_ext.rs
+/// is its client).
+pub const HELPER_UUID: &str = "flockswitch@wwhalefe.github.io";
+/// The files of that extension.
+pub const HELPER_FILES: [&str; 2] = ["extension.js", "metadata.json"];
 pub const BREW_FORMULA: &str = "wwhalefe/tap/flockswitch";
 /// The desktop portal and its GNOME backend, with the first versions that have
 /// InputCapture.
@@ -43,6 +49,7 @@ pub enum ItemId {
     Network,
     UdevRule,
     Portal,
+    GnomeHelper,
     KoreanFont,
     TrayIcon,
     MenuEntry,
@@ -56,6 +63,7 @@ impl ItemId {
             ItemId::Network => "network",
             ItemId::UdevRule => "udev-rule",
             ItemId::Portal => "portal",
+            ItemId::GnomeHelper => "gnome-helper",
             ItemId::KoreanFont => "korean-font",
             ItemId::TrayIcon => "tray-icon",
             ItemId::MenuEntry => "menu-entry",
@@ -344,6 +352,25 @@ pub struct Facts {
     pub appindicator_enabled: Option<bool>,
     /// Installed with Homebrew.
     pub homebrew: Option<Brew>,
+    /// The GNOME helper extension (None: not asked, or not GNOME).
+    pub helper: Option<HelperFacts>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HelperFacts {
+    /// The extension folder that came with this program (tarball or Homebrew layout), if
+    /// it was found.
+    pub source: Option<PathBuf>,
+    /// `~/.local/share/gnome-shell/extensions/<uuid>`.
+    pub dest: PathBuf,
+    /// Its files are in `dest`.
+    pub installed: bool,
+    /// `gsettings get org.gnome.shell enabled-extensions` as printed, when it could be read.
+    pub enabled_list: Option<String>,
+    /// The extension is switched on in GNOME's settings.
+    pub enabled: Option<bool>,
+    /// It answers now (the running Shell has loaded it).
+    pub answering: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -402,6 +429,12 @@ pub enum Why {
     /// GNOME 44 or older: an X11 session is the way, nothing to install.
     PortalX11 { gnome: u32 },
     FontMissing,
+    /// GNOME on Wayland without the helper extension: it is not installed.
+    HelperInstall,
+    /// Installed but switched off.
+    HelperEnable,
+    /// Installed and on, but the running Shell has not loaded it (a new login does).
+    HelperRelogin,
     /// No tray on stock GNOME: the extension is not installed.
     TrayInstall,
     /// It is installed but not switched on.
@@ -542,7 +575,7 @@ impl Item {
 
 /// Every item, in the order the settings window lists them.
 pub fn evaluate(f: &Facts) -> Vec<Item> {
-    vec![network(f), brew_update(f), udev(f), tray_icon(f), korean_font(f), portal(f), menu_entry(f)]
+    vec![network(f), brew_update(f), udev(f), tray_icon(f), korean_font(f), portal(f), gnome_helper(f), menu_entry(f)]
 }
 
 fn network(f: &Facts) -> Item {
@@ -679,6 +712,120 @@ fn portal(f: &Facts) -> Item {
         // No compositor, no display, or a way forced by hand: nothing to install.
         _ => Item::with(id, State::NotApplicable),
     }
+}
+
+// ---- The GNOME helper extension -------------------------------------------------------
+
+/// `enabled-extensions` as `gsettings get` printed it, with `uuid` added; None when it is
+/// there already or the text is not a list.
+pub fn enabled_list_with(printed: &str, uuid: &str) -> Option<String> {
+    let list = printed.trim();
+    if gsettings_list_contains(list, uuid) {
+        return None;
+    }
+    if matches!(list, "@as []" | "[]") {
+        return Some(format!("['{uuid}']"));
+    }
+    let inner = list.strip_prefix('[')?.strip_suffix(']')?.trim_end();
+    Some(format!("[{inner}, '{uuid}']"))
+}
+
+/// Switches the extension on. A Shell that has not seen the new files yet (Wayland, before
+/// the next login) refuses `gnome-extensions enable`; the setting is then written
+/// directly, so the extension is on at the next login.
+pub fn helper_enable_command(enabled_list: Option<&str>) -> String {
+    let enable = format!("gnome-extensions enable {HELPER_UUID}");
+    match enabled_list.and_then(|l| enabled_list_with(l, HELPER_UUID)) {
+        Some(list) => format!("{enable} || gsettings set org.gnome.shell enabled-extensions {}", shell_quote(&list)),
+        None => format!("{enable} || true"),
+    }
+}
+
+/// Copies the extension from `source` to `dest` (replacing its files), then switches it on.
+pub fn helper_install_steps(source: &Path, dest: &Path, enabled_list: Option<&str>) -> Vec<Step> {
+    let files: Vec<String> = HELPER_FILES.iter().map(|f| quoted(&source.join(f))).collect();
+    vec![
+        Step::new(format!("mkdir -p {}", quoted(dest))),
+        Step::new(format!("cp -f {} {}", files.join(" "), quoted(dest))),
+        Step::new(helper_enable_command(enabled_list)),
+    ]
+}
+
+/// Where the extension folder may be, beside the running program: the unpacked release
+/// file (`gnome-extension/` next to the program), the Homebrew formula's `share` folder
+/// (through `<prefix>/opt/flockswitch`, or the Cellar folder the program lies in), a
+/// source tree. Each ends in the extension's own folder.
+pub fn helper_source_candidates(exe_dir: Option<&Path>, brew_prefix: Option<&Path>) -> Vec<PathBuf> {
+    let share = Path::new("share/flockswitch/gnome-extension").join(HELPER_UUID);
+    let mut out = Vec::new();
+    if let Some(prefix) = brew_prefix {
+        out.push(prefix.join("opt/flockswitch").join(&share));
+    }
+    if let Some(dir) = exe_dir {
+        out.push(dir.join("gnome-extension").join(HELPER_UUID));
+        out.push(dir.join("..").join(&share));
+        out.push(dir.join("../../packaging/linux/gnome-extension").join(HELPER_UUID));
+    }
+    out
+}
+
+/// The extension in the user's data folder (`~/.local/share` or $XDG_DATA_HOME).
+pub fn helper_dest(data: &Path) -> PathBuf {
+    data.join("gnome-shell/extensions").join(HELPER_UUID)
+}
+
+/// Whether every file of the extension in `a` has the same bytes in `b`.
+#[cfg(test)]
+pub fn helper_files_equal(a: &Path, b: &Path) -> bool {
+    HELPER_FILES.iter().all(|f| match (std::fs::read(a.join(f)), std::fs::read(b.join(f))) {
+        (Ok(x), Ok(y)) => x == y,
+        _ => false,
+    })
+}
+
+/// Replaces the extension's files in `dest` with those of `source` where they differ
+/// (each written whole, then renamed into place). Returns the files changed.
+pub fn sync_helper_files(source: &Path, dest: &Path) -> std::io::Result<Vec<&'static str>> {
+    let mut changed = Vec::new();
+    for name in HELPER_FILES {
+        let new = std::fs::read(source.join(name))?;
+        if std::fs::read(dest.join(name)).ok().as_deref() == Some(new.as_slice()) {
+            continue;
+        }
+        std::fs::create_dir_all(dest)?;
+        let tmp = dest.join(format!(".{name}.new"));
+        std::fs::write(&tmp, &new)?;
+        std::fs::rename(&tmp, dest.join(name))?;
+        changed.push(name);
+    }
+    Ok(changed)
+}
+
+/// Only on GNOME's Wayland session, where the helper extension replaces the portals'
+/// questions: installed and answering is done; installed and on but not loaded asks for
+/// one login; off is switched on; missing is copied from this program's files.
+fn gnome_helper(f: &Facts) -> Item {
+    let id = ItemId::GnomeHelper;
+    if !f.wayland || !f.gnome_shell {
+        return Item::with(id, State::NotApplicable);
+    }
+    let Some(h) = &f.helper else { return Item::with(id, State::Unknown) };
+    if h.answering {
+        return Item::with(id, State::Ok);
+    }
+    if h.installed {
+        if h.enabled == Some(true) {
+            return Item::missing(id, Why::HelperRelogin, None);
+        }
+        let fix = Fix { admin: vec![], user: vec![Step::new(helper_enable_command(h.enabled_list.as_deref()))], after: After::Relogin };
+        return Item::missing(id, Why::HelperEnable, Some(fix));
+    }
+    let fix = h.source.as_deref().map(|source| Fix {
+        admin: vec![],
+        user: helper_install_steps(source, &h.dest, h.enabled_list.as_deref()),
+        after: After::Relogin,
+    });
+    Item::missing(id, Why::HelperInstall, fix)
 }
 
 fn korean_font(f: &Facts) -> Item {
@@ -927,7 +1074,7 @@ pub fn left_to_do(items: &[Item], done: &[ItemId]) -> Vec<Left> {
             }
         } else if item.fix.is_none() {
             match item.why {
-                Some(Why::TrayRelogin | Why::PortalRelogin { .. }) => Some(Left::Relogin),
+                Some(Why::TrayRelogin | Why::PortalRelogin { .. } | Why::HelperRelogin) => Some(Left::Relogin),
                 Some(Why::PortalX11 { gnome }) => Some(Left::X11Session(gnome)),
                 _ => None,
             }
@@ -1056,7 +1203,7 @@ mod tests {
     fn nothing_to_do_on_a_set_up_computer() {
         let f = Facts { udev: Udev { etc: Some(UDEV_RULE.into()), ..Udev::default() }, ..Facts::default() };
         let items = evaluate(&f);
-        assert_eq!(items.len(), 7);
+        assert_eq!(items.len(), 8);
         assert!(shown(&items, &[]).is_empty(), "{items:?}");
         assert_eq!(find(&items, ItemId::UdevRule).state, State::Ok);
         assert_eq!(find(&items, ItemId::Portal).state, State::NotApplicable);
@@ -1537,5 +1684,156 @@ mod network_tests {
             assert!(!item.actionable());
             assert!(matches!(item.why,Some(Why::Network{send:s,receive:r,..}) if s==send && r==receive));
         }
+    }
+}
+
+#[cfg(test)]
+mod helper_tests {
+    use super::*;
+
+    fn gnome() -> Facts {
+        Facts { wayland: true, gnome_shell: true, ..Facts::default() }
+    }
+
+    fn helper(installed: bool, enabled: Option<bool>, answering: bool, source: bool) -> Facts {
+        Facts {
+            helper: Some(HelperFacts {
+                source: source.then(|| PathBuf::from("/opt/fs/share/flockswitch/gnome-extension").join(HELPER_UUID)),
+                dest: PathBuf::from("/home/me/.local/share/gnome-shell/extensions").join(HELPER_UUID),
+                installed,
+                enabled_list: Some("['appindicatorsupport@rgcjonas.gmail.com']".into()),
+                enabled,
+                answering,
+            }),
+            ..gnome()
+        }
+    }
+
+    #[test]
+    fn only_on_gnome_wayland() {
+        assert_eq!(gnome_helper(&Facts::default()).state, State::NotApplicable);
+        assert_eq!(gnome_helper(&Facts { wayland: false, ..helper(false, None, false, true) }).state, State::NotApplicable);
+        assert_eq!(gnome_helper(&Facts { gnome_shell: false, ..helper(false, None, false, true) }).state, State::NotApplicable);
+        // Not looked at yet: nothing is offered.
+        assert_eq!(gnome_helper(&gnome()).state, State::Unknown);
+    }
+
+    #[test]
+    fn installed_and_answering_is_done() {
+        assert_eq!(gnome_helper(&helper(true, Some(true), true, true)).state, State::Ok);
+        // Answering is what counts, whatever else was read.
+        assert_eq!(gnome_helper(&helper(false, None, true, false)).state, State::Ok);
+    }
+
+    #[test]
+    fn installed_and_on_but_not_loaded_needs_a_login() {
+        let item = gnome_helper(&helper(true, Some(true), false, true));
+        assert_eq!(item.state, State::Missing);
+        assert_eq!(item.why, Some(Why::HelperRelogin));
+        assert!(item.fix.is_none() && !item.actionable());
+        assert_eq!(left_to_do(&[item], &[]), vec![Left::Relogin]);
+    }
+
+    #[test]
+    fn installed_but_off_is_switched_on() {
+        for enabled in [Some(false), None] {
+            let item = gnome_helper(&helper(true, enabled, false, false));
+            assert_eq!(item.why, Some(Why::HelperEnable));
+            assert!(item.actionable() && !item.needs_admin());
+            let fix = item.fix.as_ref().unwrap();
+            assert_eq!(fix.after, After::Relogin);
+            assert_eq!(fix.user.len(), 1);
+            assert!(fix.user[0].command.starts_with("gnome-extensions enable flockswitch@wwhalefe.github.io || gsettings set"), "{}", fix.user[0].command);
+        }
+    }
+
+    #[test]
+    fn missing_is_copied_from_the_programs_files_and_switched_on() {
+        let item = gnome_helper(&helper(false, None, false, true));
+        assert_eq!(item.why, Some(Why::HelperInstall));
+        assert!(item.actionable() && !item.needs_admin());
+        let fix = item.fix.as_ref().unwrap();
+        let lines: Vec<&str> = fix.user.iter().map(|s| s.command.as_str()).collect();
+        assert_eq!(lines[0], "mkdir -p /home/me/.local/share/gnome-shell/extensions/flockswitch@wwhalefe.github.io");
+        assert_eq!(
+            lines[1],
+            "cp -f /opt/fs/share/flockswitch/gnome-extension/flockswitch@wwhalefe.github.io/extension.js /opt/fs/share/flockswitch/gnome-extension/flockswitch@wwhalefe.github.io/metadata.json /home/me/.local/share/gnome-shell/extensions/flockswitch@wwhalefe.github.io"
+        );
+        assert!(lines[2].starts_with("gnome-extensions enable "));
+        assert_eq!(fix.after, After::Relogin);
+        assert_eq!(left_to_do(&[item.clone()], &[ItemId::GnomeHelper]), vec![Left::Relogin]);
+        // Where this program's files cannot be found there is nothing to run.
+        let lost = gnome_helper(&helper(false, None, false, false));
+        assert_eq!(lost.state, State::Missing);
+        assert!(lost.fix.is_none() && !lost.actionable());
+    }
+
+    #[test]
+    fn it_is_counted_and_installed_with_the_rest() {
+        let items = evaluate(&helper(false, None, false, true));
+        let item = items.iter().find(|i| i.id == ItemId::GnomeHelper).unwrap();
+        assert!(item.actionable());
+        assert!(installable(items.iter()).iter().any(|i| i.id == ItemId::GnomeHelper));
+        assert!(pending(&items, &[]) >= 1);
+        assert!(shown(&items, &["gnome-helper".to_string()]).iter().all(|i| i.id != ItemId::GnomeHelper));
+        // Only user steps: the combined administrator script leaves it out.
+        assert!(!combined_admin_script(&[item]).contains("gnome-extensions"));
+    }
+
+    #[test]
+    fn paths_with_spaces_are_quoted() {
+        let steps = helper_install_steps(Path::new("/opt/my fs/ext"), Path::new("/home/a b/ext"), None);
+        assert_eq!(steps[0].command, "mkdir -p '/home/a b/ext'");
+        assert!(steps[1].command.starts_with("cp -f '/opt/my fs/ext/extension.js' '/opt/my fs/ext/metadata.json' '/home/a b/ext'"));
+        assert_eq!(steps[2].command, "gnome-extensions enable flockswitch@wwhalefe.github.io || true");
+    }
+
+    #[test]
+    fn the_setting_gets_the_extension_added_once() {
+        let u = HELPER_UUID;
+        assert_eq!(enabled_list_with("@as []", u).as_deref(), Some("['flockswitch@wwhalefe.github.io']"));
+        assert_eq!(enabled_list_with("[]\n", u).as_deref(), Some("['flockswitch@wwhalefe.github.io']"));
+        assert_eq!(enabled_list_with("['a@b', 'c@d']\n", u).as_deref(), Some("['a@b', 'c@d', 'flockswitch@wwhalefe.github.io']"));
+        assert_eq!(enabled_list_with("['a@b', 'flockswitch@wwhalefe.github.io']", u), None);
+        assert_eq!(enabled_list_with("not a list", u), None);
+        let cmd = helper_enable_command(Some("['a@b']"));
+        assert_eq!(
+            cmd,
+            "gnome-extensions enable flockswitch@wwhalefe.github.io || gsettings set org.gnome.shell enabled-extensions '['\\''a@b'\\'', '\\''flockswitch@wwhalefe.github.io'\\'']'"
+        );
+        assert_eq!(helper_enable_command(None), "gnome-extensions enable flockswitch@wwhalefe.github.io || true");
+        assert_eq!(helper_enable_command(Some("['flockswitch@wwhalefe.github.io']")), "gnome-extensions enable flockswitch@wwhalefe.github.io || true");
+    }
+
+    #[test]
+    fn where_the_extension_may_be() {
+        let c = helper_source_candidates(Some(Path::new("/home/linuxbrew/.linuxbrew/Cellar/flockswitch/2.2.0/bin")), Some(Path::new("/home/linuxbrew/.linuxbrew")));
+        assert_eq!(c[0], PathBuf::from("/home/linuxbrew/.linuxbrew/opt/flockswitch/share/flockswitch/gnome-extension/flockswitch@wwhalefe.github.io"));
+        assert!(c.contains(&PathBuf::from("/home/linuxbrew/.linuxbrew/Cellar/flockswitch/2.2.0/bin/gnome-extension/flockswitch@wwhalefe.github.io")));
+        assert!(c.iter().any(|p| p.to_string_lossy().contains("/bin/../share/flockswitch/gnome-extension/")));
+        assert_eq!(helper_source_candidates(None, None), Vec::<PathBuf>::new());
+        assert_eq!(helper_dest(Path::new("/home/me/.local/share")), PathBuf::from("/home/me/.local/share/gnome-shell/extensions/flockswitch@wwhalefe.github.io"));
+    }
+
+    #[test]
+    fn files_are_replaced_only_where_they_differ() {
+        let root = std::env::temp_dir().join(format!("flockswitch-helper-{}", std::process::id()));
+        let (src, dst) = (root.join("src"), root.join("dst/ext"));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("extension.js"), "new code").unwrap();
+        std::fs::write(src.join("metadata.json"), "{}").unwrap();
+        assert!(!helper_files_equal(&src, &dst));
+        // Nothing there yet: both are written (and the folder made).
+        assert_eq!(sync_helper_files(&src, &dst).unwrap(), vec!["extension.js", "metadata.json"]);
+        assert!(helper_files_equal(&src, &dst));
+        assert_eq!(sync_helper_files(&src, &dst).unwrap(), Vec::<&str>::new());
+        std::fs::write(src.join("extension.js"), "newer code").unwrap();
+        assert_eq!(sync_helper_files(&src, &dst).unwrap(), vec!["extension.js"]);
+        assert_eq!(std::fs::read_to_string(dst.join("extension.js")).unwrap(), "newer code");
+        assert!(!dst.join(".extension.js.new").exists());
+        // A release without the files changes nothing.
+        assert!(sync_helper_files(&root.join("nothing"), &dst).is_err());
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

@@ -1,0 +1,8 @@
+{
+  "uuid": "flockswitch@wwhalefe.github.io",
+  "name": "flockswitch helper",
+  "description": "Lets the flockswitch app see the pointer, notice the screen edges, and share this computer's mouse and keyboard with your paired computers without asking for input capture and remote control at every start. It answers only the flockswitch program.",
+  "shell-version": ["45", "46", "47", "48", "49", "50", "51"],
+  "url": "https://github.com/WWhaleFe/flockswitch-linux",
+  "version": 1
+}

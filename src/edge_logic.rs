@@ -496,6 +496,9 @@ pub enum Choice {
     InputCapture,
     /// wlr-layer-shell strips along the edges (KDE, sway, Hyprland, other wlroots).
     LayerShell,
+    /// The GNOME helper extension (gnome_ext.rs) reads the cursor, and edge.rs watches it
+    /// as in an X11 session; no portal and no permission question.
+    GnomeHelper,
     None(Reason),
 }
 
@@ -519,6 +522,7 @@ impl Choice {
             Choice::X11 => "x11",
             Choice::InputCapture => "input-capture",
             Choice::LayerShell => "layer-shell",
+            Choice::GnomeHelper => "gnome-helper",
             Choice::None(_) => "none",
         }
     }
@@ -565,11 +569,14 @@ pub struct Probe {
     pub input_capture: Option<u32>,
     /// The running GNOME Shell's major version, if it is GNOME.
     pub gnome: Option<u32>,
+    /// The GNOME helper extension answers (GNOME on Wayland only).
+    pub gnome_helper: bool,
 }
 
-/// Picks the backend: X11 where the cursor can be read; on Wayland a layer-shell strip
-/// first (no permission, no capture, the corners left out exactly), then the portal's
-/// input capture (GNOME, which has no layer shell).
+/// Picks the backend: X11 where the cursor can be read; on Wayland the GNOME helper
+/// extension when it answers, then a layer-shell strip (no permission, no capture, the
+/// corners left out exactly), then the portal's input capture (GNOME, which has no layer
+/// shell).
 pub fn choose(p: &Probe) -> Choice {
     if let Some(name) = p.forced.as_deref() {
         let possible = match name {
@@ -578,6 +585,7 @@ pub fn choose(p: &Probe) -> Choice {
             "x11" => !p.wayland && p.x11_display,
             "layer-shell" => p.layer_shell == Some(true),
             "input-capture" => p.input_capture.is_some(),
+            "gnome-helper" => p.wayland && p.gnome_helper,
             "none" => return Choice::None(Reason::Forced(name.into())),
             _ => false,
         };
@@ -585,11 +593,16 @@ pub fn choose(p: &Probe) -> Choice {
             "x11" if possible => Choice::X11,
             "layer-shell" if possible => Choice::LayerShell,
             "input-capture" if possible => Choice::InputCapture,
+            "gnome-helper" if possible => Choice::GnomeHelper,
             _ => Choice::None(Reason::Forced(name.into())),
         };
     }
     if !p.wayland {
         return if p.x11_display { Choice::X11 } else { Choice::None(Reason::NoDisplay) };
+    }
+    // GNOME with the helper extension: no question to answer, and the cursor is known.
+    if p.gnome_helper {
+        return Choice::GnomeHelper;
     }
     if p.layer_shell == Some(true) {
         return Choice::LayerShell;
@@ -611,6 +624,16 @@ pub fn choose(p: &Probe) -> Choice {
 /// there the session is made again instead.
 pub fn can_reconfigure(gnome: Option<u32>, portal_is_gnome: bool) -> bool {
     !portal_is_gnome || gnome.is_some_and(|v| v >= 49)
+}
+
+/// Whether the network side uses the GNOME helper extension rather than the portals:
+/// the extension answers, FLOCKSWITCH_EDGE_BACKEND does not ask for another way, and the
+/// edge watcher in this process has not already taken a portal way (then the app
+/// does not drive the edges, so the network could not cross; a restart switches).
+pub fn net_uses_helper(helper_available: bool, forced: Option<&str>, edge_backend: Option<&Choice>) -> bool {
+    helper_available
+        && forced.is_none_or(|f| f == "gnome-helper")
+        && edge_backend.is_none_or(|c| *c == Choice::GnomeHelper)
 }
 
 /// Whether the system remembers the answer to its input-capture question: portal
@@ -903,6 +926,35 @@ mod tests {
         assert_eq!(xwayland_scale(&zones, &[z(0, 0, 1920, 1080)]), None);
         assert_eq!(xwayland_scale(&zones, &[z(0, 0, 1920, 1080), z(1920, 100, 1280, 720)]), None);
         assert_eq!(xwayland_scale(&[], &[]), None);
+    }
+
+    #[test]
+    fn the_helper_comes_first_on_wayland() {
+        let helper = Probe { gnome_helper: true, layer_shell: Some(false), input_capture: Some(1), gnome: Some(46), ..probe() };
+        assert_eq!(choose(&helper), Choice::GnomeHelper);
+        assert_eq!(choose(&Probe { layer_shell: Some(true), ..helper.clone() }), Choice::GnomeHelper);
+        assert_eq!(choose(&Probe { gnome: Some(43), layer_shell: Some(false), input_capture: None, ..helper.clone() }), Choice::GnomeHelper);
+        assert_eq!(Choice::GnomeHelper.name(), "gnome-helper");
+        // Without it nothing changes.
+        assert_eq!(choose(&Probe { gnome_helper: false, ..helper.clone() }), Choice::InputCapture);
+        // X11 stays X11 whatever the probe says.
+        assert_eq!(choose(&Probe { wayland: false, ..helper.clone() }), Choice::X11);
+        // Forced.
+        assert_eq!(choose(&Probe { forced: Some("gnome-helper".into()), ..helper.clone() }), Choice::GnomeHelper);
+        assert_eq!(choose(&Probe { forced: Some("gnome-helper".into()), gnome_helper: false, ..helper.clone() }), Choice::None(Reason::Forced("gnome-helper".into())));
+        assert_eq!(choose(&Probe { forced: Some("input-capture".into()), ..helper.clone() }), Choice::InputCapture);
+        assert_eq!(choose(&Probe { forced: Some("layer-shell".into()), layer_shell: Some(true), ..helper }), Choice::LayerShell);
+    }
+
+    #[test]
+    fn the_network_follows_the_edge_backend() {
+        assert!(net_uses_helper(true, None, None));
+        assert!(net_uses_helper(true, None, Some(&Choice::GnomeHelper)));
+        assert!(net_uses_helper(true, Some("gnome-helper"), None));
+        assert!(!net_uses_helper(false, None, None));
+        assert!(!net_uses_helper(true, Some("input-capture"), None));
+        assert!(!net_uses_helper(true, None, Some(&Choice::InputCapture)));
+        assert!(!net_uses_helper(true, None, Some(&Choice::LayerShell)));
     }
 
     fn probe() -> Probe {

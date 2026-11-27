@@ -361,6 +361,7 @@ fn setup_button<'a>(t: &'a Texts, item: &Item) -> &'a str {
         ItemId::MenuEntry => t.setup_add,
         ItemId::BrewUpdate => t.setup_update,
         ItemId::TrayIcon if !item.needs_admin() => t.setup_turn_on,
+        ItemId::GnomeHelper if matches!(item.why, Some(crate::setup_logic::Why::HelperEnable)) => t.setup_turn_on,
         _ => t.setup_install,
     }
 }
