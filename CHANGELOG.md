@@ -1,5 +1,14 @@
 # Changelog
 
+## 2.4.0 - 2026-11-27
+
+- Layout map: a computer with several monitors now moves as one. Moving one of its monitor tiles moves the others by the same number of cells, so the shape of its monitor arrangement stays as it is. All tiles of the picked computer are highlighted, only the spots where the whole group fits are marked, and an outline of the whole group shows where it would land. Tiles can also be dragged instead of clicked. Saved tiles of a monitor that is unplugged now move along too.
+- Fixed: unpairing the master on a sub (for example a Mac) told the master a different reason for closing the link, so the master still held the sub as paired and would not pair with it again.
+- Fixed: a computer never forgot a peer that had forgotten it (unpaired while this one was off). The "release all keys" message sent with every closing link was taken for a working session and restarted the check each time. Now two refusals ten seconds apart make it forget the peer, and the two can pair again.
+- Fixed: asking to pair again while the other side still held the pairing closed the link at once (its session messages arrived first), so no code appeared. A paired peer that receives a pair request now starts a new pairing.
+- After switching networking on, resuming a paused computer or **Find connections again**, the computer dials at once whichever side normally dials first, and drops a backoff that grew while it was off (before, this could take up to 6 to 10 seconds).
+- Fixed: a pairing asked for while an earlier link to the same address was still closing was silently dropped, and a pairing was silently cancelled when its link was replaced by the other side's automatic redial. The pairing now carries on over the new link, and is dialled again when there is none.
+
 ## 2.3.0 - 2026-11-27
 
 - Layout map is now 6 x 4 (was 5 x 3); saved 5 x 3 layouts keep working as they are.

@@ -150,7 +150,8 @@ impl Platform for FakePlatform {
     }
 }
 fn wait(label: &str, mut predicate: impl FnMut() -> bool) {
-    let deadline = Instant::now() + Duration::from_secs(5);
+    // Generous: CI runners (Windows, ARM) are several times slower than a Mac.
+    let deadline = Instant::now() + Duration::from_secs(30);
     while !predicate() {
         assert!(Instant::now() < deadline, "timed out: {label}");
         thread::sleep(Duration::from_millis(5));
@@ -222,8 +223,8 @@ fn scenario_mode(receiver: Os, no_cursor: bool) {
     assert_eq!(code.len(), 6);
     sa.request(Request::Accept { accept: true }).unwrap();
     write_request(&db.0, &Request::Accept { accept: true }).unwrap();
-    let mut ab = pa.recv_timeout(Duration::from_secs(5)).unwrap();
-    let mut ba = pb.recv_timeout(Duration::from_secs(5)).unwrap();
+    let mut ab = pa.recv_timeout(Duration::from_secs(30)).unwrap();
+    let mut ba = pb.recv_timeout(Duration::from_secs(30)).unwrap();
     wait("request consumed", || !request_path(&db.0).exists());
     ab.side = Some(Side::Right);
     ab.logitech_channel = 2;
@@ -576,8 +577,8 @@ fn require_control_gates_crossing_both_ways() {
     });
     sa.request(Request::Accept { accept: true }).unwrap();
     sb.request(Request::Accept { accept: true }).unwrap();
-    let mut ab = pa.recv_timeout(Duration::from_secs(5)).unwrap();
-    let mut ba = pb.recv_timeout(Duration::from_secs(5)).unwrap();
+    let mut ab = pa.recv_timeout(Duration::from_secs(30)).unwrap();
+    let mut ba = pb.recv_timeout(Duration::from_secs(30)).unwrap();
     ab.side = Some(Side::Right);
     ab.last_addr = sb.local_addr().to_string();
     ba.side = Some(Side::Left);
@@ -654,8 +655,8 @@ fn app_driven_edges_cross_only_on_request() {
     });
     sa.request(Request::Accept { accept: true }).unwrap();
     sb.request(Request::Accept { accept: true }).unwrap();
-    let mut ab = pa.recv_timeout(Duration::from_secs(5)).unwrap();
-    let mut ba = pb.recv_timeout(Duration::from_secs(5)).unwrap();
+    let mut ab = pa.recv_timeout(Duration::from_secs(30)).unwrap();
+    let mut ba = pb.recv_timeout(Duration::from_secs(30)).unwrap();
     ab.side = Some(Side::Right);
     ab.last_addr = sb.local_addr().to_string();
     ba.side = Some(Side::Left);
@@ -714,8 +715,8 @@ fn files_and_images_travel_with_the_cursor() {
     });
     sa.request(Request::Accept { accept: true }).unwrap();
     sb.request(Request::Accept { accept: true }).unwrap();
-    let mut ab = pa.recv_timeout(Duration::from_secs(5)).unwrap();
-    let mut ba = pb.recv_timeout(Duration::from_secs(5)).unwrap();
+    let mut ab = pa.recv_timeout(Duration::from_secs(30)).unwrap();
+    let mut ba = pb.recv_timeout(Duration::from_secs(30)).unwrap();
     ab.side = Some(Side::Right);
     ab.last_addr = sb.local_addr().to_string();
     ba.side = Some(Side::Left);
@@ -826,9 +827,9 @@ fn a_master_takes_three_subs_and_hands_them_its_layout_and_settings() {
         wait("pairing code", || sm.status().pairing.is_some_and(|p| p.stage == "waiting") && s.status().pairing.is_some());
         sm.request(Request::Accept { accept: true }).unwrap();
         s.request(Request::Accept { accept: true }).unwrap();
-        let mut to_sub = mpairs.recv_timeout(Duration::from_secs(5)).unwrap();
+        let mut to_sub = mpairs.recv_timeout(Duration::from_secs(30)).unwrap();
         assert_eq!(to_sub.role, Role::Sub);
-        let to_master = pairs.recv_timeout(Duration::from_secs(5)).unwrap();
+        let to_master = pairs.recv_timeout(Duration::from_secs(30)).unwrap();
         assert_eq!(to_master.role, Role::Master);
         to_sub.side = Some(side);
         to_sub.last_addr = s.local_addr().to_string();
@@ -838,9 +839,9 @@ fn a_master_takes_three_subs_and_hands_them_its_layout_and_settings() {
         csub.peers = vec![to_master];
         s.update_config(csub).unwrap();
         // The sub learns where it sits (the master is on the opposite side) and the settings.
-        let changed = changes.recv_timeout(Duration::from_secs(5)).unwrap();
+        let changed = changes.recv_timeout(Duration::from_secs(30)).unwrap();
         assert_eq!(changed.side, Some(side.opposite()));
-        let settings = settled.recv_timeout(Duration::from_secs(5)).unwrap();
+        let settings = settled.recv_timeout(Duration::from_secs(30)).unwrap();
         assert!(settings.require_control);
         assert_eq!(settings.cross_delay_ms, 300);
         assert_eq!(settings.app["countdown"], "ring");
@@ -899,8 +900,8 @@ impl Group {
             });
             group.m.svc.request(Request::Accept { accept: true }).unwrap();
             s.request(Request::Accept { accept: true }).unwrap();
-            let mut to_sub = mpairs.recv_timeout(Duration::from_secs(5)).unwrap();
-            let mut to_master = pairs.recv_timeout(Duration::from_secs(5)).unwrap();
+            let mut to_sub = mpairs.recv_timeout(Duration::from_secs(30)).unwrap();
+            let mut to_master = pairs.recv_timeout(Duration::from_secs(30)).unwrap();
             to_sub.last_addr = s.local_addr().to_string();
             to_master.last_addr = group.m.svc.local_addr().to_string();
             group.mcfg.peers.push(to_sub);
@@ -1255,6 +1256,9 @@ fn reconnect_after_a_simulated_pause_redials_at_once() {
     other.update_config(NetConfig { on: false, ..co.clone() }).unwrap();
     wait("link lost", || dialer.status().peers.first().is_some_and(|p| !p.connected));
     thread::sleep(Duration::from_millis(3500));
+    // Back on, the other side dials at once; here it only knows a dead address, so it is
+    // the dialer that has to find it again.
+    for p in &mut co.peers { p.last_addr = "127.0.0.1:9".into(); }
     other.update_config(co).unwrap();
     wait("listening again", || other.status().running);
     assert!(!dialer.status().peers[0].connected, "still waiting out its backoff");
@@ -1346,4 +1350,159 @@ fn idle_listener_rebind_does_not_depend_on_a_self_connection() {
         assert!(service.status().me.error.is_none());
     }
     service.stop();
+}
+
+// ---- turning a side off and on, pausing, unpairing and pairing again ----
+
+/// Like `wait`, with room for a dial backoff or the unpaired-message confirmation.
+fn wait_up_to(label: &str, secs: u64, mut predicate: impl FnMut() -> bool) -> Duration {
+    let start = Instant::now();
+    while !predicate() {
+        assert!(start.elapsed() < Duration::from_secs(secs), "timed out: {label}");
+        thread::sleep(Duration::from_millis(10));
+    }
+    start.elapsed()
+}
+fn linked(s: &Service) -> bool { s.status().peers.first().is_some_and(|p| p.connected) }
+/// Configs of a Windows master and a Mac sub on fixed ports. `sub_smaller`: the sub has the
+/// smaller id, so it is the one that dials. `known`: both already list the other as paired.
+fn win_mac(sub_smaller: bool, known: bool) -> (TempDir, TempDir, NetConfig, NetConfig) {
+    let free = || std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+    let (dm, ds) = loop {
+        let (a, b) = (TempDir::new(), TempDir::new());
+        let (ia, ib) = (Identity::load_or_create(&a.0).unwrap(), Identity::load_or_create(&b.0).unwrap());
+        if (ib.id < ia.id) == sub_smaller { break (a, b); }
+    };
+    let (im, is) = (Identity::load_or_create(&dm.0).unwrap(), Identity::load_or_create(&ds.0).unwrap());
+    let (mut cm, mut cs) = (config(&dm, "A"), config(&ds, "S1"));
+    cm.port = free();
+    cs.port = free();
+    if known {
+        cm.peers.push(PeerConfig { id: is.id, name: "mac".into(), os: Os::Mac, fingerprint: is.fingerprint, side: Some(Side::Right),
+            last_addr: format!("127.0.0.1:{}", cs.port), role: Role::Sub, ..PeerConfig::default() });
+        cs.peers.push(PeerConfig { id: im.id, name: "win".into(), os: Os::Windows, fingerprint: im.fingerprint, side: Some(Side::Left),
+            last_addr: format!("127.0.0.1:{}", cm.port), role: Role::Master, ..PeerConfig::default() });
+    }
+    (dm, ds, cm, cs)
+}
+/// `a` asks to pair with `b`, both accept, and the apps save what their hooks report.
+fn pair_and_save(a: &Service, b: &Service, apairs: &Receiver<PeerConfig>, bpairs: &Receiver<PeerConfig>,
+    ca: &mut NetConfig, cb: &mut NetConfig, label: &str) {
+    a.request(Request::PairAddr { pair_addr: b.local_addr().to_string() }).unwrap();
+    // Both must show this pairing's code: b may still show the last one as "done".
+    let waiting = |s: &Service| s.status().pairing.is_some_and(|p| p.stage == "waiting");
+    wait_up_to(&format!("{label}: codes"), 30, || waiting(a) && waiting(b));
+    a.request(Request::Accept { accept: true }).unwrap();
+    b.request(Request::Accept { accept: true }).unwrap();
+    let to_b = apairs.recv_timeout(Duration::from_secs(30)).unwrap_or_else(|_| panic!("{label}: paired hook"));
+    let to_a = bpairs.recv_timeout(Duration::from_secs(30)).unwrap_or_else(|_| panic!("{label}: paired hook"));
+    ca.peers.retain(|p| p.id != to_b.id);
+    ca.peers.push(to_b);
+    cb.peers.retain(|p| p.id != to_a.id);
+    cb.peers.push(to_a);
+    a.update_config(ca.clone()).unwrap();
+    b.update_config(cb.clone()).unwrap();
+    wait_up_to(&format!("{label}: linked"), 30, || linked(a) && linked(b));
+}
+
+#[test]
+fn a_restarted_or_switched_on_side_links_again_at_once_whichever_id_dials() {
+    for sub_smaller in [true, false] {
+        let (_dm, _ds, cm, cs) = win_mac(sub_smaller, true);
+        let mut m = Service::start(cm.clone(), FakePlatform::new(Os::Windows), Hooks::default()).unwrap();
+        let mut s = Service::start(cs.clone(), FakePlatform::new(Os::Mac), Hooks::default()).unwrap();
+        wait_up_to("first link", 30, || linked(&m) && linked(&s));
+        // The apps stop the service when the network switch goes off and start a new one.
+        s.stop();
+        wait_up_to("master sees the Mac go", 30, || !linked(&m));
+        thread::sleep(Duration::from_millis(1500));
+        s = Service::start(cs.clone(), FakePlatform::new(Os::Mac), Hooks::default()).unwrap();
+        let took = wait_up_to("Mac restarted", 30, || linked(&m) && linked(&s));
+        assert!(took < Duration::from_secs(5), "Mac restart sub_smaller={sub_smaller}: {took:?}");
+        m.stop();
+        wait_up_to("Mac sees the master go", 30, || !linked(&s));
+        thread::sleep(Duration::from_millis(1500));
+        m = Service::start(cm.clone(), FakePlatform::new(Os::Windows), Hooks::default()).unwrap();
+        let took = wait_up_to("master restarted", 30, || linked(&m) && linked(&s));
+        assert!(took < Duration::from_secs(5), "master restart sub_smaller={sub_smaller}: {took:?}");
+        // The same switch through a live config, and pausing, on either side.
+        for (who, svc, cfg) in [("Mac", &s, &cs), ("master", &m, &cm)] {
+            svc.update_config(NetConfig { on: false, ..cfg.clone() }).unwrap();
+            wait_up_to("switched off", 30, || !linked(&m) && !linked(&s));
+            thread::sleep(Duration::from_millis(1500));
+            svc.update_config(cfg.clone()).unwrap();
+            let took = wait_up_to("switched on", 30, || linked(&m) && linked(&s));
+            assert!(took < Duration::from_secs(5), "{who} switched on, sub_smaller={sub_smaller}: {took:?}");
+        }
+        for (who, svc) in [("Mac", &s), ("master", &m)] {
+            let id = svc.status().peers[0].id.clone();
+            svc.request(Request::Pause { pause: id.clone(), paused: true }).unwrap();
+            wait_up_to("paused", 30, || !linked(&m) && !linked(&s));
+            thread::sleep(Duration::from_millis(1500));
+            svc.request(Request::Pause { pause: id, paused: false }).unwrap();
+            let took = wait_up_to("resumed", 30, || linked(&m) && linked(&s));
+            assert!(took < Duration::from_secs(5), "{who} resumed, sub_smaller={sub_smaller}: {took:?}");
+        }
+        m.stop();
+        s.stop();
+    }
+}
+
+#[test]
+fn unpairing_on_either_side_lets_the_two_pair_again() {
+    for (from_sub, sub_smaller) in [(true, true), (true, false), (false, true), (false, false)] {
+        let (_dm, _ds, mut cm, mut cs) = win_mac(sub_smaller, false);
+        let (hm, mpairs, _, munpairs) = hooks();
+        let (hs, spairs, _, sunpairs) = hooks();
+        let m = Service::start(cm.clone(), FakePlatform::new(Os::Windows), hm).unwrap();
+        let s = Service::start(cs.clone(), FakePlatform::new(Os::Mac), hs).unwrap();
+        let label = format!("from_sub={from_sub} sub_smaller={sub_smaller}");
+        pair_and_save(&m, &s, &mpairs, &spairs, &mut cm, &mut cs, &label);
+        let (who, other_forgets) = if from_sub { (&s, &munpairs) } else { (&m, &sunpairs) };
+        who.request(Request::Unpair { unpair: who.status().peers[0].id.clone() }).unwrap();
+        // A sub that unpairs its master once said "master removed", which left the master paired.
+        other_forgets.recv_timeout(Duration::from_secs(30)).unwrap_or_else(|_| panic!("{label}: the other side forgets"));
+        cm.peers.clear();
+        cs.peers.clear();
+        m.update_config(cm.clone()).unwrap();
+        s.update_config(cs.clone()).unwrap();
+        pair_and_save(&m, &s, &mpairs, &spairs, &mut cm, &mut cs, &format!("{label}, again"));
+        m.stop();
+        s.stop();
+    }
+}
+
+#[test]
+fn a_mac_that_unpaired_while_the_master_was_off_can_pair_with_it_again() {
+    for (pair_from_sub, sub_smaller) in [(true, true), (true, false), (false, true)] {
+        let (_dm, _ds, mut cm, mut cs) = win_mac(sub_smaller, false);
+        let (hm, mpairs, _, _munpairs) = hooks();
+        let (hs, spairs, _, _sunpairs) = hooks();
+        let m = Service::start(cm.clone(), FakePlatform::new(Os::Windows), hm).unwrap();
+        let s = Service::start(cs.clone(), FakePlatform::new(Os::Mac), hs).unwrap();
+        pair_and_save(&m, &s, &mpairs, &spairs, &mut cm, &mut cs, "first");
+        // The goodbye never reaches the master: it still holds the Mac as paired.
+        m.stop();
+        wait_up_to("master gone", 30, || !linked(&s));
+        s.request(Request::Unpair { unpair: s.status().peers[0].id.clone() }).unwrap();
+        cs.peers.clear();
+        s.update_config(cs.clone()).unwrap();
+        let (hm, mpairs, _, _munpairs) = hooks();
+        let m = Service::start(cm.clone(), FakePlatform::new(Os::Windows), hm).unwrap();
+        let label = format!("pair_from_sub={pair_from_sub} sub_smaller={sub_smaller}");
+        if pair_from_sub {
+            // The master takes the PairRequest on the link it holds as paired, and the Mac
+            // ignores the master's session traffic meanwhile instead of closing the link.
+            pair_and_save(&s, &m, &spairs, &mpairs, &mut cs, &mut cm, &label);
+        } else {
+            // The Mac refuses each link (ReleaseAll, Bye "unpaired message"); two refusals
+            // ten seconds apart make the master forget it, then it can pair from its side.
+            wait_up_to(&format!("{label}: master forgets"), 30, || m.status().peers.is_empty());
+            cm.peers.clear();
+            m.update_config(cm.clone()).unwrap();
+            pair_and_save(&m, &s, &mpairs, &spairs, &mut cm, &mut cs, &label);
+        }
+        m.stop();
+        s.stop();
+    }
 }
