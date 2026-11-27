@@ -5,7 +5,7 @@ pub const PROTO_VERSION: u32 = 1;
 /// Hello features of this version: Group and KeyRules messages, and Displays (2.2: the
 /// computer's monitors, so layout cells and crossings are per monitor). A message that a
 /// feature stands for is only ever sent to a peer that advertised it.
-pub const FEATURES: [&str; 4] = ["group", "keyrules", "displays", "lang1-toggle"];
+pub const FEATURES: [&str; 5] = ["group", "keyrules", "displays", "lang1-toggle", "pass"];
 pub const MAX_FRAME: usize = 64 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -113,6 +113,22 @@ pub enum Msg {
         pos: f64,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         display: Option<u8>,
+        /// (2.4) The receiver's side to come back at, when the cursor left over another edge
+        /// than the one it came in by (a computer wrapped around by the other one's monitors).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        side: Option<Side>,
+    },
+    /// Controlled to controlling computer (2.4, "pass" feature): the cursor left over an edge
+    /// that has another computer `to` next to it; the receiver moves control there, entering
+    /// over `side` (the sender's exit side) at `pos` along the sender-named monitor `display`
+    /// of `to`, or at `whole` along its whole edge.
+    Pass {
+        to: String,
+        side: Side,
+        pos: f64,
+        whole: f64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        display: Option<u8>,
     },
     /// The sender's monitors (2.2), sorted as `geometry::sorted_displays`. Sent after
     /// the link is paired and whenever they change, only to peers with the "displays" feature.
@@ -205,7 +221,7 @@ mod tests {
         let rules = Msg::KeyRules([("mac>windows".to_string(), crate::DirRules::default())].into());
         let displays = Msg::Displays { rects: vec![crate::Rect::new(0.0, 0.0, 1920.0, 1080.0), crate::Rect::new(1920.0, 0.0, 1280.0, 720.0)] };
         let enter = Msg::Enter { side: Side::Left, pos: 0.25, display: Some(1) };
-        let leave = Msg::Leave { pos: 0.75, display: Some(0) };
+        let leave = Msg::Leave { pos: 0.75, display: Some(0), side: None };
         for msg in [group, rules, displays, enter, leave] {
             let mut bytes = Vec::new();
             write_frame(&mut bytes, &msg).unwrap();
@@ -219,7 +235,7 @@ mod tests {
         let old: Msg = serde_json::from_str(r#"{"type":"Enter","data":{"side":"left","pos":0.5}}"#).unwrap();
         assert_eq!(old, Msg::Enter { side: Side::Left, pos: 0.5, display: None });
         let old: Msg = serde_json::from_str(r#"{"type":"Leave","data":{"pos":0.5}}"#).unwrap();
-        assert_eq!(old, Msg::Leave { pos: 0.5, display: None });
+        assert_eq!(old, Msg::Leave { pos: 0.5, display: None, side: None });
         // A 2.1 peer parses what a 2.2 one sends without a display.
         let json = serde_json::to_string(&Msg::Enter { side: Side::Right, pos: 0.5, display: None }).unwrap();
         assert!(!json.contains("display"), "{json}");

@@ -89,6 +89,14 @@ pub fn keep_hidden(mut next: Vec<Cell>, saved: &[Cell]) -> Vec<Cell> {
     next
 }
 
+/// The cells with only one tile left for computer `id`: its monitor `display` (or, without a
+/// tile for that one, its first tile). The service then places its other monitors next to it
+/// the way they are arranged, as it does for monitors it has not seen before.
+pub fn reset_monitors(cells: &[Cell], id: &str, display: u8) -> Vec<Cell> {
+    let keep = cells.iter().find(|c| c.id == id && c.display == display).or_else(|| cells.iter().find(|c| c.id == id)).cloned();
+    cells.iter().filter(|c| c.id != id).cloned().chain(keep).collect()
+}
+
 /// The known computers that have no cell (peers without a 2.0 side start like this).
 pub fn unplaced<'a>(cells: &[Cell], known: &'a [String]) -> Vec<&'a str> {
     known.iter().filter(|k| !cells.iter().any(|c| &c.id == *k)).map(String::as_str).collect()
@@ -283,6 +291,15 @@ mod tests {
         assert!(move_to(&cells, &known, "a", 0, COLS, 0).is_none());
         assert!(move_to(&cells, &known, "a", 0, 0, ROWS).is_none());
         assert!(move_to(&cells, &known, "ghost", 0, 0, 0).is_none());
+    }
+
+    #[test]
+    fn rereading_the_monitors_keeps_one_tile_of_that_computer_only() {
+        let cells = vec![cell("me", 2, 1), Cell::of_display("a", 0, 0, 1), Cell::of_display("a", 1, 4, 3), cell("b", 3, 0)];
+        assert_eq!(reset_monitors(&cells, "a", 1), vec![cell("me", 2, 1), cell("b", 3, 0), Cell::of_display("a", 1, 4, 3)]);
+        // A monitor without a tile keeps the computer's first tile.
+        assert_eq!(reset_monitors(&cells, "a", 5), vec![cell("me", 2, 1), cell("b", 3, 0), Cell::of_display("a", 0, 0, 1)]);
+        assert_eq!(reset_monitors(&cells, "zzz", 0), cells, "another computer's tiles are left alone");
     }
 
     #[test]
