@@ -23,10 +23,26 @@ curl -fsSL https://github.com/WWhaleFe/flockswitch-linux/releases/latest/downloa
 ### Homebrew
 
 ```sh
+# 설치
 brew install --formula wwhalefe/tap/flockswitch && flockswitch setup
+
+# 업데이트
+brew update && brew upgrade --formula wwhalefe/tap/flockswitch
+
+# 제거 (설정·짝 맺기 정보까지 지운 뒤 Homebrew에서 삭제)
+flockswitch uninstall && brew uninstall --formula wwhalefe/tap/flockswitch
 ```
 
-`flockswitch setup`이 앱 메뉴 항목도 추가하니, 그다음 앱 메뉴에서 flockswitch를 실행하세요. 업데이트(또는 설정 → 일반 → **지금 업데이트**: 승인하면 이 명령을 실행): `brew update && brew upgrade --formula wwhalefe/tap/flockswitch`. 제거: `flockswitch uninstall && brew uninstall --formula wwhalefe/tap/flockswitch`. Homebrew가 없다면 위의 한 줄 설치는 Homebrew 없이 됩니다(Homebrew 설치: [brew.sh](https://brew.sh)).
+`flockswitch setup`이 앱 메뉴 항목도 추가하니, 그다음 앱 메뉴에서 flockswitch를 실행하세요. 업데이트(또는 설정 → 일반 → **지금 업데이트**: 승인하면 이 명령을 실행): `brew update && brew upgrade --formula wwhalefe/tap/flockswitch`. Homebrew가 없다면 위의 한 줄 설치는 Homebrew 없이 됩니다(Homebrew 설치: [brew.sh](https://brew.sh)).
+
+### 제거 (Homebrew 없이 설치한 경우)
+
+```sh
+flockswitch quit; flockswitch uninstall     # 설정·짝 맺기 정보·로그인 시 실행 해제
+rm -f ~/.local/bin/flockswitch ~/.local/share/applications/flockswitch.desktop
+rm -rf ~/.local/share/flockswitch
+sudo rm -f /etc/udev/rules.d/70-flockswitch.rules   # 장치 권한 규칙 (선택)
+```
 
 ### 직접 설치
 
