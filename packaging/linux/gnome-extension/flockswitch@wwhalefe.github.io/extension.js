@@ -107,7 +107,11 @@ export default class FlockswitchHelper extends Extension {
                 new GLib.VariantType('(u)'), Gio.DBusCallFlags.NONE, 1000, null);
             const [pid] = reply.deepUnpack();
             const exe = GLib.file_read_link(`/proc/${pid}/exe`);
-            ok = GLib.path_get_basename(exe) === 'flockswitch';
+            // Installed copies only: install.sh / self-update (~/.local/bin) or Homebrew.
+            const home = GLib.get_home_dir();
+            ok = GLib.path_get_basename(exe) === 'flockswitch' &&
+                (exe === `${home}/.local/bin/flockswitch` ||
+                 /\/Cellar\/flockswitch\/[^/]+\/bin\/flockswitch$/.test(exe));
         } catch (e) {
             ok = false;
         }
@@ -246,19 +250,27 @@ export default class FlockswitchHelper extends Extension {
             const [ax, ay] = global.get_pointer();
             const capture = {sender, actor, grab, anchor: [ax, ay], lastAlive: now(), eventId: 0,
                 watchId: 0, timerId: 0};
-            capture.eventId = global.stage.connect('captured-event', (_a, event) => this._onEvent(event));
-            capture.watchId = Gio.bus_watch_name_on_connection(Gio.DBus.session, sender,
-                Gio.BusNameWatcherFlags.NONE, null, () => this._endCapture(true));
-            capture.timerId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 500, () => {
-                if (now() - capture.lastAlive > KEEPALIVE_MS * 1000) {
-                    capture.timerId = 0;
-                    this._endCapture(true);
-                    return GLib.SOURCE_REMOVE;
-                }
-                return GLib.SOURCE_CONTINUE;
-            });
-            cursorTracker().set_pointer_visible(false);
+            // Recorded at once, so a failure below still gives the grab back.
             this._capture = capture;
+            try {
+                capture.eventId = global.stage.connect('captured-event', (_a, event) => this._onEventSafe(event));
+                capture.watchId = Gio.bus_watch_name_on_connection(Gio.DBus.session, sender,
+                    Gio.BusNameWatcherFlags.NONE, null, () => this._endCapture(true));
+                capture.timerId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 500, () => {
+                    if (now() - capture.lastAlive > KEEPALIVE_MS * 1000) {
+                        capture.timerId = 0;
+                        this._endCapture(true);
+                        return GLib.SOURCE_REMOVE;
+                    }
+                    return GLib.SOURCE_CONTINUE;
+                });
+                cursorTracker().set_pointer_visible(false);
+            } catch (e) {
+                logError(e, 'flockswitch helper: starting the capture');
+                this._endCapture(false);
+                invocation.return_value(new GLib.Variant('(b)', [false]));
+                return;
+            }
         }
         invocation.return_value(new GLib.Variant('(b)', [true]));
     }
@@ -283,15 +295,22 @@ export default class FlockswitchHelper extends Extension {
         if (!c)
             return;
         this._capture = null;
-        if (c.eventId)
-            global.stage.disconnect(c.eventId);
-        if (c.watchId)
-            Gio.bus_unwatch_name(c.watchId);
-        if (c.timerId)
-            GLib.source_remove(c.timerId);
-        Main.popModal(c.grab);
-        c.actor.destroy();
-        cursorTracker().set_pointer_visible(true);
+        // Each step on its own: one failing must not keep the others (above all the grab).
+        const steps = [
+            () => c.eventId && global.stage.disconnect(c.eventId),
+            () => c.watchId && Gio.bus_unwatch_name(c.watchId),
+            () => c.timerId && GLib.source_remove(c.timerId),
+            () => Main.popModal(c.grab),
+            () => c.actor.destroy(),
+            () => cursorTracker().set_pointer_visible(true),
+        ];
+        for (const step of steps) {
+            try {
+                step();
+            } catch (e) {
+                logError(e, 'flockswitch helper: ending the capture');
+            }
+        }
         if (tell)
             this._send(c.sender, 'CaptureEnded', null);
     }
@@ -304,16 +323,37 @@ export default class FlockswitchHelper extends Extension {
         }
     }
 
+    // Never lets an exception hand captured input to the local desktop.
+    _onEventSafe(event) {
+        try {
+            return this._onEvent(event);
+        } catch (e) {
+            logError(e, 'flockswitch helper: captured event');
+            return this._capture ? Clutter.EVENT_STOP : Clutter.EVENT_PROPAGATE;
+        }
+    }
+
     _onEvent(event) {
         const c = this._capture;
         if (!c)
             return Clutter.EVENT_PROPAGATE;
         const type = event.type();
+        // Emergency exit on this computer: Ctrl+Alt+Shift+Escape gives input back.
+        if (type === Clutter.EventType.KEY_PRESS && event.get_key_symbol() === Clutter.KEY_Escape) {
+            const need = Clutter.ModifierType.CONTROL_MASK | Clutter.ModifierType.MOD1_MASK |
+                Clutter.ModifierType.SHIFT_MASK;
+            if ((event.get_state() & need) === need) {
+                this._endCapture(true);
+                return Clutter.EVENT_STOP;
+            }
+        }
         switch (type) {
         case Clutter.EventType.MOTION: {
-            const rel = event.get_relative_motion?.();
-            if (rel && rel[0] && (rel[1] !== 0 || rel[2] !== 0))
-                this._send(c.sender, 'CapturedMotion', new GLib.Variant('(dd)', [rel[1], rel[2]]));
+            // gboolean (dx, dy, ...) on GNOME 45+, older builds give (dx, dy) only.
+            const rel = event.get_relative_motion?.() ?? [];
+            const [dx, dy] = typeof rel[0] === 'boolean' ? (rel[0] ? [rel[1], rel[2]] : [0, 0]) : [rel[0], rel[1]];
+            if (Number.isFinite(dx) && Number.isFinite(dy) && (dx !== 0 || dy !== 0))
+                this._send(c.sender, 'CapturedMotion', new GLib.Variant('(dd)', [dx, dy]));
             // Keep the hidden pointer where the capture began; warps carry no relative motion.
             const [x, y] = global.get_pointer();
             if (x !== c.anchor[0] || y !== c.anchor[1])
