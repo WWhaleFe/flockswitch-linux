@@ -335,7 +335,7 @@ async fn receive(
         CreateSessionOptions, PersistMode,
     };
     let (portal, session) = crate::edge_wayland::within(Duration::from_secs(5), async {
-        let portal = RemoteDesktop::new().await?;
+        let portal = RemoteDesktop::with_connection(crate::edge_wayland::portal_connection().await?).await?;
         let session = portal
             .create_session(CreateSessionOptions::default())
             .await?;
@@ -346,9 +346,16 @@ async fn receive(
         with_session(generation, |session| session.no_answer = true);
         anyhow::anyhow!("RemoteDesktop did not answer")
     })??;
+    // Set once Start has answered, for what becomes of the saved token if this ends first.
+    let path = crate::config::Config::path().with_file_name("remote-desktop.token");
+    let token = crate::net_logic::load_restore_token(&path);
+    let token_settled = std::cell::Cell::new(false);
     let result = async {
-        let path = crate::config::Config::path().with_file_name("remote-desktop.token");
-        let token = std::fs::read_to_string(&path).ok();
+        log::info!(
+            "remote-desktop: SelectDevices (pointer, keyboard; remember until revoked, {})",
+            if token.is_some() { "with the saved restore token: the system should not ask" } else { "no restore token saved: the system asks" }
+        );
+        set_remote_status(&shared, generation, if token.is_some() { "restoring" } else { "asking" });
         portal
             .select_devices(
                 &session,
@@ -363,25 +370,18 @@ async fn receive(
             .start(&session, None, rd::StartOptions::default())
             .await?
             .response()?;
+        let action = crate::net_logic::token_after_start(token.as_deref(), true, response.restore_token());
+        token_settled.set(true);
+        log::info!("{}", crate::net_logic::token_log("remote-desktop", token.is_some(), &action));
+        set_remote_status(&shared, generation, if matches!(action, crate::net_logic::TokenAfterStart::Save(_)) { "remembered" } else { "not-remembered" });
+        if let Err(e) = crate::net_logic::apply_token(&path, &action) {
+            log::warn!("remote-desktop: cannot update the restore token file: {e}");
+        }
         anyhow::ensure!(
             response.devices().contains(DeviceType::Pointer)
                 && response.devices().contains(DeviceType::Keyboard),
             "RemoteDesktop requires pointer and keyboard permission"
         );
-        if let Some(token) = response.restore_token() {
-            use std::{
-                io::Write,
-                os::unix::fs::{OpenOptionsExt, PermissionsExt},
-            };
-            let mut f = std::fs::OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .mode(0o600)
-                .open(&path)?;
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
-            f.write_all(token.as_bytes())?;
-        }
         let fd = portal
             .connect_to_eis(&session, rd::ConnectToEISOptions::default())
             .await?;
@@ -538,8 +538,30 @@ async fn receive(
         futures_util::future::Either::Left((result, _)) => result,
         futures_util::future::Either::Right(((), _)) => Ok(()),
     };
+    if !token_settled.get() {
+        // Cancelled, denied or cut off before Start answered: a token it was asked with
+        // is spent on the portal's side.
+        let action = crate::net_logic::token_after_start(token.as_deref(), false, None);
+        if action != crate::net_logic::TokenAfterStart::Keep {
+            log::info!("remote-desktop: the session ended before Start answered; the saved restore token is spent and removed (the system asks next time)");
+            if let Err(e) = crate::net_logic::apply_token(&path, &action) {
+                log::warn!("remote-desktop: cannot remove the restore token file: {e}");
+            }
+        }
+        set_remote_status(&shared, generation, "");
+    }
+    log::info!("remote-desktop: closing the session");
     let _ = crate::edge_wayland::within(Duration::from_secs(2), session.close()).await;
     result
+}
+
+/// The RemoteDesktop permission for the settings window: "asking", "restoring",
+/// "remembered", "not-remembered", or empty.
+fn set_remote_status(shared: &Shared, generation: u64, note: &str) {
+    if current_start(generation) {
+        let note = note.to_string();
+        shared.set_status(|st| st.remote_desktop = note);
+    }
 }
 struct Emulation {
     connection: reis::event::Connection,

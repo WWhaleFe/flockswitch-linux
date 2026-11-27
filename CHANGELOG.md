@@ -1,5 +1,11 @@
 # Changelog
 
+## 2.1.1 - 2026-11-27
+
+- When crossing cannot start, it no longer retries constantly: it waits 2 s, up to 30 s, before trying again, and shows the reason.
+- Quitting the app, or the app restarting after an update, closes the settings window too.
+- Wayland permission dialogs appear only as often as the system requires. Remote interaction, once remembered, is not asked again (remembered under one app id however flockswitch is started), and reconnecting, unlocking, Find connections again or toggling sharing no longer ask again. On GNOME 50 and older the input capture permission cannot be remembered by the system, so it is asked once when flockswitch starts (only once from GNOME 51). The settings window explains this.
+
 ## 2.1.0 - 2026-11-27
 
 - New settings window: one fixed-size window with a sidebar (Network: Connection and layout, Crossing, Keyboard, Clipboard, This computer; Logitech: Button switching, Shortcut switching, Edge switching, Devices; App: Effects, General) instead of tabs. Pages scroll inside the window, which never changes size; section headers share one height and boxes side by side line up; lime is used only for the "mouse is here" dot and the chosen role. A status card at the foot of the sidebar shows where the mouse is, the network state and the device, and a badge on General shows pending Linux setup items.

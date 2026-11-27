@@ -373,3 +373,27 @@ mod tests {
         assert!(has_hanja(Os::Linux) && !has_hanja(Os::Android));
     }
 }
+
+/// Whether the running flockswitch's input capture is one the system cannot remember
+/// (portal version 1, GNOME 50 and older), from the status file's edge note ("ready:1",
+/// "asking:1", "off:1"). Unknown or another backend: false.
+pub fn input_capture_forgets(backend: &str, note: &str) -> bool {
+    backend == "input-capture"
+        && note.split_once(':').is_some_and(|(code, version)| matches!(code, "ready" | "asking" | "off") && version.trim() == "1")
+}
+
+#[cfg(test)]
+mod portal_note_tests {
+    use super::input_capture_forgets;
+
+    #[test]
+    fn only_version_one_input_capture_forgets() {
+        assert!(input_capture_forgets("input-capture", "ready:1"));
+        assert!(input_capture_forgets("input-capture", "asking:1"));
+        assert!(input_capture_forgets("input-capture", "off:1"));
+        assert!(!input_capture_forgets("input-capture", "ready:2"));
+        assert!(!input_capture_forgets("input-capture", "off"));
+        assert!(!input_capture_forgets("input-capture", "denied"));
+        assert!(!input_capture_forgets("layer-shell", "ready:1"));
+    }
+}

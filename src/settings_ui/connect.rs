@@ -116,6 +116,18 @@ impl SettingsApp {
             }
         }
 
+        // GNOME Wayland: why the system's permission question may come back.
+        if net.on && !super::shots::active() && crate::edge_wayland::session_is_wayland() {
+            if crate::settings_logic::input_capture_forgets(&self.status.edge_backend, &self.status.edge_note) {
+                gap(ui);
+                note_box(ui, p, NoteKind::Info, t.net_portal_every, None);
+            }
+            if self.status.remote_desktop == "not-remembered" {
+                gap(ui);
+                note_box(ui, p, NoteKind::Warn, t.net_portal_not_remembered, None);
+            }
+        }
+
         // The background app that does the sharing is not running.
         // Screenshot mode shows everything healthy.
         let background = super::shots::active() || crate::main_instance_running();

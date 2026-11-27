@@ -46,6 +46,46 @@ pub fn edge_of(side: Side) -> Edge {
     EDGES[side.index()]
 }
 
+/// The D-Bus connection the RemoteDesktop and InputCapture sessions use, with the app id
+/// "flockswitch" registered first (org.freedesktop.host.portal.Registry).
+///
+/// The portal keeps a remembered answer (a restore token) under the caller's app id, and
+/// for a host app it reads that id from how the process was started: "flockswitch" from
+/// the app menu or autostart, nothing from a terminal. A token saved under one id is not
+/// found under the other, and the system asks again. Registering makes the id the same
+/// however flockswitch was started. It must be the first portal call on the connection,
+/// so this connection is used for nothing else. Without the registry (an older portal) the
+/// connection is still fine; the id then comes from how flockswitch was started.
+pub async fn portal_connection() -> Result<ashpd::zbus::Connection, ashpd::Error> {
+    use ashpd::zbus::{self, Connection};
+    static CONNECTION: std::sync::Mutex<Option<Connection>> = std::sync::Mutex::new(None);
+    if let Some(conn) = CONNECTION.lock().unwrap().clone() {
+        return Ok(conn);
+    }
+    let conn = Connection::session().await?;
+    let registered = within(Duration::from_secs(5), async {
+        let registry = zbus::Proxy::new(
+            &conn,
+            "org.freedesktop.portal.Desktop",
+            "/org/freedesktop/portal/desktop",
+            "org.freedesktop.host.portal.Registry",
+        )
+        .await?;
+        let options: std::collections::HashMap<&str, zbus::zvariant::Value<'_>> = std::collections::HashMap::new();
+        registry.call_method("Register", &("flockswitch", options)).await.map(|_| ())
+    })
+    .await;
+    match registered {
+        Some(Ok(())) => log::info!("portal: app id 'flockswitch' registered for the input sessions (remembered answers are kept under it)"),
+        Some(Err(e)) => log::info!(
+            "portal: registering the app id 'flockswitch' failed ({e}); remembered answers are kept under the id the portal takes from how flockswitch was started"
+        ),
+        None => log::info!("portal: the app id registry did not answer; remembered answers are kept under the id the portal takes from how flockswitch was started"),
+    }
+    let mut slot = CONNECTION.lock().unwrap();
+    Ok(slot.get_or_insert(conn).clone())
+}
+
 /// Writes the backend and its state for the settings window.
 pub fn set_status(shared: &Shared, backend: &str, note: &str) {
     let (backend, note) = (backend.to_string(), note.to_string());
@@ -352,6 +392,23 @@ impl Watch {
             }
         }
         sides
+    }
+
+    /// The settings that decide whether input capture is wanted and where, from the
+    /// configuration only (not the live network layout): after a "no" the system is asked
+    /// again only when one of these changes.
+    pub fn ask_key(&self) -> String {
+        let e = &self.cfg.edges;
+        format!(
+            "{:?}",
+            (
+                self.edges_wanted(),
+                self.network_wanted(),
+                self.cfg.logitech_edges_allowed(),
+                (e.left, e.right, e.top, e.bottom),
+                self.cfg.network.peers.iter().map(|p| p.side).collect::<Vec<_>>(),
+            )
+        )
     }
 
     pub fn margin(&self) -> i32 {

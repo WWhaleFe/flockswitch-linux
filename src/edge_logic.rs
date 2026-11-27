@@ -613,9 +613,35 @@ pub fn can_reconfigure(gnome: Option<u32>, portal_is_gnome: bool) -> bool {
     !portal_is_gnome || gnome.is_some_and(|v| v >= 49)
 }
 
+/// Whether the system remembers the answer to its input-capture question: portal
+/// version 2 (CreateSession2 with a restore token; GNOME 51 and later). Version 1 (GNOME
+/// 50 and older) asks for every session.
+pub fn remembers_answer(version: u32) -> bool {
+    version >= 2
+}
+
+/// Whether a session no longer needed (edge switching and network edges off) is kept,
+/// disabled and without barriers, instead of closed: where closing it means asking the
+/// user again later and the barriers can be changed in place.
+pub fn keep_idle_session(version: u32, reconfigure: bool) -> bool {
+    !remembers_answer(version) && reconfigure
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn idle_session_kept_only_where_asking_again_would_follow() {
+        // GNOME 49 and 50: v1, barriers changed in place.
+        assert!(keep_idle_session(1, true));
+        // GNOME 48 and older: the session is made again on every change anyway.
+        assert!(!keep_idle_session(1, false));
+        // GNOME 51 and later: the restore token answers.
+        assert!(!keep_idle_session(2, true));
+        assert!(!remembers_answer(1));
+        assert!(remembers_answer(2));
+    }
 
     fn z(x: i32, y: i32, w: i32, h: i32) -> Zone {
         Zone { x, y, w, h }

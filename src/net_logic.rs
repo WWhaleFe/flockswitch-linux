@@ -404,3 +404,139 @@ mod runtime_tests {
         assert_eq!(sub.edges.corner_margin, 150);
     }
 }
+
+/// A portal restore token as read from its file: trimmed, none when the file is empty.
+/// An empty token would make the portal refuse the whole request.
+pub fn parse_restore_token(text: &str) -> Option<String> {
+    let token = text.trim();
+    (!token.is_empty()).then(|| token.to_string())
+}
+
+/// The saved restore token of a portal ("remote-desktop.token", "input-capture.token").
+pub fn load_restore_token(path: &std::path::Path) -> Option<String> {
+    std::fs::read_to_string(path).ok().as_deref().and_then(parse_restore_token)
+}
+
+/// What becomes of the token file once a portal session has started, or failed to.
+#[derive(Debug, PartialEq, Eq)]
+pub enum TokenAfterStart {
+    /// The portal returned a token: keep it for the next session (the same text when it
+    /// restored the old one, a new one after the user answered).
+    Save(String),
+    /// The saved token is spent: the portal deletes a token's answer as soon as a session
+    /// asks with it, and keeps it again only when that session starts with "remember".
+    Remove,
+    /// Nothing to change.
+    Keep,
+}
+
+/// `used`: the token the session asked with; `started`: Start answered with success;
+/// `returned`: the token in that answer.
+pub fn token_after_start(used: Option<&str>, started: bool, returned: Option<&str>) -> TokenAfterStart {
+    match (started, returned) {
+        (true, Some(token)) if !token.trim().is_empty() => TokenAfterStart::Save(token.trim().to_string()),
+        // Started without a token: the user unticked "remember", or the portal cannot
+        // remember. Started after failing (cancelled, closed, cut off): the token was
+        // looked up, so it is gone on the portal's side either way.
+        _ if used.is_some() => TokenAfterStart::Remove,
+        _ => TokenAfterStart::Keep,
+    }
+}
+
+/// Applies `action` to the token file at `path` (owner-only, replaced in one step).
+pub fn apply_token(path: &std::path::Path, action: &TokenAfterStart) -> std::io::Result<()> {
+    match action {
+        TokenAfterStart::Save(token) => {
+            use std::io::Write;
+            #[cfg(unix)]
+            use std::os::unix::fs::OpenOptionsExt;
+            let tmp = path.with_extension("token.new");
+            let mut options = std::fs::OpenOptions::new();
+            options.write(true).create(true).truncate(true);
+            #[cfg(unix)]
+            options.mode(0o600);
+            let mut f = options.open(&tmp)?;
+            f.write_all(token.as_bytes())?;
+            f.sync_all()?;
+            std::fs::rename(&tmp, path)
+        }
+        TokenAfterStart::Remove => match std::fs::remove_file(path) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
+            _ => Ok(()),
+        },
+        TokenAfterStart::Keep => Ok(()),
+    }
+}
+
+/// Words for the log: what happened to a portal's remembered answer.
+pub fn token_log(portal: &str, used: bool, action: &TokenAfterStart) -> String {
+    match action {
+        TokenAfterStart::Save(_) if used => format!("{portal}: restore token saved again (the remembered answer stays; no question next time)"),
+        TokenAfterStart::Save(_) => format!("{portal}: new restore token saved (the answer is remembered; no question next time)"),
+        TokenAfterStart::Remove => format!("{portal}: no restore token came back, the saved one is spent and removed (the system asks next time)"),
+        TokenAfterStart::Keep => format!("{portal}: no restore token (the answer is not remembered; the system asks next time)"),
+    }
+}
+
+/// Whether the network may ask for the RemoteDesktop permission again after the user
+/// cancelled or denied it: only when they ask for it (looking for computers again).
+/// Settings written while sharing runs (a computer's name, the master's effect settings,
+/// key rules) must not bring the system's question back. Turning sharing off and on
+/// clears the block elsewhere.
+pub fn ask_again_after_deny(reconnect_asked: bool) -> bool {
+    reconnect_asked
+}
+
+#[cfg(test)]
+mod token_tests {
+    use super::*;
+
+    #[test]
+    fn empty_or_padded_token_files() {
+        assert_eq!(parse_restore_token(""), None);
+        assert_eq!(parse_restore_token(" \n"), None);
+        assert_eq!(parse_restore_token("abc\n").as_deref(), Some("abc"));
+    }
+
+    #[test]
+    fn newest_token_is_kept_and_spent_ones_go() {
+        assert_eq!(token_after_start(None, true, Some("new")), TokenAfterStart::Save("new".into()));
+        assert_eq!(token_after_start(Some("old"), true, Some("old")), TokenAfterStart::Save("old".into()));
+        assert_eq!(token_after_start(Some("old"), true, Some("new")), TokenAfterStart::Save("new".into()));
+        // "Remember" unticked: the old token was looked up, so it is spent.
+        assert_eq!(token_after_start(Some("old"), true, None), TokenAfterStart::Remove);
+        // Cancelled, or cut off between SelectDevices and Start.
+        assert_eq!(token_after_start(Some("old"), false, None), TokenAfterStart::Remove);
+        assert_eq!(token_after_start(None, false, None), TokenAfterStart::Keep);
+        assert_eq!(token_after_start(None, true, None), TokenAfterStart::Keep);
+        assert_eq!(token_after_start(None, true, Some("  ")), TokenAfterStart::Keep);
+    }
+
+    #[test]
+    fn token_file_round_trip() {
+        let dir = std::env::temp_dir().join(format!("flockswitch-token-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("remote-desktop.token");
+        apply_token(&path, &TokenAfterStart::Save("t1".into())).unwrap();
+        assert_eq!(load_restore_token(&path).as_deref(), Some("t1"));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+        }
+        apply_token(&path, &TokenAfterStart::Save("t2".into())).unwrap();
+        assert_eq!(load_restore_token(&path).as_deref(), Some("t2"));
+        apply_token(&path, &TokenAfterStart::Keep).unwrap();
+        assert_eq!(load_restore_token(&path).as_deref(), Some("t2"));
+        apply_token(&path, &TokenAfterStart::Remove).unwrap();
+        assert_eq!(load_restore_token(&path), None);
+        apply_token(&path, &TokenAfterStart::Remove).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn only_looking_again_lifts_a_deny() {
+        assert!(ask_again_after_deny(true));
+        assert!(!ask_again_after_deny(false));
+    }
+}
