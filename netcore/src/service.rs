@@ -52,6 +52,9 @@ const DISPLAYS_POLL: Duration = Duration::from_secs(2);
 /// A computer that stayed unlinked this long is also dialled by the side with the larger
 /// id (normally only the smaller one dials), in case the smaller one cannot reach it.
 const FALLBACK_DIAL: Duration = Duration::from_secs(6);
+/// How long a peer that closed the link with Bye "paused" is left alone (unless it dials us
+/// or shows up with other addresses).
+const PEER_PAUSE_QUIET: Duration = Duration::from_secs(60);
 /// Seconds to wait before dial attempt number `attempt` (0 is the first retry). While the
 /// peer advertises itself on the network it is 1, 2, then 4 at most: it is there, so the
 /// next try must not be far off. A peer only known by its saved address backs off to 10.
@@ -196,6 +199,7 @@ impl Service {
             peer_displays: HashMap::new(),
             down_since: HashMap::new(),
             seen_addrs: HashMap::new(),
+            peer_paused_until: HashMap::new(),
             bind_failed: false,
             last_bind_try: None,
         };
@@ -516,12 +520,12 @@ struct Retry {
     next: Instant,
 }
 /// Where the cursor leaves this computer: its monitor (`display`), the monitor it enters on
-/// the other computer (`target`), the position along this monitor's edge (`pos`) and along
+/// the other computer (`target`, None when that has no per-monitor cell to name), the position along this monitor's edge (`pos`) and along
 /// the whole exposed edge (`whole`, what a pre-2.2 peer understands).
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct Exit {
     display: u8,
-    target: u8,
+    target: Option<u8>,
     pos: f64,
     whole: f64,
 }
@@ -623,6 +627,8 @@ struct Control {
     down_since: HashMap<String, Instant>,
     /// The addresses discovery listed per peer the last time, to notice a change.
     seen_addrs: HashMap<String, Vec<SocketAddr>>,
+    /// Peers that ended their link with Bye "paused": not dialled until then.
+    peer_paused_until: HashMap<String, Instant>,
     /// The listener could not be (re)bound: try again from `maintenance`.
     bind_failed: bool,
     last_bind_try: Option<Instant>,
@@ -735,6 +741,7 @@ impl Control {
                 // A computer that just showed up (or came back with other addresses) is
                 // dialled at once, not after the rest of a back-off.
                 for id in track_discovered(&mut self.seen_addrs, &self.discovered) {
+                    self.peer_paused_until.remove(&id);
                     if !self.links.contains_key(&id) && self.retry.remove(&id).is_some() {
                         log::info!("{id} was discovered again: dialling without waiting");
                     }
@@ -1009,6 +1016,7 @@ impl Control {
         } else {
             self.retry.remove(id);
             self.down_since.remove(id);
+            self.peer_paused_until.remove(id);
         }
     }
     fn is_paused(&self, id: &str) -> bool {
@@ -1126,6 +1134,8 @@ impl Control {
                 if !self.config.on || id == self.identity.id {
                     return;
                 }
+                // A peer that dials us is not paused any more.
+                self.peer_paused_until.remove(&id);
                 if let Some(p) = self.config.peers.iter().chain(&self.trusted).find(|p| p.id == id) {
                     // A roster entry vouches for one role; a pairing is pinned by fingerprint.
                     let roster_only = p.via_master && !self.config.peers.iter().any(|q| q.id == id);
@@ -1389,6 +1399,10 @@ impl Control {
                             (self.hooks.on_unpaired)(id);
                         } else {
                             self.disconnect(&id, "bye");
+                            if reason == "paused" {
+                                // The peer paused its side: dialling it again only makes it refuse.
+                                self.peer_paused_until.insert(id, Instant::now() + PEER_PAUSE_QUIET);
+                            }
                         }
                     }
                 }
@@ -1681,17 +1695,27 @@ impl Control {
         self.peer_displays.retain(|id, _| known.contains(id.as_str()));
         self.displays_told.retain(|id, _| known.contains(id.as_str()));
         self.down_since.retain(|id, _| known.contains(id.as_str()));
+        self.peer_paused_until.retain(|id, _| known.contains(id.as_str()));
     }
     /// The open link on the other side of the neighbouring cell on `side`.
     /// The open link of the computer next to monitor `display` of this one on `side`, and
     /// the monitor of it that lies there. A paused computer is skipped.
-    fn neighbour_peer(&self, cells: &[Cell], display: u8, side: Side) -> Option<(String, u8)> {
+    /// The monitor is None unless the layout has a real cell for it and every monitor of that
+    /// computer is placed (see `target_display`).
+    fn neighbour_peer(&self, cells: &[Cell], display: u8, side: Side) -> Option<(String, Option<u8>)> {
         if !self.me_can_send() {
             return None;
         }
         layout::neighbour_of(cells, &self.identity.id, display, side)
             .filter(|(id, _)| self.open(id) && !self.is_paused(id))
-            .map(|(id, d)| (id.to_string(), d))
+            .map(|(id, d)| (id.to_string(), self.target_display(cells, id, d)))
+    }
+    /// The monitor `d` of computer `id` to name in Enter or Leave: only when all its monitors
+    /// have a cell, otherwise the cell may stand for the whole computer (a 2.1 layout, or a
+    /// monitor whose spot was taken) and the whole edge is used.
+    fn target_display(&self, cells: &[Cell], id: &str, d: u8) -> Option<u8> {
+        let placed = cells.iter().filter(|c| c.id == id).count();
+        (placed >= self.display_count(id).unwrap_or(1).max(1)).then_some(d)
     }
     /// The sides that have a connected computer next to any of this computer's monitors.
     fn armed_sides(&self, cells: &[Cell]) -> Vec<Side> {
@@ -1908,7 +1932,7 @@ impl Control {
             .cloned()
             .collect();
         for p in peers {
-            if p.paused {
+            if p.paused || self.peer_paused_until.get(&p.id).is_some_and(|t| *t > Instant::now()) {
                 continue;
             }
             if self.links.contains_key(&p.id) {
@@ -1965,9 +1989,11 @@ impl Control {
         }
         if let State::Controlling { side, pos, display, .. } = old {
             self.platform.stop_capture();
+            let monitors = geometry::sorted_displays(&self.platform.displays()).len();
             match display {
                 // With one monitor both positions are the same point; keep the platform's own way.
-                Some(d) if geometry::sorted_displays(&self.platform.displays()).len() > 1 => {
+                // A monitor that is gone since the crossing falls back to the whole edge.
+                Some(d) if monitors > 1 && usize::from(d) < monitors => {
                     self.platform.place_on_return_display(side, d, pos)
                 }
                 _ => self.platform.place_on_return(side, pos),
@@ -2071,6 +2097,7 @@ impl Control {
                     if let Some(ms) = caps_hold {
                         self.mapper.caps_hold_ms(ms);
                     }
+                    self.mapper.set_lang1_toggle(l.features.iter().any(|f| f == "lang1-toggle"));
                     for event in self.mapper.map(event, self.platform.os(), l.os, &rules, now) {
                         l.send(Msg::Input(event));
                     }
@@ -2123,10 +2150,11 @@ impl Control {
         if let Some(l) = self.links.get(&peer) {
             // Only a peer that knows monitors gets a monitor number; an older one gets the
             // position along the whole edge, as before.
-            l.send(if l.features.iter().any(|f| f == "displays") {
-                Msg::Enter { side, pos: exit.pos, display: Some(exit.target) }
-            } else {
-                Msg::Enter { side, pos: exit.whole, display: None }
+            l.send(match exit.target {
+                Some(target) if l.features.iter().any(|f| f == "displays") => {
+                    Msg::Enter { side, pos: exit.pos, display: Some(target) }
+                }
+                _ => Msg::Enter { side, pos: exit.whole, display: None },
             });
         }
         self.state = State::Controlling {
@@ -2203,7 +2231,7 @@ impl Control {
                 let rect = geometry::sorted_displays(&displays)[usize::from(display)];
                 Exit {
                     display,
-                    target: 0,
+                    target: None,
                     pos: geometry::display_edge_ratio(rect, side, x, y),
                     whole: geometry::edge_ratio(&displays, side, x, y),
                 }
@@ -2214,7 +2242,7 @@ impl Control {
             self.edge_wait = Some((side, since));
             // A platform that only reports a position along the whole edge.
             let (display, along) = geometry::display_for_edge_pos(&displays, side, pos).unwrap_or((0, pos));
-            (Some(Exit { display, target: 0, pos: along, whole: pos }.at(side)), 0.0, 0.0)
+            (Some(Exit { display, target: None, pos: along, whole: pos }.at(side)), 0.0, 0.0)
         } else {
             self.edge_wait = None;
             return;
@@ -2306,7 +2334,7 @@ impl Control {
     fn way_back(&self, cells: &[Cell], peer: &str, display: u8, entered: Side) -> Option<Option<u8>> {
         let me = &self.identity.id;
         match layout::neighbour_of(cells, me, display, entered) {
-            Some((id, d)) if id == peer => Some(Some(d)),
+            Some((id, d)) if id == peer => Some(self.target_display(cells, id, d)),
             _ => {
                 let mine = cells.iter().filter(|c| c.id == *me).count();
                 (mine <= 1 || geometry::sorted_displays(&self.platform.displays()).len() <= 1).then_some(None)
@@ -3384,6 +3412,7 @@ mod tests {
             peer_displays: HashMap::new(),
             down_since: HashMap::new(),
             seen_addrs: HashMap::new(),
+            peer_paused_until: HashMap::new(),
             bind_failed: false,
             last_bind_try: None,
         };
@@ -3392,6 +3421,7 @@ mod tests {
     const MASTER: &str = "aaaaaaaaaaaaaaaa";
     const SUB: &str = "bbbbbbbbbbbbbbbb";
     const OTHER: &str = "cccccccccccccccc";
+    const THIRD: &str = "dddddddddddddddd";
     fn peer(id: &str, role: Role) -> PeerConfig {
         PeerConfig { id: id.into(), fingerprint: id.repeat(4), role, os: Os::Mac, ..PeerConfig::default() }
     }
@@ -3416,7 +3446,7 @@ mod tests {
     }
     fn message(c: &mut Control, id: &str, msg: Msg) { c.event(Event::Message(id.into(), 1, msg)); }
     fn controlling(c: &mut Control, id: &str) { c.state = State::Controlling { peer: id.into(), side: Side::Right, pos: 0.5, display: None }; }
-    fn exit_at(pos: f64) -> Exit { Exit { display: 0, target: 0, pos, whole: pos } }
+    fn exit_at(pos: f64) -> Exit { Exit { display: 0, target: Some(0), pos, whole: pos } }
     fn controlled(c: &mut Control, id: &str) { c.state = State::Controlled { peer: id.into(), entered: Side::Left }; }
     fn roster(c: &Control, sender_allowed: bool) -> Vec<Member> {
         [(MASTER, true), (SUB, sender_allowed), (c.identity.id.as_str(), sender_allowed)].into_iter()
@@ -4096,6 +4126,41 @@ mod tests {
     }
 
     #[test]
+    fn the_toggle_for_a_mac_receiver_is_lang1_only_when_it_advertises_the_feature() {
+        let mut r = rig(Role::Master);
+        r.c.config.peers.push(peer(SUB, Role::Sub));
+        let rx = link(&mut r.c, SUB, Role::Sub);
+        let taps = |rx: &queue::Receiver| -> Vec<u16> {
+            rx.try_iter().filter_map(|m| match m { Msg::Input(InputEvent::Key { usage, down: true }) => Some(usage), _ => None }).collect()
+        };
+        controlling(&mut r.c, SUB);
+        r.c.capture_event(key(keymap::LANG1, true));
+        r.c.capture_event(key(keymap::LANG1, false));
+        assert_eq!(taps(&rx), vec![keymap::LANG1], "2.2 receiver");
+        // A 2.1 mac receiver has no such feature: Caps Lock, as before.
+        r.c.links.get_mut(SUB).unwrap().features = vec!["group".into(), "keyrules".into(), "displays".into()];
+        controlling(&mut r.c, SUB);
+        r.c.capture_event(key(keymap::LANG1, true));
+        r.c.capture_event(key(keymap::LANG1, false));
+        assert_eq!(taps(&rx), vec![0x39], "2.1 receiver");
+    }
+    #[test]
+    fn returning_to_a_monitor_that_is_gone_uses_the_whole_edge() {
+        let mut r = rig(Role::Master);
+        r.c.config.peers.push(peer(SUB, Role::Sub));
+        let _rx = link(&mut r.c, SUB, Role::Sub);
+        two_monitors(&r);
+        r.c.state = State::Controlling { peer: SUB.into(), side: Side::Right, pos: 0.5, display: Some(5) };
+        r.c.local(false);
+        let expected = geometry::edge_position(&r.p.displays(), Side::Right, 0.5).unwrap();
+        assert_eq!(r.p.warps.lock().unwrap().last().copied(), Some(expected));
+        // The default per-monitor placement falls back the same way for an unknown monitor.
+        r.p.warps.lock().unwrap().clear();
+        r.p.place_on_return_display(Side::Left, 9, 0.25);
+        assert_eq!(r.p.warps.lock().unwrap().last().copied(), geometry::edge_position(&r.p.displays(), Side::Left, 0.25));
+    }
+
+    #[test]
     fn input_paths_recheck_send_permission() {
         let mut r = rig(Role::Master);
         let mut p = peer(SUB, Role::Sub);
@@ -4766,11 +4831,12 @@ mod tests {
         // One monitor each: as saved.
         let cells = r.c.my_cells();
         assert_eq!((at(&cells, &me, 0), at(&cells, SUB, 0), cells.len()), (Some((2, 1)), Some((3, 1)), 2));
-        // This computer has two monitors side by side: the second goes to the nearest free cell
-        // to the right of the first, which the peer holds, so above it.
+        // This computer has two monitors side by side and the peer is on its right: the right
+        // monitor keeps the old cell (it faces the peer) and the left one takes the free spot
+        // to its left.
         r.c.my_displays = vec![big(0.0), big(1000.0)];
         let cells = r.c.my_cells();
-        assert_eq!((at(&cells, &me, 0), at(&cells, &me, 1)), (Some((2, 1)), Some((3, 0))));
+        assert_eq!((at(&cells, &me, 0), at(&cells, &me, 1)), (Some((1, 1)), Some((2, 1))));
         // The peer reports two monitors one above the other.
         r.c.peer_displays.insert(SUB.into(), vec![big(0.0), Rect::new(0.0, 1000.0, 1000.0, 1000.0)]);
         let cells = r.c.my_cells();
@@ -4984,6 +5050,110 @@ mod tests {
         assert!(sent(&rx).iter().any(|m| matches!(m, Msg::Leave { display: None, .. })));
     }
 
+    #[test]
+    fn a_monitor_without_a_cell_crosses_with_the_computer_level_neighbour_and_the_whole_edge() {
+        let mut r = rig(Role::Master);
+        let me = r.c.identity.id.clone();
+        r.c.config.peers.push(peer(SUB, Role::Sub));
+        r.c.config.peers.push(peer(OTHER, Role::Sub));
+        r.c.config.peers.push(peer(THIRD, Role::Sub));
+        let rx = link_features(&mut r.c, SUB, Role::Sub, &["group", "keyrules", "displays", "lang1-toggle"]);
+        two_monitors(&r);
+        r.c.refresh_displays();
+        // Both sides of the one cell are taken, so the second monitor has no spot of its own.
+        // The peer's second monitor (below its first) has no free spot either.
+        r.c.config.layout = vec![Cell::new(&me, 2, 1), Cell::new(SUB, 3, 1), Cell::new(OTHER, 1, 1), Cell::new(THIRD, 3, 2)];
+        r.c.peer_displays.insert(SUB.into(), vec![big(0.0), Rect::new(0.0, 1000.0, 1000.0, 1000.0)]);
+        let cells = r.c.my_cells();
+        assert_eq!(cells.iter().filter(|c| c.id == me || c.id == SUB).count(), 2, "{cells:?}");
+        // The right edge of the second monitor still crosses to the neighbour of the cell. The
+        // peer reports two monitors but has one cell: no monitor is named.
+        *r.p.cursor_at.lock().unwrap() = Some((1999.0, 250.0));
+        r.c.poll_cursor();
+        assert!(matches!(r.c.state, State::Controlling { display: Some(1), .. }), "{:?}", r.c.state.peer());
+        let enter = sent(&rx).into_iter().find(|m| matches!(m, Msg::Enter { .. })).unwrap();
+        assert_eq!(enter, Msg::Enter { side: Side::Right, pos: 250.0 / 999.0, display: None });
+        // A peer with one monitor has a real cell: it is named.
+        r.c.local(true);
+        let _ = sent(&rx);
+        r.c.peer_displays.insert(SUB.into(), vec![big(0.0)]);
+        r.c.cross_on_request(Side::Right, 0.5);
+        let enter = sent(&rx).into_iter().find(|m| matches!(m, Msg::Enter { .. })).unwrap();
+        assert!(matches!(enter, Msg::Enter { side: Side::Right, display: Some(0), .. }), "{enter:?}");
+    }
+    #[test]
+    fn a_controlled_monitor_without_a_cell_may_go_back_like_in_2_1() {
+        let mut r = rig(Role::Master);
+        let me = r.c.identity.id.clone();
+        r.c.config.peers.push(peer(SUB, Role::Sub));
+        r.c.config.peers.push(peer(OTHER, Role::Sub));
+        r.c.config.peers.push(peer(THIRD, Role::Sub));
+        let rx = link_features(&mut r.c, SUB, Role::Sub, &["group", "keyrules", "displays"]);
+        two_monitors(&r);
+        r.c.refresh_displays();
+        r.c.config.layout = vec![Cell::new(&me, 1, 1), Cell::new(SUB, 2, 1), Cell::new(OTHER, 0, 1), Cell::new(THIRD, 2, 2)];
+        r.c.peer_displays.insert(SUB.into(), vec![big(0.0), Rect::new(0.0, 1000.0, 1000.0, 1000.0)]);
+        // Entered over the right edge; the cursor is at the right edge of the second monitor,
+        // which has no cell: the peer is the neighbour of the computer's cell on that side.
+        r.c.state = State::Controlled { peer: SUB.into(), entered: Side::Right };
+        r.c.outward = true;
+        *r.p.cursor_at.lock().unwrap() = Some((1999.0, 400.0));
+        r.c.poll_cursor();
+        assert!(matches!(r.c.state, State::Local));
+        let leave = sent(&rx).into_iter().find(|m| matches!(m, Msg::Leave { .. })).unwrap();
+        assert_eq!(leave, Msg::Leave { pos: 400.0 / 999.0, display: None });
+    }
+    #[test]
+    fn a_peer_that_said_paused_is_left_alone_for_a_minute_unless_it_dials() {
+        let mut r = rig(Role::Master);
+        let mut p = peer(SUB, Role::Sub);
+        p.last_addr = "127.0.0.1:9".into();
+        r.c.config.peers.push(p);
+        let _rx = link(&mut r.c, SUB, Role::Sub);
+        message(&mut r.c, SUB, Msg::Bye { reason: "paused".into() });
+        assert!(r.c.links.is_empty());
+        let until = r.c.peer_paused_until[SUB];
+        assert!(until > Instant::now() + Duration::from_secs(50));
+        // Long after, with no back-off left: still not dialled.
+        r.c.down_since.insert(SUB.into(), Instant::now() - Duration::from_secs(60));
+        r.c.retry.clear();
+        r.c.dial_peers();
+        assert!(r.c.workers.is_empty());
+        // Another goodbye does not cause the quiet time.
+        let _rx = link(&mut r.c, SUB, Role::Sub);
+        assert!(!r.c.peer_paused_until.contains_key(SUB), "a link from the peer ends it");
+        message(&mut r.c, SUB, Msg::Bye { reason: "bye".into() });
+        assert!(!r.c.peer_paused_until.contains_key(SUB));
+        // The quiet time runs out.
+        r.c.peer_paused_until.insert(SUB.into(), Instant::now() - Duration::from_secs(1));
+        r.c.down_since.insert(SUB.into(), Instant::now() - Duration::from_secs(60));
+        r.c.retry.clear();
+        r.c.dial_peers();
+        assert_eq!(r.c.workers.len(), 1);
+    }
+    #[test]
+    fn the_paused_bye_after_hello_stays_queued_for_the_closing_link() {
+        let mut r = rig(Role::Master);
+        let mut p = peer(SUB, Role::Sub);
+        p.paused = true;
+        r.c.config.peers.push(p);
+        let (tx, rx) = queue::channel();
+        let cancel = Arc::new(AtomicBool::new(false));
+        r.c.event(Event::Connected(SUB.into(), Link {
+            token: 1, tx, cancel: cancel.clone(), name: SUB.into(), os: Os::Mac,
+            role: Role::Sub, features: vec![], fp: SUB.repeat(4),
+            addr: "127.0.0.1:47160".parse().unwrap(), listen_port: None, outgoing: true, paired: false,
+            last_rx: Instant::now(), up_since: Instant::now(), last_ping: Instant::now(), ping: None, rtt: None,
+            bulk: Arc::new(AtomicUsize::new(0)),
+        }, false));
+        // The dropped link flags the thread, whose goodbye flush still sends what is queued.
+        assert!(cancel.load(Ordering::Acquire));
+        let mut conn = rustls::Connection::Server(rustls::ServerConnection::new(crate::tls::server_config(&r.c.identity).unwrap()).unwrap());
+        let mut out = Vec::new();
+        let mut queued = None;
+        flush_goodbye(&mut conn, &mut out, &rx, &mut queued).unwrap();
+        assert!(!out.is_empty() && rx.try_recv().is_err());
+    }
     // Pause.
     fn recorded_peer_changes(r: &mut Rig) -> Arc<Mutex<Vec<PeerConfig>>> {
         let log = Arc::new(Mutex::new(Vec::new()));

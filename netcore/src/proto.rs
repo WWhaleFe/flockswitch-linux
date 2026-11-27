@@ -5,7 +5,7 @@ pub const PROTO_VERSION: u32 = 1;
 /// Hello features of this version: Group and KeyRules messages, and Displays (2.2: the
 /// computer's monitors, so layout cells and crossings are per monitor). A message that a
 /// feature stands for is only ever sent to a peer that advertised it.
-pub const FEATURES: [&str; 3] = ["group", "keyrules", "displays"];
+pub const FEATURES: [&str; 4] = ["group", "keyrules", "displays", "lang1-toggle"];
 pub const MAX_FRAME: usize = 64 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]

@@ -105,13 +105,29 @@ fn nearest_free(cells: &[Cell], to: (u8, u8)) -> Option<(u8, u8)> {
 }
 /// Adds the monitor cells computer `id` is missing, next to its existing cells and following
 /// the real arrangement: a monitor whose rectangle is right of an already placed one goes to
-/// the right of that one's cell, below goes below, and so on; the first free cell nearest to
-/// that spot is used. `displays` is the computer's monitor list (any order; empty or one
-/// monitor adds nothing). A computer with no cell at all is left alone (the user has not
-/// placed it yet). Cells of monitor numbers beyond the list are not touched.
+/// the right of that one's cell, below goes below, and so on. If that exact spot is taken (or
+/// off the grid) the monitor stays unplaced: it then leaves and is entered with the
+/// computer-level rule of `neighbour_of`. `displays` is the computer's monitor list (any
+/// order; empty or one monitor adds nothing). A computer with no cell at all is left alone
+/// (the user has not placed it yet). Cells of monitor numbers beyond the list are not touched.
+///
+/// A 2.1 layout has one cell per computer, which reads as monitor 0. When that single cell
+/// of a multi-monitor computer has neighbours, it is given to the monitor that faces them if
+/// one clearly does (see `facing_display`), so the other monitors are placed on the free
+/// side. Only a lone cell of monitor 0 is changed this way.
 pub fn auto_place(cells: &[Cell], id: &str, displays: &[Rect]) -> Vec<Cell> {
     let rects = geometry::sorted_displays(displays);
     let mut out = cells.to_vec();
+    if rects.len() > 1 {
+        let own: Vec<usize> = (0..out.len()).filter(|&i| out[i].id == id).collect();
+        if let [i] = own[..] {
+            if out[i].display == 0 {
+                if let Some(d) = facing_display(&out, &out[i], &rects) {
+                    out[i].display = d;
+                }
+            }
+        }
+    }
     for k in 0..rects.len().min(usize::from(u8::MAX) + 1) {
         let k8 = k as u8;
         if out.iter().any(|c| c.id == id && c.display == k8) {
@@ -141,12 +157,40 @@ pub fn auto_place(cells: &[Cell], id: &str, displays: &[Rect]) -> Vec<Cell> {
         } else {
             Side::Top
         };
-        let spot = step((anchor.col, anchor.row), side).unwrap_or((anchor.col, anchor.row));
-        if let Some((col, row)) = nearest_free(&out, spot) {
-            out.push(Cell::of_display(id, k8, col, row));
+        if let Some((col, row)) = step((anchor.col, anchor.row), side) {
+            if !out.iter().any(|c| (c.col, c.row) == (col, row)) {
+                out.push(Cell::of_display(id, k8, col, row));
+            }
         }
     }
     out
+}
+/// The monitor (of the sorted `rects`) that the other computers around `cell` face: for each
+/// side with a neighbour, the monitor furthest out on that side. Some only when every such
+/// side has one clear (strictly furthest) monitor and they are all the same one.
+fn facing_display(cells: &[Cell], cell: &Cell, rects: &[Rect]) -> Option<u8> {
+    let mut found: Option<usize> = None;
+    for side in [Side::Left, Side::Right, Side::Top, Side::Bottom] {
+        let Some(at) = step((cell.col, cell.row), side) else { continue };
+        if !cells.iter().any(|c| (c.col, c.row) == at && c.id != cell.id) {
+            continue;
+        }
+        // Larger is further out on `side`.
+        let out = |r: &Rect| match side {
+            Side::Left => -(r.x + r.width / 2.0),
+            Side::Right => r.x + r.width / 2.0,
+            Side::Top => -(r.y + r.height / 2.0),
+            Side::Bottom => r.y + r.height / 2.0,
+        };
+        let best = rects.iter().map(out).fold(f64::NEG_INFINITY, f64::max);
+        let mut at_best = (0..rects.len()).filter(|&i| (out(&rects[i]) - best).abs() < 1e-6);
+        let (Some(first), None) = (at_best.next(), at_best.next()) else { return None };
+        if found.is_some_and(|f| f != first) {
+            return None;
+        }
+        found = Some(first);
+    }
+    found.and_then(|d| u8::try_from(d).ok())
 }
 /// Drops the cells of monitors that no longer exist. `count` gives a computer's monitor
 /// count, or None when it is not known (then its cells stay). The saved layout keeps them;
@@ -174,13 +218,26 @@ pub fn neighbour<'a>(cells: &'a [Cell], id: &str, side: Side) -> Option<&'a str>
 /// The computer and monitor in the cell next to monitor `display` of `id` on `side`. A
 /// neighbour that is the same computer (another of its own monitors) is no crossing: the
 /// operating system moves the cursor there.
+///
+/// A monitor that has no cell of its own (a 2.1 layout, or a spot that was taken) uses the
+/// computer-level rule of 2.1: the neighbour on that side of any of the computer's cells. If
+/// several cells have a different neighbour there, the cell whose monitor number is closest to
+/// `display` wins (the lower number on a tie), as the missing monitor's own row or column is
+/// not known. None when the computer has no cell at all.
 pub fn neighbour_of<'a>(cells: &'a [Cell], id: &str, display: u8, side: Side) -> Option<(&'a str, u8)> {
-    let me = cells.iter().find(|c| c.id == id && c.display == display)?;
-    let at = step((me.col, me.row), side)?;
+    let next = |me: &Cell| {
+        let at = step((me.col, me.row), side)?;
+        cells.iter().find(|c| (c.col, c.row) == at && c.id != id).map(|c| (c.id.as_str(), c.display))
+    };
+    if let Some(me) = cells.iter().find(|c| c.id == id && c.display == display) {
+        return next(me);
+    }
     cells
         .iter()
-        .find(|c| (c.col, c.row) == at && c.id != id)
-        .map(|c| (c.id.as_str(), c.display))
+        .filter(|c| c.id == id)
+        .filter_map(|c| next(c).map(|n| (c.display, n)))
+        .min_by_key(|(d, _)| (d.abs_diff(display), *d))
+        .map(|(_, n)| n)
 }
 /// The computer next to any monitor of `id` on `side` (the first monitor that has one).
 pub fn neighbour_on_side<'a>(cells: &'a [Cell], id: &str, side: Side) -> Option<&'a str> {
@@ -280,7 +337,7 @@ mod tests {
         assert_eq!(neighbour_of(&cells, "m", 0, Side::Top), Some(("tab", 0)));
         assert_eq!(neighbour_of(&cells, "m", 1, Side::Top), None);
         assert_eq!(neighbour_of(&cells, "lap", 0, Side::Left), Some(("m", 1)));
-        assert_eq!(neighbour_of(&cells, "lap", 1, Side::Left), None, "no such monitor");
+        assert_eq!(neighbour_of(&cells, "lap", 1, Side::Left), Some(("m", 1)), "no cell for this monitor: the computer's cell decides");
         assert_eq!(neighbour_of(&cells, "ghost", 0, Side::Left), None);
         // Display 0 of the old functions.
         assert_eq!(neighbour(&cells, "m", Side::Top), Some("tab"));
@@ -375,13 +432,19 @@ mod tests {
         assert_eq!((at(&cells, "a", 1), at(&cells, "a", 2)), (Some((1, 0)), Some((2, 0))));
     }
     #[test]
-    fn auto_placement_takes_the_nearest_free_cell_and_leaves_others_alone() {
-        // The spot right of the monitor is taken: the nearest free cell is used.
+    fn auto_placement_only_uses_the_exact_spot_and_leaves_others_alone() {
+        // The spot right of the monitor is taken (and the lone cell has a neighbour on the
+        // right, so the right monitor keeps it): the left monitor goes to the free spot left.
         let before = [cell("a", 1, 1), cell("b", 2, 1)];
         let cells = auto_place(&before, "a", &[rect(0.0, 0.0), rect(100.0, 0.0)]);
-        assert_eq!(cells[..2], before);
-        assert_eq!(at(&cells, "a", 1), Some((2, 0)));
+        assert_eq!((at(&cells, "a", 1), at(&cells, "a", 0)), (Some((1, 1)), Some((0, 1))));
+        // The spot is taken and there is no way to give the cell to another monitor: unplaced.
+        let before = [cell("a", 1, 1), cell("b", 2, 1), cell("c", 0, 1)];
+        let cells = auto_place(&before, "a", &[rect(0.0, 0.0), rect(100.0, 0.0)]);
+        assert_eq!(cells.iter().filter(|c| c.id == "a").count(), 1, "{cells:?}");
+        assert_eq!(cells.len(), 3);
         // A computer that is not placed yet, one monitor, a complete set and a full grid change nothing.
+        let before = [cell("a", 1, 1), cell("b", 4, 3)];
         assert_eq!(auto_place(&before, "zzz", &[rect(0.0, 0.0), rect(100.0, 0.0)]), before);
         assert_eq!(auto_place(&before, "a", &[rect(0.0, 0.0)]), before);
         assert_eq!(auto_place(&before, "a", &[]), before);
@@ -389,11 +452,53 @@ mod tests {
         assert_eq!(auto_place(&two, "a", &[rect(0.0, 0.0), rect(100.0, 0.0)]), two);
         let full: Vec<_> = (0..ROWS).flat_map(|row| (0..COLS).map(move |col| cell(&format!("p{col}{row}"), col, row))).collect();
         assert_eq!(auto_place(&full, "p00", &[rect(0.0, 0.0), rect(100.0, 0.0)]), full);
-        // At the grid edge the step falls back to the nearest free cell.
+        // At the grid edge there is no spot: the monitor stays unplaced.
         let cells = auto_place(&[cell("a", 5, 0)], "a", &[rect(0.0, 0.0), rect(100.0, 0.0)]);
-        assert_eq!(at(&cells, "a", 1), Some((4, 0)));
+        assert_eq!(cells, vec![cell("a", 5, 0)]);
         // The result is always a valid layout.
         assert_eq!(valid_cells(&cells), cells);
+    }
+    #[test]
+    fn the_lone_cell_goes_to_the_monitor_that_faces_the_neighbours() {
+        let two = [rect(0.0, 0.0), rect(100.0, 0.0)];
+        // Master M with two monitors, a sub S on the right (the 2.1 layout of the bug report).
+        let cells = auto_place(&[cell("m", 2, 1), cell("s", 3, 1)], "m", &two);
+        assert_eq!((at(&cells, "m", 1), at(&cells, "m", 0)), (Some((2, 1)), Some((1, 1))));
+        assert_eq!(at(&cells, "s", 0), Some((3, 1)));
+        // S on the left: monitor 0 keeps the cell, monitor 1 goes to the free spot on its right.
+        let cells = auto_place(&[cell("m", 2, 1), cell("s", 1, 1)], "m", &two);
+        assert_eq!((at(&cells, "m", 0), at(&cells, "m", 1)), (Some((2, 1)), Some((3, 1))));
+        // Neighbours on both sides, or none: nothing clearly faces them, the cell stays monitor 0.
+        let cells = auto_place(&[cell("m", 2, 1), cell("s", 1, 1), cell("t", 3, 1)], "m", &two);
+        assert_eq!(at(&cells, "m", 0), Some((2, 1)));
+        assert_eq!(at(&cells, "m", 1), None, "both neighbouring spots are taken");
+        let cells = auto_place(&[cell("m", 2, 1)], "m", &two);
+        assert_eq!((at(&cells, "m", 0), at(&cells, "m", 1)), (Some((2, 1)), Some((3, 1))));
+        // Stacked monitors with a neighbour on the right: no monitor is further right.
+        let cells = auto_place(&[cell("m", 2, 1), cell("s", 3, 1)], "m", &[rect(0.0, 0.0), rect(0.0, 100.0)]);
+        assert_eq!((at(&cells, "m", 0), at(&cells, "m", 1)), (Some((2, 1)), Some((2, 2))));
+        // Above: the upper monitor (index 0) faces it.
+        let cells = auto_place(&[cell("m", 2, 1), cell("s", 2, 0)], "m", &[rect(0.0, 0.0), rect(0.0, 100.0)]);
+        assert_eq!((at(&cells, "m", 0), at(&cells, "m", 1)), (Some((2, 1)), Some((2, 2))));
+        // A cell that already names a monitor, or a complete set, is never reassigned.
+        let cells = auto_place(&[mon("m", 1, 2, 1), cell("s", 3, 1)], "m", &two);
+        assert_eq!((at(&cells, "m", 1), at(&cells, "m", 0)), (Some((2, 1)), Some((1, 1))));
+    }
+    #[test]
+    fn a_monitor_without_a_cell_uses_the_computer_level_neighbour() {
+        // m has one cell, so both its monitors cross to the neighbour of that cell.
+        let cells = [cell("m", 2, 1), cell("s", 3, 1), cell("t", 2, 0)];
+        assert_eq!(neighbour_of(&cells, "m", 1, Side::Right), Some(("s", 0)));
+        assert_eq!(neighbour_of(&cells, "m", 5, Side::Top), Some(("t", 0)));
+        assert_eq!(neighbour_of(&cells, "m", 1, Side::Left), None);
+        assert_eq!(neighbour_of(&cells, "ghost", 1, Side::Left), None);
+        // Several cells with different neighbours: the closest monitor number decides.
+        let cells = [mon("m", 0, 1, 1), mon("m", 2, 3, 1), cell("l", 0, 1), cell("r", 4, 1), cell("u", 1, 0), cell("v", 3, 0)];
+        assert_eq!(neighbour_of(&cells, "m", 1, Side::Top), Some(("u", 0)), "tie goes to the lower monitor");
+        assert_eq!(neighbour_of(&cells, "m", 3, Side::Top), Some(("v", 0)));
+        assert_eq!(neighbour_of(&cells, "m", 1, Side::Right), Some(("r", 0)), "only monitor 2's cell has one");
+        // A monitor with a cell of its own never borrows another's neighbour.
+        assert_eq!(neighbour_of(&cells, "m", 0, Side::Right), None);
     }
     #[test]
     fn the_master_gets_a_cell_for_every_monitor() {

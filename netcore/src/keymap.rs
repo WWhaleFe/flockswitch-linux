@@ -207,10 +207,13 @@ fn tap(usage: u16) -> [InputEvent; 2] {
 fn with_mod(modifier: u16, usage: u16) -> Vec<InputEvent> {
     vec![key(modifier, true), key(usage, true), key(usage, false), key(modifier, false)]
 }
-/// One tap of the receiving side's Korean/English key.
-fn hangul_tap(dst: HangulKey) -> Vec<InputEvent> {
+/// One tap of the receiving side's Korean/English key. `mac_lang1`: the receiver is a Mac that
+/// understands the "lang1-toggle" feature, so its Caps Lock choice is sent as Lang1 and the
+/// real Caps Lock key stays free.
+fn hangul_tap(dst: HangulKey, mac_lang1: bool) -> Vec<InputEvent> {
     match dst {
         HangulKey::Lang1 => tap(LANG1).into(),
+        HangulKey::CapsLock if mac_lang1 => tap(LANG1).into(),
         HangulKey::CapsLock => tap(CAPS).into(),
         HangulKey::RightAlt => tap(RALT).into(),
         HangulKey::ShiftSpace => with_mod(LSHIFT, SPACE),
@@ -263,11 +266,15 @@ pub(crate) struct KeyMapper {
     restored: HashSet<u16>,
     caps: Option<Caps>,
     caps_hold_ms: Option<u64>,
+    /// The receiver advertised "lang1-toggle" (set by the service before each event).
+    lang1_toggle: bool,
 }
 struct Ctx<'a> {
     src: Os,
     dst: Os,
     rules: &'a DirRules,
+    /// The receiver is a Mac that takes Lang1 as its Korean/English toggle.
+    mac_lang1: bool,
     /// Modifiers `around` lifted and put back during this call.
     lifted: std::cell::RefCell<Vec<u16>>,
 }
@@ -318,10 +325,15 @@ fn is_kind(usage: u16, kind: u16) -> bool {
 }
 impl KeyMapper {
     pub(crate) fn map(&mut self, event: InputEvent, src: Os, dst: Os, rules: &DirRules, now: Instant) -> Vec<InputEvent> {
-        let cx = Ctx { src, dst, rules, lifted: Default::default() };
+        let cx = Ctx { src, dst, rules, mac_lang1: dst == Os::Mac && self.lang1_toggle, lifted: Default::default() };
         let out = self.map_with(event, &cx, now);
         self.restored.extend(cx.lifted.take());
         out
+    }
+    /// Whether the receiver advertised "lang1-toggle": a Mac receiver then gets the
+    /// Korean/English toggle as Lang1 instead of Caps Lock.
+    pub(crate) fn set_lang1_toggle(&mut self, on: bool) {
+        self.lang1_toggle = on;
     }
     /// A modifier that was already down when the capture began counts as used: letting go
     /// of it alone is masked like one pressed again after a chord.
@@ -344,7 +356,7 @@ impl KeyMapper {
                 let hold = self.caps_hold_ms.take();
                 match self.caps.take() {
                     Some(Caps::Pending(at)) if hold.map(Duration::from_millis).unwrap_or_else(|| at.elapsed_at(now)) >= CAPS_LONG_PRESS => return tap(CAPS).into(),
-                    Some(Caps::Pending(_)) => return cx.around(&self.live(), |_| true, hangul_tap(rules.hangul_dst)),
+                    Some(Caps::Pending(_)) => return cx.around(&self.live(), |_| true, hangul_tap(rules.hangul_dst, cx.mac_lang1)),
                     Some(Caps::Real) => return vec![key(CAPS, false)],
                     None => {}
                 }
@@ -425,7 +437,7 @@ impl KeyMapper {
                 return Some(vec![]);
             }
             self.swallow.insert(usage);
-            return Some(cx.around(&held, |u| u != usage, hangul_tap(dst)));
+            return Some(cx.around(&held, |u| u != usage, hangul_tap(dst, cx.mac_lang1)));
         }
         let chord = if listed(HangulKey::ShiftSpace) && mods.only(false, true, false, false) {
             HangulKey::ShiftSpace
@@ -442,7 +454,7 @@ impl KeyMapper {
             HangulKey::ControlSpace => is_kind(u, 0),
             _ => is_kind(u, 3),
         };
-        Some(cx.around(&held, lift, hangul_tap(dst)))
+        Some(cx.around(&held, lift, hangul_tap(dst, cx.mac_lang1)))
     }
     /// Hanja, navigation and capture chords. These match on the source keys, so they
     /// come before the modifier table, and write destination keys directly.
@@ -1311,7 +1323,7 @@ mod rules_tests {
             let mapped = map_modifier(src, dst, &rules, modifier);
             let mapped_right = map_modifier(src, dst, &rules, modifier + 4);
             let mut expected = vec![k(mapped, true), k(mapped_right, true), k(mapped, false), k(mapped_right, false)];
-            expected.extend(hangul_tap(chord));
+            expected.extend(hangul_tap(chord, false));
             expected.extend([k(mapped, true), k(mapped_right, true), k(4, true), k(4, false), k(mapped, false), k(mapped_right, false)]);
             let out = run_at(src, dst, &rules, vec![k(modifier, true), k(modifier + 4, true), k(LANG1, true), k(LANG1, true),
                 k(LANG1, false), k(4, true), k(4, false), k(modifier, false), k(modifier + 4, false)]);
@@ -1422,9 +1434,14 @@ mod rules_tests {
     }
     /// Plays `input` through the mapper and checks what the receiver sees: how many times the
     /// toggle happened, and that nothing stays held afterwards (key state is simulated).
-    fn toggles_and_stuck_keys(src: Os, dst: Os, rules: &DirRules, input: Vec<InputEvent>) -> (usize, Vec<u16>) {
-        let (usage, modifier) = toggle_signal(rules.hangul_dst);
+    fn toggles_and_stuck_keys(src: Os, dst: Os, rules: &DirRules, input: Vec<InputEvent>, lang1_toggle: bool) -> (usize, Vec<u16>) {
+        let (usage, modifier) = match toggle_signal(rules.hangul_dst) {
+            // A Mac receiver that advertised "lang1-toggle" gets Lang1 instead of Caps Lock.
+            (CAPS, None) if lang1_toggle && dst == Os::Mac => (LANG1, None),
+            other => other,
+        };
         let mut m = KeyMapper::default();
+        m.set_lang1_toggle(lang1_toggle);
         let t0 = Instant::now();
         let mut held: HashSet<u16> = HashSet::new();
         let mut toggles = 0;
@@ -1475,17 +1492,20 @@ mod rules_tests {
             ];
             for (name, input) in cases {
                 let twice = name.ends_with("twice");
-                let (toggles, stuck) = toggles_and_stuck_keys(src, dst, &rules, input);
-                assert_eq!(toggles, if twice { 2 } else { 1 }, "{src:?}>{dst:?}: {name}");
-                assert!(stuck.is_empty(), "{src:?}>{dst:?}: {name} leaves {stuck:?} held");
-                checked += 1;
+                // Without the feature (a 2.1 receiver) and with it.
+                for lang1 in [false, true] {
+                    let (toggles, stuck) = toggles_and_stuck_keys(src, dst, &rules, input.clone(), lang1);
+                    assert_eq!(toggles, if twice { 2 } else { 1 }, "{src:?}>{dst:?}: {name} (lang1-toggle {lang1})");
+                    assert!(stuck.is_empty(), "{src:?}>{dst:?}: {name} leaves {stuck:?} held");
+                    checked += 1;
+                }
             }
             // Plain typing (a letter, Shift+letter, Space without Shift) never toggles.
             let typing = vec![k(4, true), k(4, false), k(LSHIFT, true), k(4, true), k(4, false), k(LSHIFT, false), k(SPACE, true), k(SPACE, false)];
-            let (toggles, stuck) = toggles_and_stuck_keys(src, dst, &rules, typing);
+            let (toggles, stuck) = toggles_and_stuck_keys(src, dst, &rules, typing, true);
             assert_eq!((toggles, stuck.is_empty()), (0, true), "{src:?}>{dst:?}: typing");
         }
-        assert_eq!(checked, 9 * 6);
+        assert_eq!(checked, 9 * 6 * 2);
     }
     #[test]
     fn shift_space_to_a_receiver_that_toggles_on_shift_space_is_sent_once() {
@@ -1517,5 +1537,36 @@ mod rules_tests {
             let usual = if src == Os::Mac { 0x39 } else { LANG1 };
             assert_eq!(run_at(src, dst, &rules, taps(usual)), expected, "{src:?}>{dst:?}");
         }
+    }
+    fn run_lang1(src: Os, dst: Os, rules: &DirRules, input: Vec<InputEvent>) -> Vec<InputEvent> {
+        let mut mapper = KeyMapper::default();
+        mapper.set_lang1_toggle(true);
+        let now = Instant::now();
+        input.into_iter().flat_map(|e| mapper.map(e, src, dst, rules, now)).collect()
+    }
+    #[test]
+    fn a_mac_receiver_with_lang1_toggle_gets_lang1_and_keeps_real_caps_lock() {
+        // 2.2 receiver: the toggle is a Lang1 tap, from every sender key; 2.1 keeps Caps Lock.
+        for src in [Os::Windows, Os::Linux] {
+            let rules = DirRules::default_for(src, Os::Mac);
+            assert_eq!(run_lang1(src, Os::Mac, &rules, taps(LANG1)), taps(LANG1), "{src:?}");
+            assert_eq!(run_at(src, Os::Mac, &rules, taps(LANG1)), taps(0x39), "{src:?} to a 2.1 mac");
+            let chord = vec![k(LSHIFT, true), k(SPACE, true), k(SPACE, false), k(LSHIFT, false)];
+            let out = run_lang1(src, Os::Mac, &rules, chord.clone());
+            assert!(out.contains(&k(LANG1, true)) && !out.contains(&k(0x39, true)), "{out:?}");
+        }
+        // Real Caps Lock stays 0x39: the long press from a mac sender, and a Caps Lock that
+        // is not a listed toggle key.
+        let rules = DirRules::default_for(Os::Mac, Os::Mac);
+        let mut m = KeyMapper::default();
+        m.set_lang1_toggle(true);
+        let t0 = Instant::now();
+        let mut out = m.map(k(0x39, true), Os::Mac, Os::Mac, &rules, t0);
+        out.extend(m.tick(t0 + Duration::from_millis(300)));
+        out.extend(m.map(k(0x39, false), Os::Mac, Os::Mac, &rules, t0 + Duration::from_millis(500)));
+        assert!(out.iter().all(|e| matches!(e, InputEvent::Key { usage: 0x39, .. })), "{out:?}");
+        // Other receivers are not affected by the flag.
+        let rules = DirRules::default_for(Os::Mac, Os::Windows);
+        assert_eq!(run_lang1(Os::Mac, Os::Windows, &rules, taps(0x39)), taps(LANG1));
     }
 }

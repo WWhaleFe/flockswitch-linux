@@ -90,8 +90,9 @@ pub trait Platform: Send + Sync + 'static {
     /// `side` edge of monitor `display` (see `geometry::sorted_displays`). The service only
     /// calls this when there are two or more monitors; with one it calls `place_on_return`.
     fn place_on_return_display(&self, side: Side, display: u8, pos: f64) {
-        if let Some((x, y)) = geometry::display_edge_position(&self.displays(), display, side, pos) {
-            self.warp(x, y);
+        match geometry::display_edge_position(&self.displays(), display, side, pos) {
+            Some((x, y)) => self.warp(x, y),
+            None => self.place_on_return(side, pos),
         }
     }
     fn start_capture(&self, sink: Sender<InputEvent>) -> anyhow::Result<()>;
