@@ -284,7 +284,7 @@ mod tests {
             following: None,
             layout: vec![],
             reconnecting: false,
-            keys: Default::default(),
+            keys: Default::default(), key_check: None,
         };
         assert_eq!(NetState::of(&config, None), NetState::Off);
         assert_eq!(NetState::of(&config, Some(&status("local", None))), NetState::Idle);
@@ -312,7 +312,7 @@ mod tests {
                 flock_net::Cell::new("p2", 2, 1),
             ],
             reconnecting: false,
-            keys: Default::default(),
+            keys: Default::default(), key_check: None,
         }
     }
 

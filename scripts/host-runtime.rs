@@ -287,3 +287,8 @@ mod edge {
         assert_eq!(run_watcher(crate::shared::Wake::Unchanged), vec![2]);
     }
 }
+
+/// The tray app's window starters, which the network hooks call.
+mod tray {
+    pub fn open_key_check_window() {}
+}

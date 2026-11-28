@@ -471,6 +471,11 @@ pub fn open_settings_page(page: &str) {
     start_settings(&["settings", page]);
 }
 
+/// The key check window (opened by the network service on a master).
+pub fn open_key_check_window() {
+    start_settings(&["keycheck"]);
+}
+
 fn start_settings(args: &[&str]) {
     match std::env::current_exe() {
         Ok(exe) => match std::process::Command::new(exe).args(args).spawn() {
