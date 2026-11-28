@@ -197,6 +197,85 @@ pub fn map_modifier(src: Os, dst: Os, rules: &DirRules, usage: u16) -> u16 {
     LCTRL + right + to
 }
 
+/// What `os` calls the key with HID usage `usage` (for the key check window): "Command" on
+/// a Mac is "Win" on Windows and "Super" on Linux. Right-hand modifiers start with "R ".
+pub fn key_name(usage: u16, os: Os) -> String {
+    let mac = os == Os::Mac;
+    let named = match usage {
+        0x04..=0x1d => return char::from(b'A' + (usage - 0x04) as u8).to_string(),
+        0x1e..=0x26 => return char::from(b'1' + (usage - 0x1e) as u8).to_string(),
+        0x27 => "0",
+        0x28 => if mac { "Return" } else { "Enter" },
+        0x29 => "Esc",
+        0x2a => if mac { "Delete" } else { "Backspace" },
+        0x2b => "Tab",
+        0x2c => "Space",
+        0x2d => "-",
+        0x2e => "=",
+        0x2f => "[",
+        0x30 => "]",
+        0x31 | 0x64 => "\\",
+        0x33 => ";",
+        0x34 => "'",
+        0x35 => "`",
+        0x36 => ",",
+        0x37 => ".",
+        0x38 => "/",
+        0x39 => "Caps Lock",
+        0x3a..=0x45 => return format!("F{}", usage - 0x39),
+        0x46 => "Print Screen",
+        0x47 => "Scroll Lock",
+        0x48 => "Pause",
+        0x49 => "Insert",
+        0x4a => "Home",
+        0x4b => "Page Up",
+        0x4c => if mac { "Forward Delete" } else { "Delete" },
+        0x4d => "End",
+        0x4e => "Page Down",
+        0x4f => "→",
+        0x50 => "←",
+        0x51 => "↓",
+        0x52 => "↑",
+        0x53 => "Num Lock",
+        0x54 => "Num /",
+        0x55 => "Num *",
+        0x56 => "Num -",
+        0x57 => "Num +",
+        0x58 => "Num Enter",
+        0x59..=0x61 => return format!("Num {}", usage - 0x58),
+        0x62 => "Num 0",
+        0x63 => "Num .",
+        0x65 => "Menu",
+        0x68..=0x73 => return format!("F{}", usage - 0x68 + 13),
+        LANG1 => "한/영",
+        LANG2 => "한자",
+        LCTRL..=0xe7 => {
+            let right = if usage >= 0xe4 { "R " } else { "" };
+            let name = match ((usage - LCTRL) % 4, os) {
+                (0, Os::Mac) => "Control",
+                (0, _) => "Ctrl",
+                (1, _) => "Shift",
+                (2, Os::Mac) => "Option",
+                (2, _) => "Alt",
+                (_, Os::Mac) => "Command",
+                (_, Os::Windows) => "Win",
+                (_, Os::Linux) => "Super",
+                (_, Os::Android) => "Meta",
+            };
+            return format!("{right}{name}");
+        }
+        _ => return format!("0x{usage:02x}"),
+    };
+    named.to_string()
+}
+/// `usage` with the modifiers in `held` before it ("Ctrl+Shift+S"), in `os` names.
+pub fn chord_name(held: &HashSet<u16>, usage: u16, os: Os) -> String {
+    let mut parts: Vec<String> = (LCTRL..=0xe7).filter(|m| held.contains(m) && *m != usage).map(|m| key_name(m, os)).collect();
+    parts.dedup();
+    parts.push(key_name(usage, os));
+    parts.join("+")
+}
+
 fn key(usage: u16, down: bool) -> InputEvent {
     InputEvent::Key { usage, down }
 }

@@ -94,6 +94,8 @@ impl SettingsApp {
             self.keys_cmp = true;
         }
         gap(ui);
+        self.key_check_card(ui, t, p);
+        gap(ui);
         section_head(ui, p, t.keys_section, None, |ui| head_note(ui, t.keys_section_note, p.muted));
         card_pad(ui, p, |ui| {
             // One switch for every direction leaving this computer; the table below follows it.
@@ -324,6 +326,38 @@ impl SettingsApp {
     }
 
     /// "Keys and shortcuts by system": tables of what each system calls what, and its everyday shortcuts.
+    /// "Check key mapping": opens the check window on the master; on a sub it also tests
+    /// this keyboard until Esc.
+    fn key_check_card(&mut self, ui: &mut Ui, t: &Texts, p: Palette) {
+        let status = self.net_status.as_ref();
+        let probing = status.and_then(|s| s.key_check.as_ref()).is_some_and(|k| k.probing);
+        let sub = self.cfg.network.role == flock_net::Role::Sub;
+        // A sub needs its master connected (the service ignores the request otherwise).
+        let master_here = !sub
+            || status.is_some_and(|s| s.peers.iter().any(|peer| !peer.via_master && peer.connected && peer.keyrules));
+        card_pad(ui, p, |ui| {
+            ui.horizontal(|ui| {
+                let text_w = (ui.available_width() - button_width(ui, t.keycheck_button, ButtonKind::Plain) - 16.0).max(120.0);
+                ui.allocate_ui(Vec2::new(text_w, 0.0), |ui| {
+                    ui.label(RichText::new(t.keycheck_card).size(13.0).color(p.text));
+                });
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if button(ui, p, t.keycheck_button, ButtonKind::Plain).clicked() {
+                        if master_here {
+                            self.net_request(flock_net::Request::Action { action: "keycheck_open".into() });
+                        } else {
+                            self.error = Some(t.keycheck_no_master.into());
+                        }
+                    }
+                });
+            });
+            if probing && sub {
+                ui.add_space(8.0);
+                note_box(ui, p, NoteKind::Info, t.keycheck_sub_probing, None);
+            }
+        });
+    }
+
     pub(super) fn keycmp_window(&mut self, ctx: &egui::Context, t: &Texts) {
         if !self.keys_cmp {
             return;

@@ -44,6 +44,8 @@ const PAGE_PADDING: Vec2 = Vec2::new(28.0, 22.0);
 const SECTION_HEAD: f32 = 32.0;
 
 mod connect;
+mod keycheck;
+pub use keycheck::run as keycheck_run;
 mod keys;
 mod logitech;
 mod setup_ui;

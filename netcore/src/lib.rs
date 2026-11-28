@@ -148,6 +148,9 @@ pub struct Hooks {
     pub persist_key_rules: Box<dyn Fn(&BTreeMap<String, DirRules>) -> anyhow::Result<()> + Send + Sync>,
     /// On a master: edited key rules were accepted and persisted.
     pub on_key_rules: Box<dyn Fn(BTreeMap<String, DirRules>) + Send + Sync>,
+    /// On a master: a key check was asked for (here or by a sub). The app opens the key
+    /// check window, which shows `Status::key_check` and sends "keycheck_close" when closed.
+    pub open_key_check: Box<dyn Fn() + Send + Sync>,
 }
 impl Default for Hooks {
     fn default() -> Self {
@@ -159,6 +162,7 @@ impl Default for Hooks {
             on_master_settings: Box::new(|_| {}),
             on_key_rules: Box::new(|_| {}),
             persist_key_rules: Box::new(|_| Ok(())),
+            open_key_check: Box::new(|| {}),
         }
     }
 }
@@ -446,6 +450,10 @@ pub struct PeerConfig {
     /// refused (Bye "paused"), never a crossing target. It stays paired and keeps its cells.
     #[serde(default)]
     pub paused: bool,
+    /// Master only: the peer's monitors as it last told them (2.4), so its tiles keep their
+    /// arrangement while it is away. Empty: not known.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub displays: Vec<Rect>,
 }
 impl Default for PeerConfig {
     fn default() -> Self {
@@ -461,6 +469,7 @@ impl Default for PeerConfig {
             can_send: true,
             via_master: false,
             paused: false,
+            displays: Vec::new(),
         }
     }
 }
@@ -507,6 +516,44 @@ pub struct Status {
     /// The key rules in effect, every direction.
     #[serde(default)]
     pub keys: BTreeMap<String, DirRules>,
+    /// A key check going on (2.5): on a master its window and the keys seen, on any
+    /// computer whether its own keyboard is being checked.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key_check: Option<KeyCheckStatus>,
+}
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct KeyCheckStatus {
+    /// On a master: the key check window is open (the entries below are its log).
+    pub open: bool,
+    /// This computer's keyboard is held for the check: its keys do nothing here and are
+    /// shown in the master's window. Escape ends it.
+    pub probing: bool,
+    /// Newest last.
+    pub entries: Vec<KeyCheckEntry>,
+}
+/// One key pressed during a key check: on which computer, and what every other computer
+/// in the group gets for it under the key rules.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct KeyCheckEntry {
+    pub seq: u64,
+    pub from: String,
+    pub from_os: Os,
+    /// The key as the pressing computer names it, with the modifiers held ("Ctrl+C").
+    pub key: String,
+    /// The key was let go (shown only when that sends something, like a Caps Lock tap).
+    #[serde(default)]
+    pub released: bool,
+    pub to: Vec<KeyCheckTarget>,
+}
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct KeyCheckTarget {
+    pub name: String,
+    pub os: Os,
+    /// What that computer gets, in its own names ("Command+C"); empty: nothing is sent.
+    pub keys: String,
+    /// The key really went there (the computer the pointer is on).
+    #[serde(default)]
+    pub live: bool,
 }
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TransferStatus {

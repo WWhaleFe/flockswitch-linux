@@ -243,6 +243,15 @@ fn real_main(args: &[String]) -> Result<()> {
                 ok => ok,
             }
         }
+        "keycheck" => {
+            // One key check window at a time; asked again, the open one comes to the front.
+            let addr = std::net::SocketAddr::from(([127, 0, 0, 1], INSTANCE_PORT + 2));
+            let Some(lock) = std::net::TcpListener::bind(addr).ok() else {
+                let _ = std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_secs(1));
+                return Ok(());
+            };
+            settings_ui::keycheck_run(lock)
+        }
         "list" => list(),
         "switch" => {
             let Some(n) = args.get(1).and_then(|s| s.parse::<u8>().ok()).filter(|n| (1..=3).contains(n)) else {

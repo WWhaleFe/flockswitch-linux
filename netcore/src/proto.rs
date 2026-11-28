@@ -5,7 +5,7 @@ pub const PROTO_VERSION: u32 = 1;
 /// Hello features of this version: Group and KeyRules messages, and Displays (2.2: the
 /// computer's monitors, so layout cells and crossings are per monitor). A message that a
 /// feature stands for is only ever sent to a peer that advertised it.
-pub const FEATURES: [&str; 5] = ["group", "keyrules", "displays", "lang1-toggle", "pass"];
+pub const FEATURES: [&str; 6] = ["group", "keyrules", "displays", "lang1-toggle", "pass", "keycheck"];
 pub const MAX_FRAME: usize = 64 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -130,6 +130,14 @@ pub enum Msg {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         display: Option<u8>,
     },
+    /// Sub to master (2.5, "keycheck" feature): open the key check window on the master; the
+    /// sub's own key presses follow as `KeyProbe`.
+    KeyCheckOpen,
+    /// Sub to master (2.5, "keycheck"): a key pressed or let go on the sub's keyboard during a
+    /// key check. It is only shown on the master, never typed anywhere.
+    KeyProbe { usage: u16, down: bool },
+    /// Master to sub (2.5, "keycheck"): the key check window was closed, stop sending keys.
+    KeyCheckEnd,
     /// The sender's monitors (2.2), sorted as `geometry::sorted_displays`. Sent after
     /// the link is paired and whenever they change, only to peers with the "displays" feature.
     Displays {

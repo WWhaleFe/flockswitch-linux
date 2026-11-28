@@ -205,7 +205,7 @@ fn publish_error(config: &NetConfig, error: String) {
             following: None,
             layout: vec![],
             reconnecting: false,
-            keys: Default::default(),
+            keys: Default::default(), key_check: None,
         },
     );
 }
@@ -421,6 +421,7 @@ pub fn spawn(shared: Arc<Shared>) -> JoinHandle<()> {
                                     *previous = keys.clone();
                                     Ok(())
                                 }),
+                                open_key_check: Box::new(crate::tray::open_key_check_window),
                                 ..flock_net::Hooks::default()
                             };
                             match Service::start(config.clone(), p.clone(), hooks) {
